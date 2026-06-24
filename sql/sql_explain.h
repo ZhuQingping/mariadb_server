@@ -61,6 +61,25 @@ public:
 
 class Json_writer;
 
+struct Partial_result_cache_stats
+{
+  Partial_result_cache_stats()
+   : hit(0),
+     miss(0),
+     rows_cached(0),
+     rows_replayed(0),
+     bypass(0),
+     mem_used(0)
+  {}
+
+  ulong hit;
+  ulong miss;
+  ulong rows_cached;
+  ulong rows_replayed;
+  ulong bypass;
+  size_t mem_used;
+};
+
 /**************************************************************************************
  
   Data structures for producing EXPLAIN outputs.
@@ -596,6 +615,7 @@ enum explain_extra_tag
   ET_FIRST_MATCH,
   
   ET_USING_JOIN_BUFFER,
+  ET_USING_PARTIAL_RESULT_CACHE,
 
   ET_CONST_ROW_NOT_FOUND,
   ET_UNIQUE_ROW_NOT_FOUND,
@@ -773,6 +793,8 @@ public:
     extra_tags(root),
     range_checked_fer(NULL),
     full_scan_on_null_key(false),
+    partial_result_cache_estimated_hit_ratio(0.0),
+    partial_result_cache_estimated_saved_cost(0.0),
     start_dups_weedout(false),
     end_dups_weedout(false),
     where_cond(NULL),
@@ -817,6 +839,10 @@ public:
   bool filtered_set; /* not set means 'NULL' should be printed */
   // Valid if ET_USING_INDEX_FOR_GROUP_BY is present
   bool loose_scan_is_scanning;
+  // Valid if ET_USING_PARTIAL_RESULT_CACHE is present
+  double partial_result_cache_estimated_hit_ratio;
+  double partial_result_cache_estimated_saved_cost;
+  Partial_result_cache_stats partial_result_cache_stats;
   
   /*
     Index use: key name and length.
