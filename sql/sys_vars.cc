@@ -3066,6 +3066,201 @@ static Sys_var_ulong Sys_optimizer_extra_pruning_depth(
        SESSION_VAR(optimizer_extra_pruning_depth), CMD_LINE(REQUIRED_ARG),
        VALID_RANGE(0, MAX_TABLES+1), DEFAULT(8), BLOCK_SIZE(1));
 
+static Sys_var_mybool Sys_force_parallel_execute(
+       "force_parallel_execute",
+       "Force parallel query execution in the current session when the "
+       "statement is eligible",
+       SESSION_VAR(force_parallel_execute), CMD_LINE(OPT_ARG),
+       DEFAULT(FALSE), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_mybool Sys_pq_master_enable(
+       "pq_master_enable",
+       "Global Parallel Query master switch. The current MariaDB PQ v1 "
+       "exposes this TaurusDB-compatible control variable; execution "
+       "eligibility remains governed by the v1 fast-path checks",
+       GLOBAL_VAR(pq_master_enable), CMD_LINE(OPT_ARG),
+       DEFAULT(TRUE), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static bool check_parallel_default_dop(sys_var *self __attribute__((unused)),
+                                       THD *thd, set_var *var)
+{
+  ulonglong new_dop= var->save_result.ulonglong_value;
+  if (new_dop > parallel_max_threads)
+    push_warning_printf(thd, Sql_condition::WARN_LEVEL_WARN, ER_UNKNOWN_ERROR,
+                        "parallel_default_dop (%llu) should not be larger "
+                        "than parallel_max_threads (%lu), parallel execution "
+                        "may be capped or refused for new queries.",
+                        new_dop, parallel_max_threads);
+  return false;
+}
+
+static Sys_var_ulong Sys_parallel_default_dop(
+       "parallel_default_dop",
+       "Default degree of parallelism for eligible parallel queries",
+       SESSION_VAR(parallel_default_dop), CMD_LINE(REQUIRED_ARG),
+       VALID_RANGE(0, 1024), DEFAULT(4), BLOCK_SIZE(1),
+       NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(check_parallel_default_dop));
+
+static Sys_var_ulong Sys_parallel_cost_threshold(
+       "parallel_cost_threshold",
+       "TaurusDB-compatible Parallel Query optimizer cost threshold. The "
+       "current MariaDB PQ v1 exposes this control variable before the full "
+       "TaurusDB cost model is ported",
+       SESSION_VAR(parallel_cost_threshold), CMD_LINE(REQUIRED_ARG),
+       VALID_RANGE(0, ULONG_MAX), DEFAULT(1000), BLOCK_SIZE(1),
+       NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulong Sys_parallel_rows_threshold(
+       "parallel_rows_threshold",
+       "TaurusDB-compatible Parallel Query row-count threshold. The current "
+       "MariaDB PQ v1 exposes this control variable before the full TaurusDB "
+       "cost model is ported",
+       SESSION_VAR(parallel_rows_threshold), CMD_LINE(REQUIRED_ARG),
+       VALID_RANGE(0, ULONG_MAX), DEFAULT(10000), BLOCK_SIZE(1),
+       NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_double Sys_parallel_setup_cost(
+       "parallel_setup_cost",
+       "TaurusDB-compatible fixed setup cost for Parallel Query cost "
+       "modeling. The current MariaDB PQ v1 exposes this control variable "
+       "before the full TaurusDB cost model is ported",
+       SESSION_VAR(parallel_setup_cost), CMD_LINE(REQUIRED_ARG),
+       VALID_RANGE(0, DBL_MAX), DEFAULT(250.0),
+       NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_double Sys_parallel_tuple_cost(
+       "parallel_tuple_cost",
+       "TaurusDB-compatible per-row transfer cost for Parallel Query cost "
+       "modeling. The current MariaDB PQ v1 exposes this control variable "
+       "before the full TaurusDB cost model is ported",
+       SESSION_VAR(parallel_tuple_cost), CMD_LINE(REQUIRED_ARG),
+       VALID_RANGE(0, DBL_MAX), DEFAULT(1.5),
+       NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulong Sys_op_over_pq_offset_threshold(
+       "op_over_pq_offset_threshold",
+       "TaurusDB-compatible minimum OFFSET threshold where offset pushdown "
+       "may take precedence over Parallel Query. The current MariaDB PQ v1 "
+       "uses this threshold for bounded ORDER BY projection PQ; larger "
+       "OFFSET values remain on the serial fallback path",
+       SESSION_VAR(op_over_pq_offset_threshold), CMD_LINE(REQUIRED_ARG),
+       VALID_RANGE(0, ULONG_MAX), DEFAULT(1000), BLOCK_SIZE(1),
+       NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_mybool Sys_parallel_fail_retry(
+       "parallel_fail_retry",
+       "TaurusDB-compatible switch controlling whether Parallel Query setup "
+       "failures may retry without PQ. The current MariaDB PQ v1 exposes this "
+       "control variable before the full TaurusDB retry mechanism is ported",
+       SESSION_VAR(parallel_fail_retry), CMD_LINE(OPT_ARG),
+       DEFAULT(TRUE), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_mybool Sys_parallel_graceful_fallback(
+       "parallel_graceful_fallback",
+       "Allow TaurusDB-style graceful fallback from Parallel Query setup "
+       "failures. The current MariaDB PQ v1 fallback remains bounded to the "
+       "implemented fast paths",
+       SESSION_VAR(parallel_graceful_fallback), CMD_LINE(OPT_ARG),
+       DEFAULT(TRUE), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_mybool Sys_parallel_limit_no_order_by(
+       "parallel_limit_no_order_by",
+       "TaurusDB-compatible switch controlling whether LIMIT without ORDER "
+       "BY may use Parallel Query. The current MariaDB PQ v1 still follows "
+       "its bounded LIMIT/ORDER eligibility checks",
+       SESSION_VAR(parallel_limit_no_order_by), CMD_LINE(OPT_ARG),
+       DEFAULT(TRUE), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulonglong Sys_parallel_memory_limit(
+       "parallel_memory_limit",
+       "Global memory admission limit for parallel query worker execution "
+       "and result materialization. The current MariaDB PQ MVP reserves "
+       "estimated budgets and falls back to serial execution when the limit "
+       "would be exceeded",
+       GLOBAL_VAR(parallel_memory_limit), CMD_LINE(REQUIRED_ARG),
+       VALID_RANGE(0, (ulonglong)~(intptr)0), DEFAULT(100ULL * 1024ULL * 1024ULL),
+       BLOCK_SIZE(IO_SIZE), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulong Sys_parallel_queue_timeout(
+       "parallel_queue_timeout",
+       "Queue timeout in milliseconds for parallel query worker admission "
+       "when parallel_max_threads is exhausted. A value of 0 disables waiting",
+       SESSION_VAR(parallel_queue_timeout), CMD_LINE(REQUIRED_ARG),
+       VALID_RANGE(0, ULONG_MAX), DEFAULT(0), BLOCK_SIZE(1),
+       NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulong Sys_pq_msg_queue_size(
+       "pq_msg_queue_size",
+       "Parallel query message queue size in bytes. The current MariaDB PQ "
+       "MVP exposes this TaurusDB-compatible setting before the full message "
+       "queue protocol is ported",
+       SESSION_VAR(pq_msg_queue_size), CMD_LINE(REQUIRED_ARG),
+       VALID_RANGE(1048576, 1073741824), DEFAULT(1048576), BLOCK_SIZE(1),
+       NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulong Sys_pq_msg_queue_spin_lock(
+       "pq_msg_queue_spin_lock",
+       "Spin count used by the TaurusDB parallel query message queue protocol. "
+       "The current MariaDB PQ MVP exposes this setting for compatibility",
+       SESSION_VAR(pq_msg_queue_spin_lock), CMD_LINE(REQUIRED_ARG),
+       VALID_RANGE(100, ULONG_MAX), DEFAULT(1000), BLOCK_SIZE(1),
+       NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulong Sys_pq_hash_join_max_hash_table_refills(
+       "pq_hash_join_max_hash_table_refills",
+       "TaurusDB-compatible upper limit of estimated hash table refills "
+       "before disabling Parallel Query when parallel hash join spill to disk "
+       "is unavailable. The current MariaDB PQ v1 exposes this control "
+       "variable before parallel hash join is ported",
+       SESSION_VAR(pq_hash_join_max_hash_table_refills), CMD_LINE(OPT_ARG),
+       VALID_RANGE(1, ULONG_MAX), DEFAULT(1), BLOCK_SIZE(1),
+       NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulong Sys_parallel_batch_max_slot(
+       "parallel_batch_max_slot",
+       "Maximum slot count for the TaurusDB parallel query batch buffer "
+       "manager. The current MariaDB PQ MVP exposes this control variable "
+       "before the full batch message protocol is ported",
+       SESSION_VAR(parallel_batch_max_slot), CMD_LINE(REQUIRED_ARG),
+       VALID_RANGE(0, 1024), DEFAULT(8), BLOCK_SIZE(1),
+       NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulong Sys_parallel_batch_max_mem_size(
+       "parallel_batch_max_mem_size",
+       "Maximum memory size in bytes for the TaurusDB parallel query batch "
+       "buffer. The current MariaDB PQ MVP exposes this control variable "
+       "before the full batch message protocol is ported",
+       SESSION_VAR(parallel_batch_max_mem_size), CMD_LINE(REQUIRED_ARG),
+       VALID_RANGE(0, ULONG_MAX), DEFAULT(1024 * 1024), BLOCK_SIZE(1),
+       NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+export const char *pq_support_features_switch_names[]=
+{
+  "simple_aggregate",
+  "count_distinct",
+  "correlated_subquery",
+  "hash_join_spill_to_disk",
+  "insert_select",
+  "default",
+  NullS
+};
+
+static Sys_var_flagset Sys_pq_support_features_switch(
+       "pq_support_features_switch",
+       "TaurusDB-compatible Parallel Query feature switch. The current "
+       "MariaDB PQ v1 exposes the control surface while unsupported feature "
+       "bits remain constrained by v1 eligibility checks",
+       SESSION_VAR(pq_support_features_switch), CMD_LINE(REQUIRED_ARG),
+       pq_support_features_switch_names, DEFAULT((1ULL << 0) | (1ULL << 2)),
+       NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulong Sys_parallel_max_threads(
+       "parallel_max_threads",
+       "Maximum number of concurrently running parallel query worker threads",
+       GLOBAL_VAR(parallel_max_threads), CMD_LINE(REQUIRED_ARG),
+       VALID_RANGE(0, ULONG_MAX), DEFAULT(64), BLOCK_SIZE(1),
+       NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
 /* this is used in the sigsegv handler */
 export const char *optimizer_switch_names[]=
 {
@@ -3101,6 +3296,7 @@ export const char *optimizer_switch_names[]=
   "cset_narrowing",
   "sargable_casefold",
   "reorder_outer_joins",
+  "parallel_query",
   "default",
   NullS
 };

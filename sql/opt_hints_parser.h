@@ -111,7 +111,9 @@ public:
     keyword_ROWID_FILTER,
     keyword_NO_ROWID_FILTER,
     keyword_INDEX_MERGE,
-    keyword_NO_INDEX_MERGE
+    keyword_NO_INDEX_MERGE,
+    keyword_PQ,
+    keyword_NO_PQ
   };
 
   class Token: public Lex_cstring
@@ -572,6 +574,42 @@ private:
 
     bool resolve(Parse_context *pc) const;
   };
+
+public:
+  /*
+    pq_hint ::= NO_PQ |
+                 PQ ( [ [@ query_block_name]
+                        [unsigned_number |
+                         table_name [@ query_block_name]
+                         [[,] unsigned_number]] ] )
+
+    This accepts TaurusDB-compatible phase-1 forms:
+      PQ(), PQ(4), PQ(t1), PQ(t1 4), PQ(t1, 4),
+      PQ(@qb), PQ(@qb 4), PQ(@qb t1), PQ(@qb t1 4),
+      PQ(t1 @qb), PQ(t1 @qb 4), PQ(t1 @qb, 4), NO_PQ
+  */
+  class Pq_hint: public Printable_parser_rule
+  {
+    bool m_valid= false;
+    bool m_no_pq= false;
+    bool m_has_qb= false;
+    bool m_has_table= false;
+    bool m_has_dop= false;
+    bool m_ignored= false;
+    Query_block_name m_qb;
+    Table_name m_table;
+    ulonglong m_dop= 0;
+
+  public:
+    Pq_hint() = default;
+    explicit Pq_hint(Parser *p);
+
+    explicit operator bool() const { return m_valid; }
+    bool resolve(Parse_context *pc) const;
+    void append_args(THD *thd, String *str) const override;
+  };
+
+private:
   
   // index_level_hint_body ::= hint_param_table_ext opt_hint_param_index_list
   class Index_level_hint_body: public AND2<Parser,
@@ -1078,9 +1116,16 @@ public:
   // End of structures required for join order hints
   //
 
+  class Pq_or_table_hint: public OR2<Parser, Pq_hint, Table_level_hint>
+  {
+  public:
+    using OR2::OR2;
+  };
+
   /*
     hint ::=   index_level_hint
              | table_level_hint
+             | pq_hint
              | qb_name_hint
              | max_execution_time_hint
              | semijoin_hint
@@ -1089,7 +1134,7 @@ public:
   */
   class Hint: public OR7<Parser,
                          Index_level_hint,
-                         Table_level_hint,
+                         Pq_or_table_hint,
                          Qb_name_hint,
                          Max_execution_time_hint,
                          Semijoin_hint,

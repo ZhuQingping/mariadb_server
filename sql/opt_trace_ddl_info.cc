@@ -143,6 +143,7 @@ bool store_table_definitions_in_trace(THD *thd)
         thd->variables.optimizer_record_context &&
         (lex->sql_command == SQLCOM_SELECT ||
          lex->sql_command == SQLCOM_INSERT_SELECT ||
+         lex->sql_command == SQLCOM_REPLACE_SELECT ||
          lex->sql_command == SQLCOM_DELETE ||
          lex->sql_command == SQLCOM_UPDATE ||
          lex->sql_command == SQLCOM_DELETE_MULTI ||

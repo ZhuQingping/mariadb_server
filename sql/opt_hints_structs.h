@@ -47,6 +47,8 @@ enum opt_hints_enum
   ORDER_INDEX_HINT_ENUM,
   ROWID_FILTER_HINT_ENUM,
   INDEX_MERGE_HINT_ENUM,
+  PQ_HINT_ENUM,
+  NO_PQ_HINT_ENUM,
   MAX_HINT_ENUM // This one must be the last in the list
 };
 

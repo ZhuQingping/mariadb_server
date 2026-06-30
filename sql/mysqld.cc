@@ -496,6 +496,14 @@ ulong slave_run_triggers_for_rbr= 0;
 ulong slave_ddl_exec_mode_options= SLAVE_EXEC_MODE_IDEMPOTENT;
 ulonglong slave_type_conversions_options;
 ulong thread_cache_size=0;
+my_bool pq_master_enable= true;
+ulong parallel_max_threads= 64;
+ulonglong parallel_memory_limit= 100ULL * 1024ULL * 1024ULL;
+ulong pq_stmt_executed= 0;
+ulong parallel_threads_running= 0;
+ulong parallel_threads_refused= 0;
+ulonglong parallel_memory_used= 0;
+ulong parallel_memory_refused= 0;
 ulonglong global_max_tmp_space_usage;
 Atomic_counter<ulonglong> global_tmp_space_used;
 ulonglong binlog_cache_size=0;
@@ -7998,6 +8006,12 @@ SHOW_VAR status_vars[]= {
   {"Opened_table_definitions", (char*) offsetof(STATUS_VAR, opened_shares), SHOW_LONG_STATUS},
   {"Opened_tables",            (char*) offsetof(STATUS_VAR, opened_tables), SHOW_LONG_STATUS},
   {"Opened_views",             (char*) offsetof(STATUS_VAR, opened_views), SHOW_LONG_STATUS},
+  {"Parallel_query_count",     (char*) offsetof(STATUS_VAR, parallel_query_count), SHOW_LONG_STATUS},
+  {"PQ_memory_refused",        (char*) &parallel_memory_refused, SHOW_LONG},
+  {"PQ_memory_used",           (char*) &parallel_memory_used, SHOW_LONGLONG_NOFLUSH},
+  {"PQ_stmt_executed",         (char*) &pq_stmt_executed, SHOW_LONG},
+  {"PQ_threads_refused",       (char*) &parallel_threads_refused, SHOW_LONG},
+  {"PQ_threads_running",       (char*) &parallel_threads_running, SHOW_LONG_NOFLUSH},
   {"Prepared_stmt_count",      (char*) &show_prepared_stmt_count, SHOW_SIMPLE_FUNC},
   {"Rows_sent",                (char*) offsetof(STATUS_VAR, rows_sent), SHOW_LONGLONG_STATUS},
   {"Rows_read",                (char*) offsetof(STATUS_VAR, rows_read), SHOW_LONGLONG_STATUS},

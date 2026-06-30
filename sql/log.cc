@@ -4148,6 +4148,11 @@ bool MYSQL_QUERY_LOG::write(THD *thd, time_t current_time,
                     (ulong) (thd->status_var.bytes_sent - thd->bytes_sent_old)))
       goto err;
 
+    if (!is_command && thd->lex->sql_command == SQLCOM_SELECT &&
+        my_b_printf(&log_file, "# PQ_executed: %u\n",
+                    (uint) thd->statement_pq_executed))
+      goto err;
+
     if (unlikely(log_slow_verbosity &
                  LOG_SLOW_VERBOSITY_ENGINE) &&
         thd->handler_stats.has_stats())

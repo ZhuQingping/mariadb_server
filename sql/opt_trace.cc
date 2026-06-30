@@ -95,18 +95,22 @@ const char *Opt_trace_context::flag_names[]= {"enabled", "default",
   Returns if a particular command will be traced or not
 */
 
-inline bool sql_command_can_be_traced(enum enum_sql_command sql_command)
+inline bool sql_command_can_be_traced(THD *thd,
+                                      enum enum_sql_command sql_command)
 {
   /*
     For first iteration we are only allowing select queries.
     TODO: change to allow other queries.
   */
   return sql_command == SQLCOM_SELECT ||
+         (sql_command == SQLCOM_CREATE_TABLE &&
+          thd->lex->create_info.is_create_select()) ||
          sql_command == SQLCOM_UPDATE ||
          sql_command == SQLCOM_DELETE ||
          sql_command == SQLCOM_DELETE_MULTI ||
          sql_command == SQLCOM_UPDATE_MULTI ||
-         sql_command == SQLCOM_INSERT_SELECT;
+         sql_command == SQLCOM_INSERT_SELECT ||
+         sql_command == SQLCOM_REPLACE_SELECT;
 }
 
 void opt_trace_print_expanded_query(THD *thd, SELECT_LEX *select_lex,
@@ -264,6 +268,12 @@ void opt_trace_disable_if_no_tables_access(THD *thd, TABLE_LIST *tbl)
       don't have their grant.privilege set.
     */
     if (!t->is_anonymous_derived_table() &&
+        /*
+          Sequence functions add hidden TABLE_LIST entries. Their privileges
+          are checked by the sequence Item itself; direct SELECT from a
+          sequence table does not set TABLE_LIST::sequence.
+        */
+        !t->sequence &&
         !t->table_function)
     {
       const GRANT_INFO backup_grant_info= t->grant;
@@ -500,7 +510,7 @@ void Opt_trace_start::init(THD *thd,
   const ulonglong var= thd->variables.optimizer_trace;
   traceable= FALSE;
   if (unlikely(var & Opt_trace_context::FLAG_ENABLED) &&
-      sql_command_can_be_traced(sql_command) &&
+      sql_command_can_be_traced(thd, sql_command) &&
       !list_has_optimizer_trace_table(tbl) &&
       !sets_var_optimizer_trace(sql_command, set_vars) &&
       !thd->system_thread &&

@@ -7490,6 +7490,8 @@ void THD::reset_for_next_command(bool do_clear_error)
 
   used= 0;
   is_fatal_error= 0;
+  no_pq= false;
+  statement_pq_executed= false;
   variables.option_bits&= ~OPTION_BINLOG_THIS_STMT;
 
   /*

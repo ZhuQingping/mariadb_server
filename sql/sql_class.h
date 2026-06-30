@@ -788,6 +788,7 @@ typedef struct system_variables
   ulonglong max_tmp_space_usage;
 
   double optimizer_where_cost, optimizer_scan_setup_cost;
+  double parallel_setup_cost, parallel_tuple_cost;
   double log_slow_query_time_double, max_statement_time_double;
   double log_slow_always_query_time_double;
   double sample_percentage;
@@ -837,6 +838,17 @@ typedef struct system_variables
   ulong optimizer_max_sel_args;
   ulong optimizer_trace_max_mem_size;
   ulong optimizer_adjust_secondary_key_costs;
+  ulong parallel_default_dop;
+  ulong parallel_cost_threshold;
+  ulong parallel_rows_threshold;
+  ulong op_over_pq_offset_threshold;
+  ulong parallel_queue_timeout;
+  ulong pq_msg_queue_size;
+  ulong pq_msg_queue_spin_lock;
+  ulong pq_hash_join_max_hash_table_refills;
+  ulong parallel_batch_max_slot;
+  ulong parallel_batch_max_mem_size;
+  ulonglong pq_support_features_switch;
   ulong use_stat_tables;
   ulong histogram_size;
   ulong histogram_type;
@@ -905,6 +917,10 @@ typedef struct system_variables
     Default transaction access mode. READ ONLY (true) or READ WRITE (false).
   */
   my_bool tx_read_only;
+  my_bool force_parallel_execute;
+  my_bool parallel_fail_retry;
+  my_bool parallel_graceful_fallback;
+  my_bool parallel_limit_no_order_by;
   my_bool low_priority_updates;
   my_bool query_cache_wlock_invalidate;
   my_bool keep_files_on_create;
@@ -1093,6 +1109,7 @@ typedef struct system_status_var
   /*
     Number of statements sent from the client
   */
+  ulong parallel_query_count;
   ulong questions;
   /*
     IMPORTANT!
@@ -3410,6 +3427,8 @@ public:
   struct  system_status_var *initial_status_var; /* used by show status */
   ha_handler_stats handler_stats;       // Handler statistics
   THR_LOCK_INFO lock_info;              // Locking info of this thread
+  bool no_pq;                           // Current statement has NO_PQ hint.
+  bool statement_pq_executed;           // Current statement used PQ.
 
   /**
     Protects THD data accessed from other threads:

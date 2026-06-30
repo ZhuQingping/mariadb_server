@@ -823,6 +823,8 @@ THD::THD(my_thread_id id, bool is_wsrep_applier)
   status_var.max_local_memory_used= status_var.local_memory_used;
   status_var.global_memory_used= 0;
   status_var.tmp_space_used= 0;
+  no_pq= false;
+  statement_pq_executed= false;
   variables.pseudo_thread_id= thread_id;
   variables.max_mem_used= global_system_variables.max_mem_used;
   main_da.init();

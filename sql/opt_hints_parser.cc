@@ -59,6 +59,8 @@ int cmp_lex_string(const LEX_CSTRING &s, const LEX_CSTRING &t,
 int cmp_lex_string_limit(const LEX_CSTRING &s, const LEX_CSTRING &t,
                          const CHARSET_INFO *cs, size_t chars_limit);
 
+static void push_warning_incorrect_pq_dop(THD *thd);
+
 static const Lex_ident_sys null_ident_sys;
 
 
@@ -81,6 +83,10 @@ Optimizer_hint_tokenizer::find_keyword(const LEX_CSTRING &str)
 {
   switch (str.length)
   {
+  case 2:
+    if ("PQ"_Lex_ident_column.streq(str)) return TokenID::keyword_PQ;
+    break;
+
   case 3:
     if ("BKA"_Lex_ident_column.streq(str)) return TokenID::keyword_BKA;
     if ("BNL"_Lex_ident_column.streq(str)) return TokenID::keyword_BNL;
@@ -90,6 +96,7 @@ Optimizer_hint_tokenizer::find_keyword(const LEX_CSTRING &str)
   case 5:
     if ("MERGE"_Lex_ident_column.streq(str)) return TokenID::keyword_MERGE;
     if ("INDEX"_Lex_ident_column.streq(str)) return TokenID::keyword_INDEX;
+    if ("NO_PQ"_Lex_ident_column.streq(str)) return TokenID::keyword_NO_PQ;
     break;
 
   case 6:
@@ -306,6 +313,13 @@ void Parser::push_warning_syntax_error(THD *thd, uint start_lineno)
                       msg, txt.ptr(), start_lineno + lineno());
 }
 
+
+static void push_warning_incorrect_pq_dop(THD *thd)
+{
+  push_warning(thd, Sql_condition::WARN_LEVEL_WARN, ER_UNKNOWN_ERROR,
+               "Incorrect number for degree of parallel");
+}
+
 /*
   Resolve a parsed table level hint, i.e. set up proper Opt_hint_* structures
   which will be used later during query preparation and optimization.
@@ -442,6 +456,209 @@ bool Parser::Table_level_hint::resolve(Parse_context *pc) const
     }
   }
   return false;
+}
+
+Parser::Pq_hint::Pq_hint(Parser *p)
+{
+  if (p->token(TokenID::keyword_NO_PQ))
+  {
+    m_valid= true;
+    m_no_pq= true;
+    return;
+  }
+
+  if (!p->token(TokenID::keyword_PQ))
+    return;
+
+  if (!p->token(TokenID::tLPAREN))
+  {
+    p->set_syntax_error();
+    return;
+  }
+
+  if (p->look_ahead_token_id() == TokenID::tRPAREN)
+  {
+    p->shift();
+    m_valid= true;
+    return;
+  }
+
+  if (p->token(TokenID::tAT))
+  {
+    m_qb= Query_block_name(p);
+    if (!m_qb)
+    {
+      p->set_syntax_error();
+      return;
+    }
+    m_has_qb= true;
+
+    if (p->look_ahead_token_id() == TokenID::tRPAREN)
+    {
+      p->shift();
+      m_valid= true;
+      return;
+    }
+  }
+
+  if (p->look_ahead_token_id() == TokenID::tUNSIGNED_NUMBER)
+  {
+    Unsigned_Number dop(p);
+    const ULonglong_null parsed_dop= dop.get_ulonglong();
+    if (parsed_dop.is_null() || parsed_dop.value() == 0 ||
+        parsed_dop.value() > UINT_MAX32)
+    {
+      push_warning_incorrect_pq_dop(p->thd());
+      if (!p->token(TokenID::tRPAREN))
+        p->set_syntax_error();
+      else
+      {
+        m_valid= true;
+        m_ignored= true;
+      }
+      return;
+    }
+    m_dop= parsed_dop.value();
+    m_has_dop= true;
+  }
+  else
+  {
+    m_table= Table_name(p);
+    if (!m_table)
+    {
+      p->set_syntax_error();
+      return;
+    }
+    m_has_table= true;
+
+    if (!m_has_qb && p->token(TokenID::tAT))
+    {
+      m_qb= Query_block_name(p);
+      if (!m_qb)
+      {
+        p->set_syntax_error();
+        return;
+      }
+      m_has_qb= true;
+    }
+
+    if (p->token(TokenID::tCOMMA) ||
+        p->look_ahead_token_id() == TokenID::tUNSIGNED_NUMBER)
+    {
+      Unsigned_Number dop(p);
+      if (!dop)
+      {
+        p->set_syntax_error();
+        return;
+      }
+      const ULonglong_null parsed_dop= dop.get_ulonglong();
+      if (parsed_dop.is_null() || parsed_dop.value() == 0 ||
+          parsed_dop.value() > UINT_MAX32)
+      {
+        push_warning_incorrect_pq_dop(p->thd());
+        if (!p->token(TokenID::tRPAREN))
+          p->set_syntax_error();
+        else
+        {
+          m_valid= true;
+          m_ignored= true;
+        }
+        return;
+      }
+      m_dop= parsed_dop.value();
+      m_has_dop= true;
+    }
+  }
+
+  if (!p->token(TokenID::tRPAREN))
+  {
+    p->set_syntax_error();
+    return;
+  }
+  m_valid= true;
+}
+
+bool Parser::Pq_hint::resolve(Parse_context *pc) const
+{
+  if (m_ignored)
+    return false;
+
+  const opt_hints_enum hint_type= m_no_pq ? NO_PQ_HINT_ENUM : PQ_HINT_ENUM;
+  const bool hint_state= true;
+  const Lex_ident_sys qb_name_sys= m_has_qb ?
+      m_qb.to_ident_sys(pc->thd) : Lex_ident_sys();
+  Opt_hints_qb *qb= find_qb_hints(pc, qb_name_sys,
+                                  hint_type, hint_state);
+  if (!qb)
+    return false;
+
+  if (m_no_pq)
+  {
+    pc->thd->no_pq= true;
+    if (qb->set_switch(true, hint_type, false))
+    {
+      print_warn(pc->thd, ER_WARN_CONFLICTING_HINT, hint_type, true,
+                 &null_ident_sys, nullptr, nullptr, this);
+    }
+    return false;
+  }
+
+  if (!m_has_table)
+  {
+    if (qb->set_switch(hint_state, hint_type, false))
+    {
+      print_warn(pc->thd, ER_WARN_CONFLICTING_HINT, hint_type, hint_state,
+                 m_has_qb ? &qb_name_sys : &null_ident_sys, nullptr,
+                 nullptr, this);
+    }
+    else if (m_has_dop)
+      qb->pq_hint_dop= m_dop;
+    return false;
+  }
+
+  const Lex_ident_sys table_name_sys= m_table.to_ident_sys(pc->thd);
+  Opt_hints_table *tab= get_table_hints(pc, table_name_sys, qb);
+  if (!tab)
+    return false;
+  if (tab->set_switch(true, hint_type, true))
+  {
+    print_warn(pc->thd, ER_WARN_CONFLICTING_HINT, hint_type, true,
+               m_has_qb ? &qb_name_sys : &null_ident_sys, &table_name_sys,
+               nullptr, this);
+  }
+  else if (m_has_dop)
+    tab->pq_hint_dop= m_dop;
+  return false;
+}
+
+void Parser::Pq_hint::append_args(THD *thd, String *str) const
+{
+  bool need_comma= false;
+  if (m_has_qb)
+  {
+    const Lex_ident_sys qb_name_sys= m_qb.to_ident_sys(thd);
+    str->append(STRING_WITH_LEN("@"));
+    append_identifier(thd, str, &qb_name_sys);
+    need_comma= true;
+  }
+  if (m_has_table)
+  {
+    if (need_comma)
+      str->append(STRING_WITH_LEN(" "));
+    const Lex_ident_sys table_name_sys= m_table.to_ident_sys(thd);
+    append_identifier(thd, str, &table_name_sys);
+    need_comma= true;
+  }
+  if (m_has_dop)
+  {
+    if (need_comma && !m_has_qb)
+      str->append(STRING_WITH_LEN(","));
+    else if (need_comma)
+      str->append(STRING_WITH_LEN(" "));
+    char buff[32];
+    const size_t len= my_snprintf(buff, sizeof(buff), "%llu", m_dop);
+    str->append(buff, len);
+  }
 }
 
 /*
@@ -1515,10 +1732,18 @@ bool Parser::Hint_list::resolve(Parse_context *pc) const
   for (Hint_list::iterator li= this->begin(); li != this->end(); ++li)
   {
     Parser::Hint &hint= *li;
-    if (const Table_level_hint &table_hint= hint)
+    if (const Pq_or_table_hint &pq_or_table_hint= hint)
     {
-      if (table_hint.resolve(pc))
-        return true;          /* purecov: inspected */
+      if (const Pq_hint &pq_hint= pq_or_table_hint)
+      {
+        if (pq_hint.resolve(pc))
+          return true;          /* purecov: inspected */
+      }
+      else if (const Table_level_hint &table_hint= pq_or_table_hint)
+      {
+        if (table_hint.resolve(pc))
+          return true;          /* purecov: inspected */
+      }
     }
     else if (const Index_level_hint &index_hint= hint)
     {

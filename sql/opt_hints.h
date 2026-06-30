@@ -536,6 +536,8 @@ public:
                MEM_ROOT *mem_root_arg,
                uint select_number_arg);
 
+  ulonglong pq_hint_dop= 0;
+
   const LEX_CSTRING get_print_name()
   {
     return name.str ? name : sys_name;
@@ -768,6 +770,8 @@ public:
     : Opt_hints(table_name_arg, qb_hints_arg, mem_root_arg),
       keyinfo_array(mem_root_arg)
   { }
+
+  ulonglong pq_hint_dop= 0;
 
   CHARSET_INFO *charset_info() const override
   {
