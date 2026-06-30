@@ -1410,6 +1410,7 @@ public:
 #endif
   void replace_handler(handler *new_file) override { file= new_file; }
   QUICK_SELECT_I *make_reverse(uint used_key_parts_arg) override;
+  uint get_mrr_buf_size() const { return mrr_buf_size; }
 
   void add_used_key_part_to_set() override;
 
@@ -1420,6 +1421,15 @@ private:
   QUICK_RANGE_SELECT *get_quick_select_for_ref(THD *thd, TABLE *table,
                                                struct st_table_ref *ref,
                                                ha_rows records);
+  friend
+  QUICK_RANGE_SELECT *get_quick_select_for_between(THD *thd, TABLE *table,
+                                                   uint key_nr,
+                                                   Item_param *low,
+                                                   Item_param *high,
+                                                   ha_rows records,
+                                                   double read_time,
+                                                   uint mrr_flags,
+                                                   uint mrr_buf_size);
   friend bool get_quick_keys(PARAM *param, QUICK_RANGE_SELECT *quick, 
                              KEY_PART *key, SEL_ARG *key_tree, 
                              uchar *min_key, uint min_key_flag,
@@ -2044,6 +2054,14 @@ FT_SELECT *get_ft_select(THD *thd, TABLE *table, uint key);
 QUICK_RANGE_SELECT *get_quick_select_for_ref(THD *thd, TABLE *table,
                                              struct st_table_ref *ref,
                                              ha_rows records);
+QUICK_RANGE_SELECT *get_quick_select_for_between(THD *thd, TABLE *table,
+                                                 uint key_nr,
+                                                 Item_param *low,
+                                                 Item_param *high,
+                                                 ha_rows records,
+                                                 double read_time,
+                                                 uint mrr_flags,
+                                                 uint mrr_buf_size);
 SQL_SELECT *make_select(TABLE *head, table_map const_tables,
 			table_map read_tables, COND *conds,
                         SORT_INFO* filesort,

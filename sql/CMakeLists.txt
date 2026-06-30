@@ -140,6 +140,7 @@ SET (SQL_SOURCE
                sql_oracle_outer_join.cc
                sql_parse.cc sql_bootstrap.cc
                sql_partition.cc sql_plugin.cc sql_prepare.cc sql_rename.cc
+               sql_plan_cache.cc
                debug_sync.cc debug.cc
                sql_repl.cc sql_select.cc sql_show.cc sql_state.c
                group_by_handler.cc derived_handler.cc select_handler.cc

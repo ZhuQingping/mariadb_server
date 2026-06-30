@@ -13145,6 +13145,179 @@ err:
 
 
 /*
+  Build a QUICK_RANGE_SELECT for the narrow plan-cache hit shape:
+  a single, ascending, non-null keypart with inclusive BETWEEN parameter
+  bounds.  Any unsupported shape returns NULL so the caller can fall back to
+  the normal range optimizer.
+*/
+
+static bool plan_cache_integer_keypart_field(const Field *field)
+{
+  switch (field->real_type()) {
+  case MYSQL_TYPE_TINY:
+  case MYSQL_TYPE_SHORT:
+  case MYSQL_TYPE_INT24:
+  case MYSQL_TYPE_LONG:
+  case MYSQL_TYPE_LONGLONG:
+    return true;
+  default:
+    return false;
+  }
+}
+
+
+static bool plan_cache_store_int_between_keys_from_params(THD *thd,
+                                                          TABLE *table,
+                                                          KEY_PART_INFO *key_part,
+                                                          Item_param *low,
+                                                          Item_param *high,
+                                                          uchar *low_key,
+                                                          uchar *high_key)
+{
+  Field *field= key_part->field;
+  const longlong *low_value;
+  const longlong *high_value;
+  uchar *old_ptr;
+  uchar *old_null_ptr;
+  uchar old_null_bit;
+  enum_check_fields old_count_cuted_fields;
+  MY_BITMAP *old_map;
+  int low_error;
+  int high_error= 1;
+
+  if (!plan_cache_integer_keypart_field(field))
+    return false;
+
+  if (!(low_value= low->const_ptr_longlong()) || low->null_value ||
+      !(high_value= high->const_ptr_longlong()) || high->null_value)
+    return false;
+
+  old_count_cuted_fields= thd->count_cuted_fields;
+  Use_relaxed_field_copy relaxed_field_copy(table->in_use);
+  old_map= dbug_tmp_use_all_columns(table, &table->write_set);
+
+  old_ptr= field->ptr;
+  old_null_ptr= field->null_ptr;
+  old_null_bit= field->null_bit;
+  field->move_field(low_key, 0, 0);
+  low_error= field->store(*low_value, low->unsigned_flag);
+  if (!low_error)
+  {
+    field->move_field(high_key, 0, 0);
+    high_error= field->store(*high_value, high->unsigned_flag);
+  }
+  field->move_field(old_ptr, old_null_ptr, old_null_bit);
+
+  dbug_tmp_restore_column_map(&table->write_set, old_map);
+  thd->count_cuted_fields= old_count_cuted_fields;
+
+  return !low_error && !high_error &&
+         !low->null_value && !high->null_value && !thd->is_error();
+}
+
+QUICK_RANGE_SELECT *get_quick_select_for_between(THD *thd, TABLE *table,
+                                                 uint key_nr,
+                                                 Item_param *low,
+                                                 Item_param *high,
+                                                 ha_rows records,
+                                                 double read_time,
+                                                 uint mrr_flags,
+                                                 uint mrr_buf_size)
+{
+  MEM_ROOT *old_root, *alloc;
+  QUICK_RANGE_SELECT *quick;
+  KEY *key_info;
+  KEY_PART_INFO *key_part_info;
+  KEY_PART *key_part;
+  QUICK_RANGE *range;
+  bool create_err= FALSE;
+  uchar low_key[MAX_KEY_LENGTH];
+  uchar high_key[MAX_KEY_LENGTH];
+  uint key_length;
+
+  if (!thd || !table || !table->file || key_nr >= table->s->keys ||
+      !low || !high)
+    return 0;
+
+  key_info= table->key_info + key_nr;
+  if (key_info->is_ignored ||
+      (key_info->flags & HA_NULL_PART_KEY) ||
+      key_info->user_defined_key_parts != 1 ||
+      !key_info->key_part)
+    return 0;
+
+  key_part_info= key_info->key_part;
+  if (!key_part_info[0].field ||
+      key_part_info[0].field->real_maybe_null() ||
+      (key_part_info[0].key_part_flag & HA_REVERSE_SORT) ||
+      key_part_info[0].store_length > MAX_KEY_LENGTH)
+    return 0;
+
+  key_length= key_part_info[0].store_length;
+  bzero(low_key, key_length);
+  bzero(high_key, key_length);
+
+  if (!plan_cache_store_int_between_keys_from_params(thd, table,
+                                                     key_part_info,
+                                                     low, high,
+                                                     low_key, high_key))
+  {
+    store_key_item low_copy(thd, key_part_info[0].field, low_key, 0,
+                            key_part_info[0].length, low, false);
+    store_key_item high_copy(thd, key_part_info[0].field, high_key, 0,
+                             key_part_info[0].length, high, false);
+    if ((low_copy.copy(thd) & 1) || low_copy.null_key ||
+        (high_copy.copy(thd) & 1) || high_copy.null_key ||
+        thd->is_error())
+      return 0;
+  }
+
+  if (key_part_info[0].field->key_cmp(low_key, high_key) > 0)
+    return 0;
+
+  old_root= thd->mem_root;
+  quick= new QUICK_RANGE_SELECT(thd, table, key_nr, true, old_root,
+                                &create_err);
+  alloc= old_root;
+
+  if (!quick || create_err || quick->init())
+    goto err;
+
+  if (!(range= new (alloc)
+        QUICK_RANGE(thd, low_key, key_length, make_prev_keypart_map(1),
+                    high_key, key_length, make_prev_keypart_map(1), 0)))
+    goto err;
+
+  if (!(quick->key_parts= key_part=
+        (KEY_PART*) alloc_root(alloc, sizeof(KEY_PART))))
+    goto err;
+
+  key_part->part= 0;
+  key_part->field= key_part_info[0].field;
+  key_part->length= key_part_info[0].length;
+  key_part->store_length= key_part_info[0].store_length;
+  key_part->null_bit= key_part_info[0].null_bit;
+  key_part->flag= (uint8) key_part_info[0].key_part_flag;
+
+  quick->max_used_key_length= key_length;
+  quick->used_key_parts= 1;
+  if (insert_dynamic(&quick->ranges, (uchar*) &range))
+    goto err;
+
+  quick->mrr_flags= mrr_flags;
+  quick->mrr_buf_size= mrr_buf_size;
+  quick->records= records;
+  quick->read_time= read_time;
+
+  return quick;
+
+err:
+  delete quick;
+  return 0;
+}
+
+
+/*
   Perform key scans for all used indexes (except CPK), get rowids and merge 
   them into an ordered non-recurrent sequence of rowids.
   

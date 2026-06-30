@@ -1772,6 +1772,7 @@ bool Item_exists_subselect::fix_length_and_dec()
     thd->change_item_tree(&unit->global_parameters()->limit_params.select_limit,
                           item);
     unit->global_parameters()->limit_params.explicit_limit= 1; // we set the limit
+    unit->global_parameters()->limit_params.is_fetch_first= false;
     DBUG_PRINT("info", ("Set limit to 1"));
   }
   DBUG_RETURN(FALSE);
@@ -3276,6 +3277,7 @@ bool Item_exists_subselect::exists2in_processor(void *opt_arg)
 
   first_select->limit_params.select_limit= NULL;
   first_select->limit_params.explicit_limit= FALSE;
+  first_select->limit_params.is_fetch_first= false;
   if (!(in_subs= new (thd->mem_root) Item_in_subselect(thd, left_exp,
                                                          first_select)))
   {

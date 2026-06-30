@@ -1025,12 +1025,14 @@ class Lex_select_limit
 public:
   /* explicit LIMIT clause was used */
   bool explicit_limit;
+  bool is_fetch_first;
   bool with_ties;
   Item *select_limit, *offset_limit;
 
   void clear()
   {
     explicit_limit= FALSE;    // No explicit limit given by user
+    is_fetch_first= FALSE;    // No FETCH FIRST / OFFSET-only syntax
     with_ties= FALSE;         // No use of WITH TIES operator
     select_limit= NULL;       // denotes the default limit = HA_POS_ERROR
     offset_limit= NULL;       // denotes the default offset = 0

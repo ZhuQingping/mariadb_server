@@ -618,6 +618,18 @@ struct LEX;
 class st_select_lex;
 class st_select_lex_unit;
 
+namespace plan_cache
+{
+struct Cached_plan_state;
+struct Pending_access_recipe;
+enum class State
+{
+  NONE,
+  READY,
+  UNCACHEABLE
+};
+}
+
 
 class st_select_lex_node {
 protected:
@@ -1068,6 +1080,9 @@ public:
   */
   List<String> *prev_join_using;
   JOIN *join; /* after JOIN::prepare it is pointer to corresponding JOIN */
+  plan_cache::Cached_plan_state *plan_cache_state;
+  plan_cache::Pending_access_recipe *plan_cache_pending_access_recipe;
+  plan_cache::State plan_cache_state_status;
   TABLE_LIST *embedding;          /* table embedding to the above list   */
   table_value_constr *tvc;
 

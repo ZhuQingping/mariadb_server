@@ -13251,6 +13251,7 @@ fetch_first_clause:
             $$.select_limit= one;
             $$.offset_limit= 0;
             $$.explicit_limit= true;
+            $$.is_fetch_first= true;
             $$.with_ties= $4;
           }
         | OFFSET_SYM limit_option row_or_rows
@@ -13262,6 +13263,7 @@ fetch_first_clause:
             $$.select_limit= one;
             $$.offset_limit= $2;
             $$.explicit_limit= true;
+            $$.is_fetch_first= true;
             $$.with_ties= $7;
           }
         | FETCH_SYM first_or_next limit_option row_or_rows only_or_with_ties
@@ -13269,6 +13271,7 @@ fetch_first_clause:
             $$.select_limit= $3;
             $$.offset_limit= 0;
             $$.explicit_limit= true;
+            $$.is_fetch_first= true;
             $$.with_ties= $5;
           }
         | OFFSET_SYM limit_option row_or_rows
@@ -13277,6 +13280,7 @@ fetch_first_clause:
             $$.select_limit= $6;
             $$.offset_limit= $2;
             $$.explicit_limit= true;
+            $$.is_fetch_first= true;
             $$.with_ties= $8;
           }
         | OFFSET_SYM limit_option row_or_rows
@@ -13284,6 +13288,7 @@ fetch_first_clause:
             $$.select_limit= 0;
             $$.offset_limit= $2;
             $$.explicit_limit= true;
+            $$.is_fetch_first= true;
             $$.with_ties= false;
           }
         ;
@@ -13317,6 +13322,7 @@ limit_options:
             $$.select_limit= $1;
             $$.offset_limit= NULL;
             $$.explicit_limit= true;
+            $$.is_fetch_first= false;
             $$.with_ties= false;
           }
         | limit_option ',' limit_option
@@ -13324,6 +13330,7 @@ limit_options:
             $$.select_limit= $3;
             $$.offset_limit= $1;
             $$.explicit_limit= true;
+            $$.is_fetch_first= false;
             $$.with_ties= false;
           }
         | limit_option OFFSET_SYM limit_option
@@ -13331,6 +13338,7 @@ limit_options:
             $$.select_limit= $1;
             $$.offset_limit= $3;
             $$.explicit_limit= true;
+            $$.is_fetch_first= false;
             $$.with_ties= false;
           }
         ;
@@ -13389,6 +13397,7 @@ delete_limit_clause:
             sel->limit_params.select_limit= $2;
             Lex->set_stmt_unsafe(LEX::BINLOG_STMT_UNSAFE_LIMIT);
             sel->limit_params.explicit_limit= 1;
+            sel->limit_params.is_fetch_first= false;
           }
        | LIMIT ROWS_SYM EXAMINED_SYM { thd->parse_error(); MYSQL_YYABORT; }
        | LIMIT limit_option ROWS_SYM EXAMINED_SYM { thd->parse_error(); MYSQL_YYABORT; }

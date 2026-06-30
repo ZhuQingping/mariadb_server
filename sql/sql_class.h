@@ -790,6 +790,7 @@ typedef struct system_variables
   double optimizer_where_cost, optimizer_scan_setup_cost;
   double log_slow_query_time_double, max_statement_time_double;
   double log_slow_always_query_time_double;
+  double session_plan_cache_allow_change_ratio;
   double sample_percentage;
 
   ha_rows select_limit;
@@ -928,6 +929,8 @@ typedef struct system_variables
 #endif // USER_VAR_TRACKING
   my_bool tcp_nodelay;
   my_bool optimizer_record_context;
+  my_bool session_plan_cache;
+  my_bool session_plan_cache_profile;
   plugin_ref table_plugin;
   plugin_ref tmp_table_plugin;
   plugin_ref enforced_table_plugin;
@@ -1084,6 +1087,37 @@ typedef struct system_status_var
   ulong access_denied_errors;
   ulong lost_connections;
   ulong max_statement_time_exceeded;
+  ulong cached_plan_hits;
+  ulong cached_plan_invalidations;
+  ulong cached_plan_prevalidations;
+  ulonglong cached_plan_profile_validate_us;
+  ulonglong cached_plan_profile_prevalidate_us;
+  ulonglong cached_plan_profile_hit_path_us;
+  ulonglong cached_plan_profile_hit_build_us;
+  ulonglong cached_plan_profile_hit_explain_us;
+  ulonglong cached_plan_profile_hit_unique_build_us;
+  ulonglong cached_plan_profile_hit_unique_alloc_us;
+  ulonglong cached_plan_profile_hit_unique_setup_plan_us;
+  ulonglong cached_plan_profile_hit_unique_setup_us;
+  ulonglong cached_plan_profile_hit_unique_read_us;
+  ulonglong cached_plan_profile_hit_ref_build_us;
+  ulonglong cached_plan_profile_hit_ref_alloc_us;
+  ulonglong cached_plan_profile_hit_ref_setup_us;
+  ulonglong cached_plan_profile_hit_range_build_us;
+  ulonglong cached_plan_profile_hit_range_make_select_us;
+  ulonglong cached_plan_profile_hit_range_quick_select_us;
+  ulonglong cached_plan_profile_hit_range_setup_us;
+  ulonglong cached_plan_profile_hit_range_setup_alloc_us;
+  ulonglong cached_plan_profile_hit_range_setup_base_us;
+  ulonglong cached_plan_profile_hit_range_setup_distinct_us;
+  ulonglong cached_plan_profile_hit_range_setup_order_us;
+  ulonglong cached_plan_profile_hit_range_setup_ref_array_us;
+  ulonglong cached_plan_profile_hit_range_setup_aggr_us;
+  ulonglong cached_plan_profile_hit_range_setup_distinct_fast_us;
+  ulonglong cached_plan_profile_hit_range_setup_post_us;
+  ulong cached_plan_profile_hit_unique_count;
+  ulong cached_plan_profile_hit_ref_count;
+  ulong cached_plan_profile_hit_range_count;
   /*
    Number of times where column info was not
    sent with prepared statement metadata.

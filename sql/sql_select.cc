@@ -30,6 +30,7 @@
 #include "unireg.h"
 #include "sql_select.h"
 #include "sql_cache.h"                          // query_cache_*
+#include "sql_plan_cache.h"
 #include "sql_table.h"                          // primary_key_name
 #include "probes_mysql.h"
 #include "key.h"                 // key_copy, key_cmp, key_cmp_if_same
@@ -301,10 +302,14 @@ static ORDER *create_distinct_group(THD *thd, Ref_ptr_array ref_pointer_array,
                                     ORDER *order, List<Item> &fields,
                                     List<Item> &all_fields,
 				    bool *all_order_by_fields_used);
+static ORDER *create_plan_cache_single_distinct_group(THD *thd,
+                                                      ORDER *order,
+                                                      List<Item> &fields);
 static bool test_if_subpart(ORDER *group_by, ORDER *order_by);
 static TABLE *get_sort_by_table(ORDER *a,ORDER *b,List<TABLE_LIST> &tables, 
                                 table_map const_tables);
 static void calc_group_buffer(JOIN *join, ORDER *group);
+void calc_group_buffer(TMP_TABLE_PARAM *param, ORDER *group);
 static bool make_group_fields(JOIN *main_join, JOIN *curr_join);
 static bool alloc_group_fields(JOIN *join, ORDER *group);
 static bool alloc_order_fields(JOIN *join, ORDER *group,
@@ -1984,10 +1989,85 @@ bool JOIN::build_explain()
   DBUG_RETURN(0);
 }
 
+bool JOIN::build_plan_cache_hit_explain()
+{
+  DBUG_ENTER("JOIN::build_plan_cache_hit_explain");
+  const bool order_filesort= order && join_tab && join_tab->filesort;
+  /*
+    build_explain() also wires execution-time trackers.  For the narrow
+    single-table plan-cache hit shape, avoid filling the full EXPLAIN payload
+    while still creating the tracker objects that JOIN::exec() and sub_select()
+    dereference.
+  */
+  if (thd->lex->analyze_stmt ||
+      (select_options & SELECT_DESCRIBE) ||
+      (thd->variables.log_slow_verbosity &
+       (LOG_SLOW_VERBOSITY_EXPLAIN | LOG_SLOW_VERBOSITY_ENGINE)) ||
+      aggr_tables || exec_join_tab_cnt() != 1 || !join_tab ||
+      !thd->lex->explain || select_lex->master_unit()->derived ||
+      pushdown_query || zero_result_cause || is_in_subquery() ||
+      need_tmp || group || group_list || select_distinct ||
+      (order && !order_filesort) || (!order && join_tab->filesort))
+    DBUG_RETURN(true);
+
+  MEM_ROOT *old_mem_root= thd->mem_root;
+  Item *old_free_list __attribute__((unused))= thd->free_list;
+  Explain_query *output= thd->lex->explain;
+  thd->mem_root= output->mem_root;
+
+  Explain_select *xpl_sel=
+    new (output->mem_root) Explain_select(output->mem_root, false);
+  if (!xpl_sel)
+  {
+    thd->mem_root= old_mem_root;
+    DBUG_RETURN(true);
+  }
+
+#ifndef DBUG_OFF
+  xpl_sel->select_lex= select_lex;
+#endif
+  xpl_sel->select_id= select_lex->select_number;
+  xpl_sel->select_type= select_lex->type;
+  xpl_sel->linkage= select_lex->get_linkage();
+  xpl_sel->cost= best_read;
+
+  Explain_table_access *eta=
+    new (output->mem_root) Explain_table_access(output->mem_root, false);
+  if (!eta)
+  {
+    thd->mem_root= old_mem_root;
+    DBUG_RETURN(true);
+  }
+  if (order_filesort &&
+      !(eta->pre_join_sort=
+        new (output->mem_root) Explain_aggr_filesort(output->mem_root,
+                                                     false,
+                                                     join_tab->filesort)))
+  {
+    thd->mem_root= old_mem_root;
+    DBUG_RETURN(true);
+  }
+
+  explain= xpl_sel;
+  join_tab->explain_plan= eta;
+  join_tab->tracker= &eta->tracker;
+  join_tab->jbuf_tracker= &eta->jbuf_tracker;
+  join_tab->jbuf_loops_tracker= &eta->jbuf_loops_tracker;
+  join_tab->jbuf_unpack_tracker= &eta->jbuf_unpack_tracker;
+  xpl_sel->add_table(eta, output);
+  output->add_node(xpl_sel);
+  output->query_plan_ready();
+
+  thd->mem_root= old_mem_root;
+  DBUG_ASSERT(thd->free_list == old_free_list);
+  DBUG_RETURN(false);
+}
+
 
 int JOIN::optimize()
 {
   int res= 0;
+  bool plan_cache_hit= false;
   if (select_lex->pushdown_select)
   {
     if (optimization_state == JOIN::OPTIMIZATION_DONE)
@@ -2013,12 +2093,37 @@ int JOIN::optimize()
     if (optimization_state != JOIN::NOT_OPTIMIZED)
       return FALSE;
     optimization_state= JOIN::OPTIMIZATION_IN_PROGRESS;
-    res= optimize_inner();
+    plan_cache::Execute_validation plan_cache_validation=
+      plan_cache::validate_state_for_execute(thd, select_lex, this);
+#ifndef DBUG_OFF
+    plan_cache::trace_eligibility(
+        thd, plan_cache::check_eligibility(thd, select_lex, this));
+#endif
+    plan_cache::Execute_recipe_result plan_cache_result=
+      plan_cache::try_execute_cached_recipe(thd, select_lex, this,
+                                            plan_cache_validation);
+    if (plan_cache_result == plan_cache::Execute_recipe_result::FALLBACK)
+      res= optimize_inner();
+    else if (plan_cache_result == plan_cache::Execute_recipe_result::ERROR)
+      res= 1;
+    else
+      plan_cache_hit= true;
   }
   if (!with_two_phase_optimization)
   {
     if (!res && have_query_plan != QEP_DELETED)
-      res= build_explain();
+    {
+      ulonglong explain_timer=
+        plan_cache_hit && thd->variables.session_plan_cache_profile ?
+        microsecond_interval_timer() : 0;
+      if (plan_cache_hit && !build_plan_cache_hit_explain())
+        res= 0;
+      else
+        res= build_explain();
+      if (explain_timer)
+        thd->status_var.cached_plan_profile_hit_explain_us+=
+          microsecond_interval_timer() - explain_timer;
+    }
     optimization_state= JOIN::OPTIMIZATION_DONE;
   }
 
@@ -3363,6 +3468,8 @@ int JOIN::optimize_stage2()
   if (make_join_readinfo(this, select_opts_for_readinfo, no_jbuf_after))
     DBUG_RETURN(1);
 
+  plan_cache::maybe_create_state(thd, select_lex, this);
+
   /* Perform FULLTEXT search before all regular searches */
   if (!(select_options & SELECT_DESCRIBE))
     if (init_ftfuncs(thd, select_lex, MY_TEST(order)))
@@ -4371,6 +4478,164 @@ bool JOIN::make_aggr_tables_info()
   DBUG_RETURN(false);
 }
 
+
+namespace plan_cache
+{
+static inline ulonglong profile_start(THD *thd);
+static inline void profile_add(THD *thd, ulonglong start, ulonglong *counter);
+}
+
+
+bool JOIN::setup_plan_cache_distinct_range_aggr_tables_info()
+{
+  List_iterator_fast<Item> fields_it(fields_list);
+  Item *item= fields_it++;
+  JOIN_TAB *sort_tab;
+  ulonglong fast_timer;
+  DBUG_ENTER("JOIN::setup_plan_cache_distinct_range_aggr_tables_info");
+
+  if (need_tmp || !group || !group_list || group_list->next || order ||
+      select_distinct || having || tmp_having || procedure ||
+      implicit_grouping || select_lex->have_window_funcs() ||
+      select_lex->custom_agg_func_used() ||
+      rollup.state != ROLLUP::STATE_NONE || tmp_table_param.sum_func_count ||
+      fields_list.elements != 1 || all_fields.elements != fields_list.elements ||
+      !item || fields_it++ || !items3.is_null() || !sum_funcs ||
+      !sum_funcs_end || !join_tab || top_join_tab_count != 1 || aggr_tables ||
+      !tables_list)
+    DBUG_RETURN(true);
+
+  DBUG_ASSERT(current_ref_ptrs == items0);
+
+  sort_and_group_aggr_tab= NULL;
+  fast_timer= plan_cache::profile_start(thd);
+  if (make_group_fields(this, this))
+  {
+    plan_cache::profile_add(
+        thd, fast_timer,
+        &thd->status_var.cached_plan_profile_hit_range_setup_distinct_fast_us);
+    DBUG_RETURN(true);
+  }
+
+  if (items0.is_null())
+    init_items_ref_array();
+  items3= ref_ptr_array_slice(4);
+  if (setup_copy_fields(thd, &tmp_table_param,
+                        items3, tmp_fields_list3, tmp_all_fields3,
+                        fields_list.elements, all_fields))
+  {
+    plan_cache::profile_add(
+        thd, fast_timer,
+        &thd->status_var.cached_plan_profile_hit_range_setup_distinct_fast_us);
+    DBUG_RETURN(true);
+  }
+
+  fields= &tmp_fields_list3;
+  set_items_ref_array(items3);
+  join_tab[top_join_tab_count + aggr_tables - 1].ref_array= &items3;
+  join_tab[top_join_tab_count + aggr_tables - 1].all_fields= &tmp_all_fields3;
+  join_tab[top_join_tab_count + aggr_tables - 1].fields= &tmp_fields_list3;
+
+  /*
+    build_range_between_lookup_plan() has already converted this exact
+    DISTINCT range shape into a single-column GROUP BY over the selected field.
+    Keep the filesort/grouping step; DISTINCT is adjacent-duplicate removal
+    after sorting.
+  */
+  select_limit= HA_POS_ERROR;
+  sort_tab= join_tab + const_tables;
+  if (!only_const_tables() &&
+      ordered_index_usage != JOIN::ordered_index_group_by &&
+      sort_tab->type != JT_CONST && sort_tab->type != JT_EQ_REF &&
+      add_sorting_to_table(sort_tab, group_list))
+  {
+    plan_cache::profile_add(
+        thd, fast_timer,
+        &thd->status_var.cached_plan_profile_hit_range_setup_distinct_fast_us);
+    DBUG_RETURN(true);
+  }
+
+  sum_funcs[0]= 0;
+  for (uint i= 0; i <= send_group_parts; i++)
+    sum_funcs_end[i]= sum_funcs;
+
+  set_items_ref_array(items0);
+  if (join_tab)
+    join_tab[exec_join_tab_cnt() + aggr_tables - 1].next_select=
+      setup_end_select_func(this);
+
+  plan_cache::profile_add(
+      thd, fast_timer,
+      &thd->status_var.cached_plan_profile_hit_range_setup_distinct_fast_us);
+  DBUG_RETURN(false);
+}
+
+
+bool JOIN::setup_plan_cache_sum_range_aggr_tables_info()
+{
+  List_iterator_fast<Item> fields_it(fields_list);
+  Item *item= fields_it++;
+  Item_sum *sum_item;
+  DBUG_ENTER("JOIN::setup_plan_cache_sum_range_aggr_tables_info");
+
+  if (need_tmp || group || group_list || order || select_distinct || having ||
+      procedure || !implicit_grouping || select_lex->have_window_funcs() ||
+      rollup.state != ROLLUP::STATE_NONE || tmp_table_param.sum_func_count != 1 ||
+      fields_list.elements != 1 || all_fields.elements != fields_list.elements ||
+      !item || item->type() != Item::SUM_FUNC_ITEM || fields_it++ ||
+      !items3.is_null() || !sum_funcs || !sum_funcs_end || !join_tab ||
+      top_join_tab_count != 1 || aggr_tables)
+    DBUG_RETURN(make_aggr_tables_info());
+
+  sum_item= static_cast<Item_sum *>(item);
+  if (sum_item->sum_func() != Item_sum::SUM_FUNC ||
+      sum_item->get_arg_count() != 1 ||
+      sum_item->get_arg(0)->type() != Item::FIELD_ITEM)
+    DBUG_RETURN(make_aggr_tables_info());
+
+  DBUG_ASSERT(current_ref_ptrs == items0);
+
+  sort_and_group_aggr_tab= NULL;
+  join_tab[top_join_tab_count - 1].fields= &fields_list;
+  join_tab[top_join_tab_count - 1].all_fields= &all_fields;
+
+  /*
+    SUM(field) without GROUP BY has no group key to cache.  The generic
+    make_group_fields() path only marks sort_and_group for this shape.
+  */
+  sort_and_group= 1;
+
+  if (items0.is_null())
+    init_items_ref_array();
+  items3= ref_ptr_array_slice(4);
+  tmp_table_param.copy_funcs.empty();
+  tmp_table_param.copy_field= tmp_table_param.copy_field_end= 0;
+  tmp_fields_list3.empty();
+  tmp_all_fields3.empty();
+  if (tmp_all_fields3.push_back(item, thd->mem_root) ||
+      tmp_fields_list3.push_back(item, thd->mem_root))
+    DBUG_RETURN(true);
+  items3[0]= item;
+
+  set_items_ref_array(items3);
+  join_tab[top_join_tab_count + aggr_tables - 1].ref_array= &items3;
+  join_tab[top_join_tab_count + aggr_tables - 1].all_fields= &tmp_all_fields3;
+  join_tab[top_join_tab_count + aggr_tables - 1].fields= &tmp_fields_list3;
+
+  sum_funcs[0]= sum_item;
+  sum_funcs[1]= 0;
+  for (uint i= 0; i <= send_group_parts; i++)
+    sum_funcs_end[i]= sum_funcs + 1;
+
+  if (prepare_sum_aggregators(thd, sum_funcs,
+                              !join_tab ||
+                              !join_tab->is_using_agg_loose_index_scan()))
+    DBUG_RETURN(true);
+  if (unlikely(setup_sum_funcs(thd, sum_funcs) || thd->is_error()))
+    DBUG_RETURN(true);
+
+  DBUG_RETURN(false);
+}
 
 
 bool
@@ -13281,6 +13546,1229 @@ bool JOIN::inject_cond_into_where(Item *injected_cond)
 
 
 static Item * const null_ptr= NULL;
+
+namespace plan_cache
+{
+
+static inline ulonglong profile_start(THD *thd)
+{
+  return thd && thd->variables.session_plan_cache_profile ?
+         microsecond_interval_timer() : 0;
+}
+
+static inline void profile_add(THD *thd, ulonglong start, ulonglong *counter)
+{
+  if (start)
+    *counter+= microsecond_interval_timer() - start;
+}
+
+struct Plan_cache_join_restore
+{
+  JOIN *join;
+  TABLE *table;
+  JOIN_TAB *join_tab;
+  JOIN_TAB **best_ref;
+  JOIN_TAB **map2table;
+  TABLE **table_vector;
+  POSITION *positions;
+  POSITION *sort_positions;
+  POSITION *best_positions;
+  POSITION *next_sort_position;
+  uint sort_space;
+  uint table_count;
+  uint top_join_tab_count;
+  uint const_tables;
+  uint aggr_tables;
+  table_map const_table_map;
+  table_map found_const_table_map;
+  table_map allowed_tables;
+  table_map allowed_top_level_tables;
+  table_map eq_ref_tables;
+  TABLE_LIST *tables_list;
+  List<Item> *fields;
+  Item *conds;
+  ORDER *order;
+  ORDER *group_list;
+  uint send_group_parts;
+  bool first_record;
+  bool group_sent;
+  bool need_tmp;
+  bool simple_order;
+  bool simple_group;
+  bool no_order;
+  bool group;
+  bool select_distinct;
+  bool sort_and_group;
+  bool skip_sort_order;
+  decltype(JOIN::ordered_index_void) ordered_index_usage;
+#ifndef DBUG_OFF
+  int dbug_join_tab_array_size;
+#endif
+  double best_read;
+  double join_record_count;
+  const char *zero_result_cause;
+  bool impossible_where;
+  JOIN_TAB *table_join_tab;
+
+  Plan_cache_join_restore(JOIN *join_arg, TABLE *table_arg)
+    : join(join_arg), table(table_arg),
+      join_tab(join_arg->join_tab), best_ref(join_arg->best_ref),
+      map2table(join_arg->map2table), table_vector(join_arg->table),
+      positions(join_arg->positions), sort_positions(join_arg->sort_positions),
+      best_positions(join_arg->best_positions),
+      next_sort_position(join_arg->next_sort_position),
+      sort_space(join_arg->sort_space), table_count(join_arg->table_count),
+      top_join_tab_count(join_arg->top_join_tab_count),
+      const_tables(join_arg->const_tables),
+      aggr_tables(join_arg->aggr_tables),
+      const_table_map(join_arg->const_table_map),
+      found_const_table_map(join_arg->found_const_table_map),
+      allowed_tables(join_arg->allowed_tables),
+      allowed_top_level_tables(join_arg->allowed_top_level_tables),
+      eq_ref_tables(join_arg->eq_ref_tables),
+      tables_list(join_arg->tables_list), fields(join_arg->fields),
+      conds(join_arg->conds), order(join_arg->order),
+      group_list(join_arg->group_list),
+      send_group_parts(join_arg->send_group_parts),
+      first_record(join_arg->first_record),
+      group_sent(join_arg->group_sent), need_tmp(join_arg->need_tmp),
+      simple_order(join_arg->simple_order),
+      simple_group(join_arg->simple_group),
+      no_order(join_arg->no_order), group(join_arg->group),
+      select_distinct(join_arg->select_distinct),
+      sort_and_group(join_arg->sort_and_group),
+      skip_sort_order(join_arg->skip_sort_order),
+      ordered_index_usage(join_arg->ordered_index_usage),
+#ifndef DBUG_OFF
+      dbug_join_tab_array_size(join_arg->dbug_join_tab_array_size),
+#endif
+      best_read(join_arg->best_read),
+      join_record_count(join_arg->join_record_count),
+      zero_result_cause(join_arg->zero_result_cause),
+      impossible_where(join_arg->impossible_where),
+      table_join_tab(table_arg->reginfo.join_tab)
+  {}
+
+  void restore()
+  {
+    join->join_tab= join_tab;
+    join->best_ref= best_ref;
+    join->map2table= map2table;
+    join->table= table_vector;
+    join->positions= positions;
+    join->sort_positions= sort_positions;
+    join->best_positions= best_positions;
+    join->next_sort_position= next_sort_position;
+    join->sort_space= sort_space;
+    join->table_count= table_count;
+    join->top_join_tab_count= top_join_tab_count;
+    join->const_tables= const_tables;
+    join->aggr_tables= aggr_tables;
+    join->const_table_map= const_table_map;
+    join->found_const_table_map= found_const_table_map;
+    join->allowed_tables= allowed_tables;
+    join->allowed_top_level_tables= allowed_top_level_tables;
+    join->eq_ref_tables= eq_ref_tables;
+    join->tables_list= tables_list;
+    join->fields= fields;
+    join->conds= conds;
+    join->order= order;
+    join->group_list= group_list;
+    join->send_group_parts= send_group_parts;
+    join->first_record= first_record;
+    join->group_sent= group_sent;
+    join->need_tmp= need_tmp;
+    join->simple_order= simple_order;
+    join->simple_group= simple_group;
+    join->no_order= no_order;
+    join->group= group;
+    join->select_distinct= select_distinct;
+    join->sort_and_group= sort_and_group;
+    join->skip_sort_order= skip_sort_order;
+    join->ordered_index_usage= ordered_index_usage;
+#ifndef DBUG_OFF
+    join->dbug_join_tab_array_size= dbug_join_tab_array_size;
+#endif
+    join->best_read= best_read;
+    join->join_record_count= join_record_count;
+    join->zero_result_cause= zero_result_cause;
+    join->impossible_where= impossible_where;
+    join->join_tab_ranges.empty();
+    table->reginfo.join_tab= table_join_tab;
+  }
+};
+
+class Plan_cache_int_store_key : public store_key
+{
+  THD *thd;
+  Field *field;
+  Item_param *item;
+  uchar *key;
+  uint key_length;
+
+public:
+  Plan_cache_int_store_key(THD *thd_arg, Field *field_arg, uchar *key_arg,
+                           uint key_length_arg, Item_param *item_arg)
+    : store_key(), thd(thd_arg), field(field_arg), item(item_arg),
+      key(key_arg), key_length(key_length_arg)
+  {}
+
+  enum Type type() const override { return ITEM_STORE_KEY; }
+  const char *name() const override { return "func"; }
+
+protected:
+  enum store_key_result copy_inner() override
+  {
+    const longlong *value;
+    uchar *old_ptr;
+    uchar *old_null_ptr;
+    uchar old_null_bit;
+    int error;
+
+    if (item->has_no_value() || item->null_value)
+    {
+      null_key= true;
+      return STORE_KEY_OK;
+    }
+
+    if (!(value= item->const_ptr_longlong()))
+      return STORE_KEY_FATAL;
+
+    bzero(key, key_length);
+    old_ptr= field->ptr;
+    old_null_ptr= field->null_ptr;
+    old_null_bit= field->null_bit;
+    field->move_field(key, 0, 0);
+    error= field->store(*value, item->unsigned_flag);
+    field->move_field(old_ptr, old_null_ptr, old_null_bit);
+
+    null_key= item->null_value;
+    return error || thd->is_error() ? STORE_KEY_FATAL : STORE_KEY_OK;
+  }
+};
+
+static bool plan_cache_can_use_int_store_key(KEY_PART_INFO *key_part,
+                                             Item_param *param_item)
+{
+  if (!key_part || !key_part->field || !param_item ||
+      param_item->null_value || param_item->has_no_value() ||
+      !param_item->const_ptr_longlong())
+    return false;
+
+  switch (key_part->field->real_type()) {
+  case MYSQL_TYPE_TINY:
+  case MYSQL_TYPE_SHORT:
+  case MYSQL_TYPE_INT24:
+  case MYSQL_TYPE_LONG:
+  case MYSQL_TYPE_LONGLONG:
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool build_unique_eq_const_lookup_plan(THD *thd, SELECT_LEX *select_lex,
+                                       JOIN *join, uint key_nr,
+                                       Item_param *param_item)
+{
+  TABLE_LIST *table_list;
+  TABLE *table;
+  KEY *keyinfo= 0;
+  KEY_PART_INFO *key_part;
+  JOIN_TAB *tab;
+  JOIN_TAB **best_ref;
+  JOIN_TAB **map2table;
+  TABLE **table_vector;
+  POSITION *positions;
+  POSITION *sort_positions;
+  POSITION *best_positions;
+  JOIN_TAB_RANGE *root_range;
+  ulonglong setup_timer;
+  ulonglong read_timer;
+
+  if (!thd || !select_lex || !join || thd->lex->analyze_stmt ||
+      (join->select_options & SELECT_DESCRIBE))
+    return false;
+
+  setup_timer= plan_cache::profile_start(thd);
+
+  if (select_lex->leaf_tables.elements != 1 ||
+      !(table_list= select_lex->leaf_tables.head()) ||
+      !(table= table_list->table))
+    return false;
+
+  if (!param_item || param_item->null_value || param_item->has_no_value())
+    return false;
+
+  if (key_nr >= table->s->keys)
+    return false;
+
+  keyinfo= table->key_info + key_nr;
+  if (keyinfo->is_ignored ||
+      (keyinfo->flags & HA_NULL_PART_KEY) ||
+      !(keyinfo->flags & HA_NOSAME) ||
+      keyinfo->user_defined_key_parts != 1 ||
+      !keyinfo->key_part ||
+      !keyinfo->key_part[0].field ||
+      keyinfo->key_part[0].field->real_maybe_null())
+    return false;
+
+  key_part= keyinfo->key_part;
+  if (key_part[0].store_length > MAX_KEY_LENGTH)
+    return false;
+
+  /*
+    This helper installs a compact executable JOIN shape.  If a caller ever
+    reaches us after a range list has already been built, fail closed so the
+    normal optimizer remains the owner of that state.
+  */
+  if (join->join_tab_ranges.elements)
+    return false;
+
+  if (!multi_alloc_root(thd->mem_root,
+                        &tab, sizeof(JOIN_TAB),
+                        &best_ref, sizeof(JOIN_TAB*) * 2,
+                        &map2table, sizeof(JOIN_TAB*) * MAX_TABLES,
+                        &table_vector, sizeof(TABLE*) * 2,
+                        &positions, sizeof(POSITION) * 2,
+                        &sort_positions, sizeof(POSITION) * 2,
+                        &best_positions, sizeof(POSITION) * 2,
+                        NullS))
+    return false;
+
+  bzero((void*) tab, sizeof(JOIN_TAB));
+  bzero(best_ref, sizeof(JOIN_TAB*) * 2);
+  bzero(map2table, sizeof(JOIN_TAB*) * MAX_TABLES);
+  bzero(table_vector, sizeof(TABLE*) * 2);
+  new ((char*) positions) POSITION;
+  new ((char*) (positions + 1)) POSITION;
+  new ((char*) sort_positions) POSITION;
+  new ((char*) (sort_positions + 1)) POSITION;
+  new ((char*) best_positions) POSITION;
+  new ((char*) (best_positions + 1)) POSITION;
+
+  tab->join= join;
+  tab->table= table;
+  tab->tab_list= table_list;
+  tab->fields= &select_lex->item_list;
+  tab->all_fields= &join->all_fields;
+  tab->on_expr_ref= (Item**) &null_ptr;
+  tab->type= JT_CONST;
+  tab->keys.set_bit(key_nr);
+  tab->const_keys.set_bit(key_nr);
+  tab->checked_keys.set_bit(key_nr);
+  tab->read_record.table= table;
+  tab->read_record.unlock_row= join_const_unlock_row;
+  tab->read_record.print_error= true;
+  tab->records= 1;
+  tab->found_records= 1;
+  tab->records_init= 1.0;
+  tab->records_read= 1.0;
+  tab->records_out= 1.0;
+  tab->cond_selectivity= 1.0;
+  tab->partial_join_cardinality= 1.0;
+  tab->join_read_time= 0.0;
+  tab->index= key_nr;
+  tab->ref.key_parts= 1;
+  tab->ref.key_length= key_part[0].store_length;
+  tab->ref.key= (int) key_nr;
+  tab->ref.key_err= 1;
+  tab->ref.has_record= false;
+  tab->ref.const_ref_part_map= 1;
+  tab->ref.null_rejecting= 1;
+  tab->ref.null_ref_part= NO_REF_PART;
+  tab->ref.disable_cache= false;
+  tab->ref.uses_splitting= false;
+
+  if (!(tab->ref.key_buff=
+          thd->calloc<uchar>(ALIGN_SIZE(tab->ref.key_length) * 2)) ||
+      !(tab->ref.key_copy= thd->alloc<store_key*>(1)) ||
+      !(tab->ref.items= thd->alloc<Item*>(1)) ||
+      !(tab->ref.cond_guards= thd->alloc<bool*>(1)))
+    return false;
+
+  tab->ref.key_buff2= tab->ref.key_buff + ALIGN_SIZE(tab->ref.key_length);
+  tab->ref.key_copy[0]= 0;
+  tab->ref.items[0]= param_item;
+  tab->ref.cond_guards[0]= 0;
+
+  {
+    store_key_item key_copy(thd, key_part[0].field, tab->ref.key_buff,
+                            0, key_part[0].length, param_item, false);
+    if ((key_copy.copy(thd) & 1) || key_copy.null_key || thd->is_error())
+      return false;
+  }
+
+  if (!(root_range= new (thd->mem_root) JOIN_TAB_RANGE))
+    return false;
+
+  root_range->start= tab;
+  root_range->end= tab + 1;
+
+  JOIN_TAB *old_join_tab= join->join_tab;
+  JOIN_TAB **old_best_ref= join->best_ref;
+  JOIN_TAB **old_map2table= join->map2table;
+  TABLE **old_table_vector= join->table;
+  POSITION *old_positions= join->positions;
+  POSITION *old_sort_positions= join->sort_positions;
+  POSITION *old_best_positions= join->best_positions;
+  POSITION *old_next_sort_position= join->next_sort_position;
+  uint old_sort_space= join->sort_space;
+  uint old_table_count= join->table_count;
+  uint old_top_join_tab_count= join->top_join_tab_count;
+  uint old_const_tables= join->const_tables;
+  uint old_aggr_tables= join->aggr_tables;
+  table_map old_const_table_map= join->const_table_map;
+  table_map old_found_const_table_map= join->found_const_table_map;
+  table_map old_allowed_tables= join->allowed_tables;
+  table_map old_allowed_top_level_tables= join->allowed_top_level_tables;
+  table_map old_eq_ref_tables= join->eq_ref_tables;
+  TABLE_LIST *old_tables_list= join->tables_list;
+  List<Item> *old_fields= join->fields;
+  Item *old_conds= join->conds;
+  bool old_need_tmp= join->need_tmp;
+  bool old_simple_order= join->simple_order;
+  bool old_simple_group= join->simple_group;
+  bool old_no_order= join->no_order;
+  double old_best_read= join->best_read;
+  double old_join_record_count= join->join_record_count;
+  const char *old_zero_result_cause= join->zero_result_cause;
+  bool old_impossible_where= join->impossible_where;
+  JOIN_TAB *old_table_join_tab= table->reginfo.join_tab;
+  bool old_table_const_table= table->const_table;
+  bool old_table_null_row= table->null_row;
+  uint old_table_status= table->status;
+
+  join->join_tab= tab;
+  join->best_ref= best_ref;
+  join->map2table= map2table;
+  join->table= table_vector;
+  join->positions= positions;
+  join->sort_positions= sort_positions;
+  join->best_positions= best_positions;
+  join->next_sort_position= sort_positions;
+  join->sort_space= 2;
+  join->table_count= 1;
+  join->top_join_tab_count= 1;
+  join->const_tables= 1;
+  join->aggr_tables= 0;
+  join->const_table_map= table->map;
+  join->allowed_tables= ~table_map(0);
+  join->allowed_top_level_tables= table->map;
+  join->eq_ref_tables= table->map;
+  join->tables_list= table_list;
+  join->fields= &select_lex->item_list;
+  join->conds= select_lex->where;
+  join->need_tmp= false;
+  join->simple_order= true;
+  join->simple_group= true;
+  join->no_order= true;
+  join->best_read= 1.0;
+  join->join_record_count= 1.0;
+  join->zero_result_cause= 0;
+  join->impossible_where= false;
+
+  best_ref[0]= tab;
+  best_ref[1]= 0;
+  table_vector[0]= table;
+  table_vector[1]= 0;
+  if (table->tablenr < MAX_TABLES)
+    map2table[table->tablenr]= tab;
+  table->reginfo.join_tab= tab;
+
+  set_position(join, 0, tab, 0);
+  best_positions[0]= positions[0];
+  tab->records_init= positions[0].records_init;
+  tab->records_read= positions[0].records_read;
+  tab->records_out= positions[0].records_out;
+  tab->cond_selectivity= positions[0].cond_selectivity;
+
+  plan_cache::profile_add(
+      thd, setup_timer,
+      &thd->status_var.cached_plan_profile_hit_unique_setup_us);
+  read_timer= plan_cache::profile_start(thd);
+  int error= join_read_const_table(thd, tab, &join->positions[0]);
+  plan_cache::profile_add(
+      thd, read_timer,
+      &thd->status_var.cached_plan_profile_hit_unique_read_us);
+  DBUG_EXECUTE_IF("session_plan_cache_const_lookup_fail",
+  {
+    DBUG_PRINT("plan_cache",
+               ("debug const lookup fallback select_lex=%p", select_lex));
+    error= 1;
+  });
+  if (error > 0 || thd->is_error() ||
+      join->join_tab_ranges.push_back(root_range, thd->mem_root))
+  {
+    join->join_tab= old_join_tab;
+    join->best_ref= old_best_ref;
+    join->map2table= old_map2table;
+    join->table= old_table_vector;
+    join->positions= old_positions;
+    join->sort_positions= old_sort_positions;
+    join->best_positions= old_best_positions;
+    join->next_sort_position= old_next_sort_position;
+    join->sort_space= old_sort_space;
+    join->table_count= old_table_count;
+    join->top_join_tab_count= old_top_join_tab_count;
+    join->const_tables= old_const_tables;
+    join->aggr_tables= old_aggr_tables;
+    join->const_table_map= old_const_table_map;
+    join->found_const_table_map= old_found_const_table_map;
+    join->allowed_tables= old_allowed_tables;
+    join->allowed_top_level_tables= old_allowed_top_level_tables;
+    join->eq_ref_tables= old_eq_ref_tables;
+    join->tables_list= old_tables_list;
+    join->fields= old_fields;
+    join->conds= old_conds;
+    join->need_tmp= old_need_tmp;
+    join->simple_order= old_simple_order;
+    join->simple_group= old_simple_group;
+    join->no_order= old_no_order;
+    join->best_read= old_best_read;
+    join->join_record_count= old_join_record_count;
+    join->zero_result_cause= old_zero_result_cause;
+    join->impossible_where= old_impossible_where;
+    table->reginfo.join_tab= old_table_join_tab;
+    table->const_table= old_table_const_table;
+    table->null_row= old_table_null_row;
+    table->status= old_table_status;
+    return false;
+  }
+  if (error < 0)
+  {
+    join->found_const_table_map= 0;
+    join->zero_result_cause=
+      "Impossible WHERE noticed after reading const tables";
+  }
+  else
+    join->found_const_table_map= table->map;
+
+  DBUG_PRINT("plan_cache",
+             ("built unique equality const lookup plan select_lex=%p key=%u "
+              "row_found=%d",
+              select_lex, key_nr, error == 0));
+  return true;
+}
+
+bool build_ref_eq_lookup_plan(THD *thd, SELECT_LEX *select_lex, JOIN *join,
+                              uint key_nr, Item_param *param_item,
+                              ulonglong *alloc_counter,
+                              ulonglong *setup_counter)
+{
+  TABLE_LIST *table_list;
+  TABLE *table;
+  KEY *keyinfo= 0;
+  KEY_PART_INFO *key_part;
+  JOIN_TAB *tab;
+  JOIN_TAB **best_ref;
+  JOIN_TAB **map2table;
+  TABLE **table_vector;
+  POSITION *positions;
+  POSITION *sort_positions;
+  POSITION *best_positions;
+  uchar *key_buff;
+  store_key **key_copy;
+  Item **ref_items;
+  bool **cond_guards;
+  void *key_copy_item;
+  JOIN_TAB_RANGE *root_range;
+  uint key_length;
+  uint aligned_key_length;
+  bool use_int_store_key;
+  size_t key_copy_size;
+  ulonglong alloc_timer;
+  ulonglong setup_timer;
+
+  if (!thd || !select_lex || !join || thd->lex->analyze_stmt ||
+      (join->select_options & SELECT_DESCRIBE))
+    return false;
+
+  if (select_lex->leaf_tables.elements != 1 ||
+      !(table_list= select_lex->leaf_tables.head()) ||
+      !(table= table_list->table))
+    return false;
+
+  if (!param_item || param_item->null_value || param_item->has_no_value())
+    return false;
+
+  if (key_nr >= table->s->keys)
+    return false;
+
+  keyinfo= table->key_info + key_nr;
+  if (keyinfo->is_ignored ||
+      (keyinfo->flags & HA_NULL_PART_KEY) ||
+      keyinfo->user_defined_key_parts != 1 ||
+      !keyinfo->key_part ||
+      !keyinfo->key_part[0].field ||
+      keyinfo->key_part[0].field->real_maybe_null())
+    return false;
+
+  key_part= keyinfo->key_part;
+  key_length= key_part[0].store_length;
+  if (key_length > MAX_KEY_LENGTH || join->join_tab_ranges.elements)
+    return false;
+  aligned_key_length= ALIGN_SIZE(key_length);
+  use_int_store_key= plan_cache_can_use_int_store_key(key_part, param_item);
+  key_copy_size= use_int_store_key ?
+    sizeof(Plan_cache_int_store_key) : sizeof(store_key_item);
+
+  alloc_timer= plan_cache::profile_start(thd);
+  if (!multi_alloc_root(thd->mem_root,
+                        &tab, sizeof(JOIN_TAB),
+                        &best_ref, sizeof(JOIN_TAB*) * 2,
+                        &map2table, sizeof(JOIN_TAB*) * MAX_TABLES,
+                        &table_vector, sizeof(TABLE*) * 2,
+                        &positions, sizeof(POSITION),
+                        &sort_positions, sizeof(POSITION),
+                        &best_positions, sizeof(POSITION),
+                        &key_buff, aligned_key_length * 2,
+                        &key_copy, sizeof(store_key*) * 2,
+                        &ref_items, sizeof(Item*),
+                        &cond_guards, sizeof(bool*),
+                        &key_copy_item, key_copy_size,
+                        NullS))
+  {
+    if (alloc_counter)
+      plan_cache::profile_add(thd, alloc_timer, alloc_counter);
+    return false;
+  }
+
+  bzero((void*) tab, sizeof(JOIN_TAB));
+  bzero(map2table, sizeof(JOIN_TAB*) * MAX_TABLES);
+  /* Ref equality hits have no ORDER/DISTINCT tail POSITION consumers. */
+  new ((char*) positions) POSITION;
+  new ((char*) sort_positions) POSITION;
+  new ((char*) best_positions) POSITION;
+  if (alloc_counter)
+    plan_cache::profile_add(thd, alloc_timer, alloc_counter);
+
+  setup_timer= plan_cache::profile_start(thd);
+  tab->join= join;
+  tab->table= table;
+  tab->tab_list= table_list;
+  tab->fields= &select_lex->item_list;
+  tab->all_fields= &join->all_fields;
+  tab->on_expr_ref= (Item**) &null_ptr;
+  tab->type= JT_REF;
+  tab->keys.set_bit(key_nr);
+  tab->const_keys.set_bit(key_nr);
+  tab->checked_keys.set_bit(key_nr);
+  tab->read_first_record= join_read_always_key;
+  tab->next_select= setup_end_select_func(join);
+  tab->read_record.table= table;
+  tab->read_record.unlock_row= rr_unlock_row;
+  tab->read_record.print_error= true;
+  tab->read_record.read_record_func=
+    ((keyinfo->flags & HA_NOSAME) && keyinfo->user_defined_key_parts == 1) ?
+    join_no_more_records : join_read_next_same;
+  tab->records= table->file ? table->file->stats.records : 0;
+  tab->found_records= tab->records;
+  tab->records_init= tab->records ? (double) tab->records : 1.0;
+  tab->records_read= tab->records_init;
+  tab->records_out= tab->records_init;
+  tab->cond_selectivity= 1.0;
+  tab->partial_join_cardinality= tab->records_init;
+  tab->join_read_time= 0.0;
+  tab->index= key_nr;
+  tab->ref.key_parts= 1;
+  tab->ref.key_length= key_length;
+  tab->ref.key= (int) key_nr;
+  tab->ref.key_err= 1;
+  tab->ref.has_record= false;
+  tab->ref.const_ref_part_map= 0;
+  tab->ref.null_rejecting= 1;
+  tab->ref.null_ref_part= NO_REF_PART;
+  tab->ref.disable_cache= false;
+  tab->ref.uses_splitting= false;
+
+  tab->ref.key_buff= key_buff;
+  tab->ref.key_buff2= key_buff + aligned_key_length;
+  tab->ref.key_copy= key_copy;
+  tab->ref.items= ref_items;
+  tab->ref.cond_guards= cond_guards;
+  if (use_int_store_key)
+    tab->ref.key_copy[0]=
+      ::new (key_copy_item)
+      Plan_cache_int_store_key(thd, key_part[0].field, tab->ref.key_buff,
+                               key_length, param_item);
+  else
+    tab->ref.key_copy[0]=
+      ::new (key_copy_item)
+      store_key_item(thd, key_part[0].field, tab->ref.key_buff, 0,
+                     key_part[0].length, param_item, false);
+  tab->ref.key_copy[1]= 0;
+  tab->ref.items[0]= param_item;
+  tab->ref.cond_guards[0]= 0;
+
+  if (!(root_range= new (thd->mem_root) JOIN_TAB_RANGE))
+  {
+    if (setup_counter)
+      plan_cache::profile_add(thd, setup_timer, setup_counter);
+    return false;
+  }
+
+  root_range->start= tab;
+  root_range->end= tab + 1;
+
+  if (join->join_tab_ranges.push_back(root_range, thd->mem_root))
+  {
+    if (setup_counter)
+      plan_cache::profile_add(thd, setup_timer, setup_counter);
+    return false;
+  }
+
+  join->join_tab= tab;
+  join->best_ref= best_ref;
+  join->map2table= map2table;
+  join->table= table_vector;
+  join->positions= positions;
+  join->sort_positions= sort_positions;
+  join->best_positions= best_positions;
+  join->next_sort_position= sort_positions;
+  join->sort_space= 1;
+  join->table_count= 1;
+  join->top_join_tab_count= 1;
+  join->const_tables= 0;
+  join->aggr_tables= 0;
+  join->const_table_map= 0;
+  join->found_const_table_map= 0;
+  join->allowed_tables= ~table_map(0);
+  join->allowed_top_level_tables= table->map;
+  join->eq_ref_tables= 0;
+  join->tables_list= table_list;
+  join->fields= &select_lex->item_list;
+  join->conds= select_lex->where;
+  join->need_tmp= false;
+  join->simple_order= true;
+  join->simple_group= true;
+  join->no_order= true;
+  join->best_read= tab->records_read;
+  join->join_record_count= tab->records_out;
+  join->zero_result_cause= 0;
+  join->impossible_where= false;
+
+  best_ref[0]= tab;
+  best_ref[1]= 0;
+  table_vector[0]= table;
+  table_vector[1]= 0;
+  if (table->tablenr < MAX_TABLES)
+    map2table[table->tablenr]= tab;
+  table->reginfo.join_tab= tab;
+
+  set_position(join, 0, tab, 0);
+  best_positions[0]= positions[0];
+  tab->records_init= positions[0].records_init;
+  tab->records_read= positions[0].records_read;
+  tab->records_out= positions[0].records_out;
+  tab->cond_selectivity= positions[0].cond_selectivity;
+
+  DBUG_PRINT("plan_cache",
+             ("built ref equality lookup plan select_lex=%p key=%u",
+              select_lex, key_nr));
+  if (setup_counter)
+    plan_cache::profile_add(thd, setup_timer, setup_counter);
+  return true;
+}
+
+
+static bool
+plan_cache_distinct_range_uses_single_access_tab(SELECT_LEX *select_lex,
+                                                 JOIN *join)
+{
+  ORDER *order;
+  TABLE_LIST *table_list;
+  handlerton *ht;
+  List_iterator_fast<Item> fields_it(join->fields_list);
+  Item *item= fields_it++;
+
+  if (!(select_lex->options & SELECT_DISTINCT) ||
+      select_lex->with_sum_func || select_lex->n_sum_items ||
+      select_lex->n_child_sum_items || select_lex->group_list.elements ||
+      select_lex->order_list.elements != 1 ||
+      select_lex->have_window_funcs() ||
+      select_lex->custom_agg_func_used() ||
+      select_lex->having || select_lex->prep_having ||
+      join->having || join->tmp_having || join->procedure ||
+      join->implicit_grouping ||
+      join->rollup.state != ROLLUP::STATE_NONE ||
+      (join->select_options & OPTION_BUFFER_RESULT) ||
+      join->unit->lim.is_with_ties() ||
+      join->need_tmp ||
+      join->aggr_tables ||
+      join->fields_list.elements != 1 ||
+      join->all_fields.elements != join->fields_list.elements ||
+      !item || fields_it++)
+    return false;
+
+  if (select_lex->leaf_tables.elements != 1 ||
+      !(table_list= select_lex->leaf_tables.head()) ||
+      !table_list->table || !table_list->table->file)
+    return false;
+
+  ht= table_list->table->file->partition_ht();
+  if (ht && ht->create_group_by)
+    return false;
+
+  order= select_lex->order_list.first;
+  return order && !order->next && order->in_field_list &&
+         order->item && *order->item && item->eq(*order->item, true);
+}
+
+
+bool build_range_between_lookup_plan(THD *thd, SELECT_LEX *select_lex,
+                                     JOIN *join, uint key_nr,
+                                     field_index_t fieldnr,
+                                     Item_param *recipe_low_param,
+                                     Item_param *recipe_high_param,
+                                     ha_rows quick_records,
+                                     double quick_read_time,
+                                     uint quick_mrr_flags,
+                                     uint quick_mrr_buf_size)
+{
+  TABLE_LIST *table_list;
+  TABLE *table;
+  KEY *keyinfo= 0;
+  KEY_PART_INFO *key_part;
+  JOIN_TAB *tab;
+  JOIN_TAB **best_ref;
+  JOIN_TAB **map2table;
+  TABLE **table_vector;
+  POSITION *positions;
+  POSITION *sort_positions;
+  POSITION *best_positions;
+  JOIN_TAB_RANGE *root_range;
+  SQL_SELECT *select= 0;
+  SQL_SELECT *select_mem= 0;
+  QUICK_RANGE_SELECT *quick;
+  int error= 0;
+  key_map keys;
+  quick_select_return range_rc;
+  bool needs_post_access_setup;
+  ulonglong make_select_timer;
+  ulonglong quick_select_timer;
+  ulonglong setup_timer;
+  ulonglong setup_alloc_timer;
+  ulonglong setup_base_timer;
+  ulonglong setup_distinct_timer;
+  ulonglong setup_order_timer;
+  ulonglong setup_post_timer;
+  uint join_tab_capacity;
+  uint position_capacity;
+  bool construct_position_tail;
+  bool distinct_single_access_tab;
+
+  if (!thd || !select_lex || !join || thd->lex->analyze_stmt ||
+      (join->select_options & SELECT_DESCRIBE))
+    return false;
+
+  if (select_lex->leaf_tables.elements != 1 ||
+      !(table_list= select_lex->leaf_tables.head()) ||
+      !(table= table_list->table))
+    return false;
+
+  if (key_nr >= table->s->keys)
+    return false;
+
+  if (!recipe_low_param ||
+      recipe_low_param->null_value || recipe_low_param->has_no_value() ||
+      !recipe_high_param ||
+      recipe_high_param->null_value || recipe_high_param->has_no_value())
+    return false;
+
+  keyinfo= table->key_info + key_nr;
+  if (keyinfo->is_ignored ||
+      (keyinfo->flags & HA_NULL_PART_KEY) ||
+      keyinfo->user_defined_key_parts != 1 ||
+      !keyinfo->key_part ||
+      !keyinfo->key_part[0].field ||
+      keyinfo->key_part[0].field->real_maybe_null() ||
+      keyinfo->key_part[0].fieldnr != fieldnr)
+    return false;
+
+  key_part= keyinfo->key_part;
+  if (key_part[0].store_length > MAX_KEY_LENGTH || join->join_tab_ranges.elements)
+    return false;
+
+  needs_post_access_setup=
+    select_lex->with_sum_func || select_lex->n_sum_items ||
+    select_lex->n_child_sum_items || select_lex->order_list.elements ||
+    (select_lex->options & SELECT_DISTINCT) || select_lex->group_list.elements;
+  distinct_single_access_tab=
+    plan_cache_distinct_range_uses_single_access_tab(select_lex, join);
+  /*
+    General DISTINCT may add post-join tabs.  The exact sysbench DISTINCT range
+    shape groups and sorts on the access tab, so it does not need spare tabs.
+  */
+  join_tab_capacity=
+    (select_lex->options & SELECT_DISTINCT) && !distinct_single_access_tab ?
+    3 : 1;
+  /* ORDER/DISTINCT may inspect tail POSITION slots; simple/SUM range do not. */
+  construct_position_tail= join_tab_capacity > 1 ||
+                           select_lex->order_list.elements;
+  position_capacity= construct_position_tail ? 2 : 1;
+
+  if (!select_lex->where)
+    return false;
+
+  quick_select_timer= plan_cache::profile_start(thd);
+  quick= get_quick_select_for_between(thd, table, key_nr,
+                                      recipe_low_param, recipe_high_param,
+                                      quick_records, quick_read_time,
+                                      quick_mrr_flags, quick_mrr_buf_size);
+  if (quick)
+  {
+    range_rc= SQL_SELECT::OK;
+  }
+  else
+  {
+    make_select_timer= plan_cache::profile_start(thd);
+    select= make_select(table, 0, 0, select_lex->where, (SORT_INFO*) 0,
+                        false, &error);
+    plan_cache::profile_add(
+        thd, make_select_timer,
+        &thd->status_var.cached_plan_profile_hit_range_make_select_us);
+    if (!select || error)
+      return false;
+    keys.clear_all();
+    keys.set_bit(key_nr);
+    range_rc= select->test_quick_select(thd, keys, 0, HA_POS_ERROR,
+                                        true, false, false, true,
+                                        Item_func::BITMAP_NONE);
+  }
+  plan_cache::profile_add(
+      thd, quick_select_timer,
+      &thd->status_var.cached_plan_profile_hit_range_quick_select_us);
+  if (range_rc != SQL_SELECT::OK)
+  {
+    delete select;
+    delete quick;
+    return false;
+  }
+  if (quick)
+  {
+    if (quick->get_type() != QUICK_SELECT_I::QS_TYPE_RANGE ||
+        quick->index != key_nr ||
+        quick->used_key_parts != 1)
+    {
+      delete quick;
+      return false;
+    }
+  }
+  else if (!select->quick ||
+           select->quick->get_type() != QUICK_SELECT_I::QS_TYPE_RANGE ||
+           select->quick->index != key_nr ||
+           select->quick->used_key_parts != 1)
+  {
+    delete select;
+    return false;
+  }
+
+  setup_timer= plan_cache::profile_start(thd);
+  setup_alloc_timer= plan_cache::profile_start(thd);
+  bool alloc_ok;
+  if (quick)
+    alloc_ok= multi_alloc_root(thd->mem_root,
+                               &select_mem, sizeof(SQL_SELECT),
+                               &tab, sizeof(JOIN_TAB) * join_tab_capacity,
+                               &best_ref, sizeof(JOIN_TAB*) * 2,
+                               &map2table, sizeof(JOIN_TAB*) * MAX_TABLES,
+                               &table_vector, sizeof(TABLE*) * 2,
+                               &positions, sizeof(POSITION) * position_capacity,
+                               &sort_positions, sizeof(POSITION) * position_capacity,
+                               &best_positions, sizeof(POSITION) * position_capacity,
+                               &root_range, sizeof(JOIN_TAB_RANGE),
+                               NullS);
+  else
+    alloc_ok= multi_alloc_root(thd->mem_root,
+                               &tab, sizeof(JOIN_TAB) * join_tab_capacity,
+                               &best_ref, sizeof(JOIN_TAB*) * 2,
+                               &map2table, sizeof(JOIN_TAB*) * MAX_TABLES,
+                               &table_vector, sizeof(TABLE*) * 2,
+                               &positions, sizeof(POSITION) * position_capacity,
+                               &sort_positions, sizeof(POSITION) * position_capacity,
+                               &best_positions, sizeof(POSITION) * position_capacity,
+                               &root_range, sizeof(JOIN_TAB_RANGE),
+                               NullS);
+  if (!alloc_ok)
+  {
+    delete select;
+    delete quick;
+    return false;
+  }
+  if (quick)
+  {
+    select= select_mem;
+    ::new ((void*) select) SQL_SELECT;
+    select->read_tables= 0;
+    select->const_tables= 0;
+    select->head= table;
+    select->cond= select_lex->where;
+    select->quick= quick;
+  }
+
+  bzero((void*) tab, sizeof(JOIN_TAB) * join_tab_capacity);
+  bzero(map2table, sizeof(JOIN_TAB*) * MAX_TABLES);
+  new ((char*) positions) POSITION;
+  if (construct_position_tail)
+    new ((char*) (positions + 1)) POSITION;
+  new ((char*) sort_positions) POSITION;
+  if (construct_position_tail)
+    new ((char*) (sort_positions + 1)) POSITION;
+  new ((char*) best_positions) POSITION;
+  if (construct_position_tail)
+    new ((char*) (best_positions + 1)) POSITION;
+  plan_cache::profile_add(
+      thd, setup_alloc_timer,
+      &thd->status_var.cached_plan_profile_hit_range_setup_alloc_us);
+
+  setup_base_timer= plan_cache::profile_start(thd);
+  tab->join= join;
+  tab->table= table;
+  tab->tab_list= table_list;
+  tab->fields= &select_lex->item_list;
+  tab->all_fields= &join->all_fields;
+  tab->on_expr_ref= (Item**) &null_ptr;
+  tab->type= JT_RANGE;
+  tab->keys.set_bit(key_nr);
+  tab->const_keys.set_bit(key_nr);
+  tab->checked_keys.set_bit(key_nr);
+  tab->read_first_record= join_init_read_record;
+  tab->next_select= setup_end_select_func(join);
+  tab->select= select;
+  tab->use_quick= 1;
+  tab->records= table->file ? table->file->stats.records : 0;
+  tab->found_records= select->quick->records;
+  tab->records_init= select->quick->records ? (double) select->quick->records : 1.0;
+  tab->records_read= tab->records_init;
+  tab->records_out= tab->records_init;
+  tab->cond_selectivity= 1.0;
+  tab->partial_join_cardinality= tab->records_init;
+  tab->join_read_time= select->quick->read_time;
+  tab->index= MAX_KEY;
+  tab->ref.key= -1;
+
+  root_range->start= tab;
+  root_range->end= tab + 1;
+
+  if (join->join_tab_ranges.push_back(root_range, thd->mem_root))
+  {
+    delete select;
+    return false;
+  }
+
+  Plan_cache_join_restore restore(join, table);
+
+  join->join_tab= tab;
+  join->best_ref= best_ref;
+  join->map2table= map2table;
+  join->table= table_vector;
+  join->positions= positions;
+  join->sort_positions= sort_positions;
+  join->best_positions= best_positions;
+  join->next_sort_position= sort_positions;
+  join->sort_space= position_capacity;
+  join->table_count= 1;
+  join->top_join_tab_count= 1;
+  join->const_tables= 0;
+  join->aggr_tables= 0;
+#ifndef DBUG_OFF
+  join->dbug_join_tab_array_size= join_tab_capacity;
+#endif
+  join->const_table_map= 0;
+  join->found_const_table_map= 0;
+  join->allowed_tables= ~table_map(0);
+  join->allowed_top_level_tables= table->map;
+  join->eq_ref_tables= 0;
+  join->tables_list= table_list;
+  join->fields= &select_lex->item_list;
+  join->conds= select_lex->where;
+  join->sort_and_group= false;
+  join->first_record= false;
+  join->group_sent= false;
+  join->accepted_rows= 0;
+  plan_cache::profile_add(
+      thd, setup_base_timer,
+      &thd->status_var.cached_plan_profile_hit_range_setup_base_us);
+  if (select_lex->options & SELECT_DISTINCT)
+  {
+    setup_distinct_timer= plan_cache::profile_start(thd);
+    List<Item> distinct_all_fields(select_lex->item_list, thd->mem_root);
+    TMP_TABLE_PARAM distinct_tmp_param;
+    bool all_order_fields_used= false;
+    ORDER *distinct_group;
+
+    DBUG_EXECUTE_IF("session_plan_cache_distinct_range_setup_fail",
+    {
+      DBUG_PRINT("plan_cache",
+                 ("debug distinct range setup fallback select_lex=%p",
+                  select_lex));
+      restore.restore();
+      delete select;
+      return false;
+    });
+
+    if (distinct_all_fields.elements != select_lex->item_list.elements)
+    {
+      restore.restore();
+      delete select;
+      return false;
+    }
+
+    count_field_types(select_lex, &distinct_tmp_param,
+                      distinct_all_fields, false);
+
+    distinct_group=
+      create_plan_cache_single_distinct_group(thd,
+                                              select_lex->order_list.first,
+                                              join->fields_list);
+    if (distinct_group)
+      all_order_fields_used= true;
+    if (!distinct_group)
+      distinct_group=
+        create_distinct_group(thd, select_lex->ref_pointer_array,
+                              select_lex->order_list.first,
+                              join->fields_list, distinct_all_fields,
+                              &all_order_fields_used);
+    if (!distinct_group || !all_order_fields_used)
+    {
+      restore.restore();
+      delete select;
+      return false;
+    }
+    calc_group_buffer(&distinct_tmp_param, distinct_group);
+
+    DBUG_EXECUTE_IF("session_plan_cache_distinct_range_group_fail",
+    {
+      DBUG_PRINT("plan_cache",
+                 ("debug distinct range group fallback select_lex=%p",
+                  select_lex));
+      restore.restore();
+      delete select;
+      return false;
+    });
+
+    join->all_fields= distinct_all_fields;
+    join->tmp_all_fields1.empty();
+    join->tmp_all_fields2.empty();
+    join->tmp_all_fields3.empty();
+    join->tmp_fields_list1.empty();
+    join->tmp_fields_list2.empty();
+    join->tmp_fields_list3.empty();
+    join->items1.reset();
+    join->items2.reset();
+    join->items3.reset();
+    join->tmp_table_param.cleanup();
+    join->tmp_table_param= distinct_tmp_param;
+
+    join->order= 0;
+    join->group_list= distinct_group;
+    join->group= true;
+    join->no_order= false;
+    join->select_distinct= false;
+    join->simple_order= true;
+    join->simple_group= true;
+    join->sort_and_group= true;
+    join->send_group_parts= join->tmp_table_param.group_parts;
+    join->group_fields.delete_elements();
+    join->group_fields_cache.empty();
+    plan_cache::profile_add(
+        thd, setup_distinct_timer,
+        &thd->status_var.cached_plan_profile_hit_range_setup_distinct_us);
+  }
+  else
+  {
+    setup_order_timer= plan_cache::profile_start(thd);
+    join->order= select_lex->order_list.first;
+    join->group_list= 0;
+    join->group= false;
+    join->no_order= !join->order;
+    join->select_distinct= false;
+    join->simple_order= true;
+    join->simple_group= true;
+    plan_cache::profile_add(
+        thd, setup_order_timer,
+        &thd->status_var.cached_plan_profile_hit_range_setup_order_us);
+  }
+  setup_post_timer= plan_cache::profile_start(thd);
+  join->skip_sort_order= false;
+  join->ordered_index_usage= JOIN::ordered_index_void;
+  join->need_tmp= join->test_if_need_tmp_table();
+  join->best_read= tab->records_read;
+  join->join_record_count= tab->records_out;
+  join->zero_result_cause= 0;
+  join->impossible_where= false;
+
+  best_ref[0]= tab;
+  best_ref[1]= 0;
+  table_vector[0]= table;
+  table_vector[1]= 0;
+  if (table->tablenr < MAX_TABLES)
+    map2table[table->tablenr]= tab;
+  table->reginfo.join_tab= tab;
+
+  set_position(join, 0, tab, 0);
+  best_positions[0]= positions[0];
+  tab->records_init= positions[0].records_init;
+  tab->records_read= positions[0].records_read;
+  tab->records_out= positions[0].records_out;
+  tab->cond_selectivity= positions[0].cond_selectivity;
+
+  if (needs_post_access_setup)
+  {
+    ulonglong ref_array_timer= plan_cache::profile_start(thd);
+    join->init_items_ref_array();
+    plan_cache::profile_add(
+        thd, ref_array_timer,
+        &thd->status_var.cached_plan_profile_hit_range_setup_ref_array_us);
+  }
+  DBUG_EXECUTE_IF("session_plan_cache_distinct_range_aggr_setup_fail",
+  {
+    if (select_lex->options & SELECT_DISTINCT)
+    {
+      DBUG_PRINT("plan_cache",
+                 ("debug distinct range aggregate setup error select_lex=%p",
+                  select_lex));
+      my_error(ER_OUT_OF_RESOURCES, MYF(0));
+    }
+  });
+  if (needs_post_access_setup)
+  {
+    ulonglong aggr_timer= plan_cache::profile_start(thd);
+    bool aggr_failed=
+      thd->is_error() ||
+      ((select_lex->with_sum_func ||
+        select_lex->n_sum_items ||
+        select_lex->n_child_sum_items) ?
+       join->setup_plan_cache_sum_range_aggr_tables_info() :
+       distinct_single_access_tab ?
+       join->setup_plan_cache_distinct_range_aggr_tables_info() :
+       join->setup_plan_cache_aggr_tables_info());
+    plan_cache::profile_add(
+        thd, aggr_timer,
+        &thd->status_var.cached_plan_profile_hit_range_setup_aggr_us);
+    if (aggr_failed)
+    {
+      if (!thd->is_error())
+        my_error(ER_OUT_OF_RESOURCES, MYF(0));
+      return false;
+    }
+  }
+  tab->next_select= setup_end_select_func(join);
+  plan_cache::profile_add(
+      thd, setup_post_timer,
+      &thd->status_var.cached_plan_profile_hit_range_setup_post_us);
+
+  plan_cache::profile_add(
+      thd, setup_timer,
+      &thd->status_var.cached_plan_profile_hit_range_setup_us);
+  DBUG_PRINT("plan_cache",
+             ("built range between lookup plan select_lex=%p key=%u",
+              select_lex, key_nr));
+  return true;
+}
+
+} // namespace plan_cache
 
 
 /*
@@ -29227,6 +30715,26 @@ setup_new_fields(THD *thd, List<Item> &fields,
     # Pointer to new group
 */
 
+static ORDER *
+create_plan_cache_single_distinct_group(THD *thd, ORDER *order,
+                                        List<Item> &fields)
+{
+  List_iterator_fast<Item> fields_it(fields);
+  Item *item= fields_it++;
+  if (!thd || !order || order->next || !order->in_field_list ||
+      !order->item || !*order->item || !item || fields_it++ ||
+      !item->eq(*order->item, true))
+    return 0;
+
+  ORDER *group= (ORDER*) thd->memdup((char*) order, sizeof(ORDER));
+  if (!group)
+    return 0;
+  group->next= 0;
+  item->marker= MARKER_FOUND_IN_ORDER;
+  return group;
+}
+
+
 ORDER *
 create_distinct_group(THD *thd, Ref_ptr_array ref_pointer_array,
                       ORDER *order_list, List<Item> &fields,
@@ -34514,6 +36022,7 @@ static bool set_limit_for_unit(THD *thd, SELECT_LEX_UNIT *unit, ha_rows lim)
   unit->set_limit(gpar);
 
   gpar->limit_params.explicit_limit= true; // to show in EXPLAIN
+  gpar->limit_params.is_fetch_first= false;
 
   if (arena)
     thd->restore_active_arena(arena, &backup);

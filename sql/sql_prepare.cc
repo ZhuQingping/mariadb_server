@@ -94,6 +94,7 @@ When one supplies long data for a placeholder:
 #include "sql_parse.h" // insert_precheck, update_precheck, delete_precheck
 #include "sql_base.h"  // open_normal_and_derived_tables
 #include "sql_cache.h"                          // query_cache_*
+#include "sql_plan_cache.h"
 #include "sql_view.h"                          // create_view_precheck
 #include "sql_select.h" // for JOIN
 #include "sql_insert.h" // mysql_prepare_insert
@@ -4205,6 +4206,8 @@ Prepared_statement::~Prepared_statement()
 
   MYSQL_DESTROY_PS(m_prepared_stmt);
 
+  plan_cache::destroy_for_deallocate(thd, lex);
+
   delete cursor;
   /*
     We have to call free on the items even if cleanup is called as some items,
@@ -5074,6 +5077,7 @@ Prepared_statement::reprepare()
   if (likely(!error))
   {
     MYSQL_REPREPARE_PS(m_prepared_stmt);
+    plan_cache::invalidate_for_reprepare(thd, lex);
     swap_prepared_statement(&copy);
     swap_parameter_array(param_array, copy.param_array, param_count);
 #ifdef DBUG_ASSERT_EXISTS
@@ -5557,6 +5561,8 @@ void Prepared_statement::deallocate_immediate()
 {
   /* We account deallocate in the same manner as mysqld_stmt_close */
   status_var_increment(thd->status_var.com_stmt_close);
+
+  plan_cache::destroy_for_deallocate(thd, lex);
 
   /* It should now be safe to reset CHANGE MASTER parameters */
   lex_end(lex);

@@ -50,6 +50,7 @@
 #include "derror.h"       // init_errmessage
 #include "sql_manager.h"  // stop_handle_manager, start_handle_manager
 #include "sql_expression_cache.h" // subquery_cache_miss, subquery_cache_hit
+#include "sql_plan_cache.h"
 #include "sys_vars_shared.h"
 #include "ddl_log.h"
 #include "optimizer_defaults.h"
@@ -7877,6 +7878,17 @@ static int show_cached_thread_count(THD *thd, SHOW_VAR *var, void *buff,
   return 0;
 }
 
+static int show_cached_plan_count(THD *, SHOW_VAR *var, void *buff,
+                                  system_status_var *,
+                                  enum enum_var_type scope)
+{
+  var->type= SHOW_LONG;
+  var->value= buff;
+  *(reinterpret_cast<ulong*>(buff))=
+    scope == SHOW_OPT_GLOBAL ? plan_cache::live_state_count() : 0;
+  return 0;
+}
+
 
 /*
   Variables shown by SHOW STATUS in alphabetical order
@@ -7899,6 +7911,38 @@ SHOW_VAR status_vars[]= {
   {"Busy_time",                (char*) offsetof(STATUS_VAR, busy_time), SHOW_MICROSECOND_STATUS},
   {"Bytes_received",           (char*) offsetof(STATUS_VAR, bytes_received), SHOW_LONGLONG_STATUS},
   {"Bytes_sent",               (char*) offsetof(STATUS_VAR, bytes_sent), SHOW_LONGLONG_STATUS},
+  SHOW_FUNC_ENTRY("Cached_plan_count", &show_cached_plan_count),
+  {"Cached_plan_hits",         (char*) offsetof(STATUS_VAR, cached_plan_hits), SHOW_LONG_STATUS},
+  {"Cached_plan_invalidations",(char*) offsetof(STATUS_VAR, cached_plan_invalidations), SHOW_LONG_STATUS},
+  {"Cached_plan_prevalidations",(char*) offsetof(STATUS_VAR, cached_plan_prevalidations), SHOW_LONG_STATUS},
+  {"Cached_plan_profile_hit_build_us",(char*) offsetof(STATUS_VAR, cached_plan_profile_hit_build_us), SHOW_LONGLONG_STATUS},
+  {"Cached_plan_profile_hit_explain_us",(char*) offsetof(STATUS_VAR, cached_plan_profile_hit_explain_us), SHOW_LONGLONG_STATUS},
+  {"Cached_plan_profile_hit_path_us",(char*) offsetof(STATUS_VAR, cached_plan_profile_hit_path_us), SHOW_LONGLONG_STATUS},
+  {"Cached_plan_profile_hit_range_count",(char*) offsetof(STATUS_VAR, cached_plan_profile_hit_range_count), SHOW_LONG_STATUS},
+  {"Cached_plan_profile_hit_range_build_us",(char*) offsetof(STATUS_VAR, cached_plan_profile_hit_range_build_us), SHOW_LONGLONG_STATUS},
+  {"Cached_plan_profile_hit_range_make_select_us",(char*) offsetof(STATUS_VAR, cached_plan_profile_hit_range_make_select_us), SHOW_LONGLONG_STATUS},
+  {"Cached_plan_profile_hit_range_quick_select_us",(char*) offsetof(STATUS_VAR, cached_plan_profile_hit_range_quick_select_us), SHOW_LONGLONG_STATUS},
+  {"Cached_plan_profile_hit_range_setup_us",(char*) offsetof(STATUS_VAR, cached_plan_profile_hit_range_setup_us), SHOW_LONGLONG_STATUS},
+  {"Cached_plan_profile_hit_range_setup_alloc_us",(char*) offsetof(STATUS_VAR, cached_plan_profile_hit_range_setup_alloc_us), SHOW_LONGLONG_STATUS},
+  {"Cached_plan_profile_hit_range_setup_base_us",(char*) offsetof(STATUS_VAR, cached_plan_profile_hit_range_setup_base_us), SHOW_LONGLONG_STATUS},
+  {"Cached_plan_profile_hit_range_setup_distinct_us",(char*) offsetof(STATUS_VAR, cached_plan_profile_hit_range_setup_distinct_us), SHOW_LONGLONG_STATUS},
+  {"Cached_plan_profile_hit_range_setup_order_us",(char*) offsetof(STATUS_VAR, cached_plan_profile_hit_range_setup_order_us), SHOW_LONGLONG_STATUS},
+  {"Cached_plan_profile_hit_range_setup_ref_array_us",(char*) offsetof(STATUS_VAR, cached_plan_profile_hit_range_setup_ref_array_us), SHOW_LONGLONG_STATUS},
+  {"Cached_plan_profile_hit_range_setup_aggr_us",(char*) offsetof(STATUS_VAR, cached_plan_profile_hit_range_setup_aggr_us), SHOW_LONGLONG_STATUS},
+  {"Cached_plan_profile_hit_range_setup_distinct_fast_us",(char*) offsetof(STATUS_VAR, cached_plan_profile_hit_range_setup_distinct_fast_us), SHOW_LONGLONG_STATUS},
+  {"Cached_plan_profile_hit_range_setup_post_us",(char*) offsetof(STATUS_VAR, cached_plan_profile_hit_range_setup_post_us), SHOW_LONGLONG_STATUS},
+  {"Cached_plan_profile_hit_ref_count",(char*) offsetof(STATUS_VAR, cached_plan_profile_hit_ref_count), SHOW_LONG_STATUS},
+  {"Cached_plan_profile_hit_ref_build_us",(char*) offsetof(STATUS_VAR, cached_plan_profile_hit_ref_build_us), SHOW_LONGLONG_STATUS},
+  {"Cached_plan_profile_hit_ref_alloc_us",(char*) offsetof(STATUS_VAR, cached_plan_profile_hit_ref_alloc_us), SHOW_LONGLONG_STATUS},
+  {"Cached_plan_profile_hit_ref_setup_us",(char*) offsetof(STATUS_VAR, cached_plan_profile_hit_ref_setup_us), SHOW_LONGLONG_STATUS},
+  {"Cached_plan_profile_hit_unique_alloc_us",(char*) offsetof(STATUS_VAR, cached_plan_profile_hit_unique_alloc_us), SHOW_LONGLONG_STATUS},
+  {"Cached_plan_profile_hit_unique_build_us",(char*) offsetof(STATUS_VAR, cached_plan_profile_hit_unique_build_us), SHOW_LONGLONG_STATUS},
+  {"Cached_plan_profile_hit_unique_count",(char*) offsetof(STATUS_VAR, cached_plan_profile_hit_unique_count), SHOW_LONG_STATUS},
+  {"Cached_plan_profile_hit_unique_read_us",(char*) offsetof(STATUS_VAR, cached_plan_profile_hit_unique_read_us), SHOW_LONGLONG_STATUS},
+  {"Cached_plan_profile_hit_unique_setup_plan_us",(char*) offsetof(STATUS_VAR, cached_plan_profile_hit_unique_setup_plan_us), SHOW_LONGLONG_STATUS},
+  {"Cached_plan_profile_hit_unique_setup_us",(char*) offsetof(STATUS_VAR, cached_plan_profile_hit_unique_setup_us), SHOW_LONGLONG_STATUS},
+  {"Cached_plan_profile_prevalidate_us",(char*) offsetof(STATUS_VAR, cached_plan_profile_prevalidate_us), SHOW_LONGLONG_STATUS},
+  {"Cached_plan_profile_validate_us",(char*) offsetof(STATUS_VAR, cached_plan_profile_validate_us), SHOW_LONGLONG_STATUS},
   {"Column_compressions",      (char*) offsetof(STATUS_VAR, column_compressions), SHOW_LONG_STATUS},
   {"Column_decompressions",    (char*) offsetof(STATUS_VAR, column_decompressions), SHOW_LONG_STATUS},
   {"Com",                      (char*) com_status_vars, SHOW_ARRAY},

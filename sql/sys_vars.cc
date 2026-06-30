@@ -459,6 +459,40 @@ static Sys_var_double Sys_analyze_sample_percentage(
        CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, 100),
        DEFAULT(100));
 
+static Sys_var_mybool Sys_session_plan_cache(
+       "session_plan_cache",
+       "Enable session-level prepared statement plan cache. "
+       "This feature is disabled by default",
+       SESSION_VAR(session_plan_cache), CMD_LINE(OPT_ARG),
+       DEFAULT(FALSE));
+
+static Sys_var_mybool Sys_session_plan_cache_profile(
+       "session_plan_cache_profile",
+       "Collect lightweight session plan cache hit-path profiling counters. "
+       "This is disabled by default and intended for diagnostics",
+       SESSION_VAR(session_plan_cache_profile), CMD_LINE(OPT_ARG),
+       DEFAULT(FALSE), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static bool check_session_plan_cache_allow_change_ratio(sys_var *self, THD *thd,
+                                                    set_var *var)
+{
+  if (var->value && var->value->val_real() < 0)
+  {
+    my_error(ER_WRONG_VALUE_FOR_VAR, MYF(0), self->name.str, "negative");
+    return true;
+  }
+  return false;
+}
+
+static Sys_var_double Sys_session_plan_cache_allow_change_ratio(
+       "session_plan_cache_allow_change_ratio",
+       "Invalidate cached plans when table row count changes by this ratio. "
+       "The default is 0",
+       SESSION_VAR(session_plan_cache_allow_change_ratio),
+       CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, DBL_MAX),
+       DEFAULT(0), NO_MUTEX_GUARD, NOT_IN_BINLOG,
+       ON_CHECK(check_session_plan_cache_allow_change_ratio));
+
 /*
   The max length have to be UINT_MAX32 to not remove GEOMETRY fields
   from analyze.

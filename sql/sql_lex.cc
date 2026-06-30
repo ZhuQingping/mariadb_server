@@ -3147,6 +3147,9 @@ void st_select_lex::init_query()
   min_max_opt_list.empty();
   limit_params.clear();
   join= 0;
+  plan_cache_state= 0;
+  plan_cache_pending_access_recipe= 0;
+  plan_cache_state_status= plan_cache::State::NONE;
   cur_pos_in_select_list= UNDEF_POS;
   having= prep_having= where= prep_where= 0;
   cond_pushed_into_where= cond_pushed_into_having= 0;

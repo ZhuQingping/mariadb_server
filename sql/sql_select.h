@@ -1786,6 +1786,7 @@ public:
   int optimize_stage2();
   int optimize_stage2_and_finish();
   bool build_explain();
+  bool build_plan_cache_hit_explain();
   int reinit();
   int init_execution();
   int exec() __attribute__((warn_unused_result));
@@ -1944,6 +1945,13 @@ public:
 
   bool transform_in_predicates_into_in_subq(THD *thd);
 
+  bool setup_plan_cache_aggr_tables_info()
+  {
+    return make_aggr_tables_info();
+  }
+  bool setup_plan_cache_distinct_range_aggr_tables_info();
+  bool setup_plan_cache_sum_range_aggr_tables_info();
+
   bool optimize_upper_rownum_func();
   void calc_allowed_top_level_tables(SELECT_LEX *lex);
   table_map get_allowed_nj_tables(uint idx);
@@ -2051,6 +2059,9 @@ public:
     to_field=field_arg->new_key_field(thd->mem_root, field_arg->table,
                                       ptr, length, null, 1);
   }
+  store_key()
+    :null_key(0), to_field(0), null_ptr(0), err(0)
+  {}
   store_key(store_key &arg)
     :Sql_alloc(), null_key(arg.null_key), to_field(arg.to_field),
              null_ptr(arg.null_ptr), err(arg.err)
@@ -2070,7 +2081,7 @@ public:
   enum store_key_result copy(THD *thd)
   {
     enum_check_fields org_count_cuted_fields= thd->count_cuted_fields;
-    Use_relaxed_field_copy urfc(to_field->table->in_use);
+    Use_relaxed_field_copy urfc(to_field ? to_field->table->in_use : thd);
 
     /* If needed, perform CharsetNarrowing for making ref access lookup keys. */
     Utf8_narrow do_narrow(to_field, do_cset_narrowing);
