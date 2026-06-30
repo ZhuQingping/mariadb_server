@@ -3121,6 +3121,7 @@ ha_innobase::ha_innobase(
 			  | HA_CONCURRENT_OPTIMIZE
 			  | HA_CAN_SKIP_LOCKED
 		  ),
+	m_pq_worker_scan_ctx(),
 	m_start_of_scan(),
         m_mysql_has_locked()
 {}
@@ -3128,7 +3129,10 @@ ha_innobase::ha_innobase(
 /*********************************************************************//**
 Destruct ha_innobase handler. */
 
-ha_innobase::~ha_innobase() = default;
+ha_innobase::~ha_innobase()
+{
+	pq_worker_scan_end();
+}
 /*======================*/
 
 /*********************************************************************//**
@@ -4538,9 +4542,9 @@ innobase_end(handlerton*, ha_panic_function)
 	if (srv_was_started) {
 		THD *thd= current_thd;
 		if (thd) { // may be UNINSTALL PLUGIN statement
-		 	if (trx_t* trx = thd_to_trx(thd)) {
+			if (trx_t* trx = thd_to_trx(thd)) {
 				trx->free();
-		 	}
+			}
 		}
 
 		innodb_shutdown();
@@ -4616,6 +4620,1488 @@ innobase_start_trx_and_assign_read_view(
 	innobase_register_trx(innodb_hton_ptr, thd, trx);
 
 	DBUG_RETURN(0);
+}
+
+int
+ha_innobase::pq_create_snapshot(THD *thd)
+{
+	DBUG_ENTER("ha_innobase::pq_create_snapshot");
+
+	trx_t *trx = check_trx_exists(thd);
+
+	trx_start_if_not_started_xa(trx, false);
+	trx->isolation_level = innodb_isolation_level(thd) & 3;
+
+	if (trx->isolation_level == TRX_ISO_READ_UNCOMMITTED) {
+		DBUG_RETURN(HA_ERR_UNSUPPORTED);
+	}
+
+	trx->read_view.open(trx);
+	innobase_register_trx(innodb_hton_ptr, thd, trx);
+
+	DBUG_RETURN(0);
+}
+
+int
+ha_innobase::pq_clone_snapshot(THD *thd, THD *leader_thd)
+{
+	DBUG_ENTER("ha_innobase::pq_clone_snapshot");
+
+	mysql_mutex_lock(&leader_thd->LOCK_thd_data);
+	trx_t *leader_trx = thd_to_trx(leader_thd);
+	mysql_mutex_unlock(&leader_thd->LOCK_thd_data);
+
+	if (!leader_trx || !leader_trx->read_view.is_open()) {
+		DBUG_RETURN(HA_ERR_UNSUPPORTED);
+	}
+
+	trx_t *trx = check_trx_exists(thd);
+
+	trx_start_if_not_started_xa(trx, false);
+	trx->isolation_level = leader_trx->isolation_level;
+
+	if (trx->isolation_level == TRX_ISO_READ_UNCOMMITTED ||
+	    !trx->read_view.clone_from(leader_trx->read_view)) {
+		DBUG_RETURN(HA_ERR_UNSUPPORTED);
+	}
+
+	innobase_register_trx(innodb_hton_ptr, thd, trx);
+
+	DBUG_RETURN(0);
+}
+
+void
+ha_innobase::pq_refresh_snapshot_for_retry(THD *thd)
+{
+	DBUG_ENTER("ha_innobase::pq_refresh_snapshot_for_retry");
+
+	trx_t *trx = thd_to_trx(thd);
+
+	if (trx && trx->isolation_level == TRX_ISO_READ_COMMITTED) {
+		trx->read_view.close();
+		trx->read_view.open(trx);
+	}
+
+	DBUG_VOID_RETURN;
+}
+
+bool
+ha_innobase::pq_scan_supported() const
+{
+	return(true);
+}
+
+struct innodb_pq_btree_ctx
+{
+	innodb_pq_btree_ctx* next;
+	uint64_t id;
+	uint keyno;
+	bool reverse;
+	bool second_split_candidate;
+	uint split_depth;
+	uint32_t space_id;
+	index_id_t index_id;
+	uint32_t root_page_no;
+	uint16_t root_level;
+	uint32_t child_page_no;
+	uint16_t child_level;
+	uint root_slot_ordinal;
+	uint child_ordinal;
+	uint child_records;
+	uint32_t first_page_hint;
+	uint32_t last_page_hint;
+	ha_rows estimated_rows;
+	key_range start_range;
+	key_range end_range;
+	uchar* start_key;
+	uchar* end_key;
+};
+
+struct innodb_pq_btree_ctx_queue
+{
+	innodb_pq_btree_ctx* head;
+	innodb_pq_btree_ctx* tail;
+	uint count;
+};
+
+struct innodb_pq_btree_worker_queue
+{
+	innodb_pq_btree_ctx_queue current;
+	innodb_pq_btree_ctx_queue standby;
+};
+
+struct innodb_pq_btree_scan_ctx
+{
+	bool enabled;
+	bool boundary_available;
+	bool split_used;
+	const char* rejected_reason;
+	uint keyno;
+	uint dop;
+	innodb_pq_btree_ctx_queue shared;
+	key_range scan_start_range;
+	key_range scan_end_range;
+	uchar* scan_start_key;
+	uchar* scan_end_key;
+};
+
+struct innodb_pq_leader_scan_ctx
+{
+	uint keyno;
+	uint dop;
+	bool reverse;
+	innodb_pq_btree_scan_ctx btree;
+};
+
+struct innodb_pq_worker_scan_ctx
+{
+	uint keyno;
+	bool reverse;
+	bool index_open;
+	bool first_next;
+	bool use_btree_descriptors;
+	bool fast_scan_available;
+	bool fast_scan_started;
+	mem_heap_t* fast_scan_heap;
+	byte* fast_start_buf;
+	byte* fast_end_buf;
+	dtuple_t* fast_start_tuple;
+	dtuple_t* fast_end_tuple;
+	page_cur_mode_t fast_start_mode;
+	bool fast_end_exclusive;
+	row_pq_record_buffer_t fast_record_buffer;
+	uchar* fast_record_buffer_storage;
+	mem_heap_t* fast_row_heap;
+	innodb_pq_btree_ctx* active_btree_ctx;
+	innodb_pq_btree_worker_queue btree_queue;
+	key_range start_range;
+	key_range end_range;
+	uchar* start_key;
+	uchar* end_key;
+};
+
+static void
+innodb_pq_clear_range(key_range* range)
+{
+	memset(range, 0, sizeof(*range));
+}
+
+static void
+innodb_pq_btree_queue_init(innodb_pq_btree_ctx_queue* queue)
+{
+	queue->head = NULL;
+	queue->tail = NULL;
+	queue->count = 0;
+}
+
+static void
+innodb_pq_btree_ctx_free(innodb_pq_btree_ctx* ctx)
+{
+	if (!ctx) {
+		return;
+	}
+
+	if (ctx->start_key) {
+		my_free(ctx->start_key);
+	}
+	if (ctx->end_key) {
+		my_free(ctx->end_key);
+	}
+	my_free(ctx);
+}
+
+static void
+innodb_pq_btree_queue_clear(innodb_pq_btree_ctx_queue* queue)
+{
+	innodb_pq_btree_ctx* ctx = queue->head;
+	while (ctx) {
+		innodb_pq_btree_ctx* next = ctx->next;
+		innodb_pq_btree_ctx_free(ctx);
+		ctx = next;
+	}
+	innodb_pq_btree_queue_init(queue);
+}
+
+static void
+innodb_pq_btree_queue_push(
+	innodb_pq_btree_ctx_queue* queue,
+	innodb_pq_btree_ctx* ctx)
+{
+	ctx->next = NULL;
+	if (queue->tail) {
+		queue->tail->next = ctx;
+	} else {
+		queue->head = ctx;
+	}
+	queue->tail = ctx;
+	queue->count++;
+}
+
+static innodb_pq_btree_ctx*
+innodb_pq_btree_queue_pop(innodb_pq_btree_ctx_queue* queue)
+{
+	innodb_pq_btree_ctx* ctx = queue->head;
+	if (!ctx) {
+		return(NULL);
+	}
+
+	queue->head = ctx->next;
+	if (!queue->head) {
+		queue->tail = NULL;
+	}
+	queue->count--;
+	ctx->next = NULL;
+	return(ctx);
+}
+
+static void
+innodb_pq_btree_worker_queue_init(innodb_pq_btree_worker_queue* queue)
+{
+	innodb_pq_btree_queue_init(&queue->current);
+	innodb_pq_btree_queue_init(&queue->standby);
+}
+
+static void
+innodb_pq_btree_worker_queue_clear(innodb_pq_btree_worker_queue* queue)
+{
+	innodb_pq_btree_queue_clear(&queue->current);
+	innodb_pq_btree_queue_clear(&queue->standby);
+}
+
+static void
+innodb_pq_btree_scan_ctx_init(
+	innodb_pq_btree_scan_ctx* ctx,
+	uint keyno,
+	uint dop)
+{
+	ctx->enabled = false;
+	ctx->boundary_available = false;
+	ctx->split_used = false;
+	ctx->rejected_reason = NULL;
+	ctx->keyno = keyno;
+	ctx->dop = dop;
+	innodb_pq_clear_range(&ctx->scan_start_range);
+	innodb_pq_clear_range(&ctx->scan_end_range);
+	ctx->scan_start_key = NULL;
+	ctx->scan_end_key = NULL;
+	innodb_pq_btree_queue_init(&ctx->shared);
+}
+
+static void
+innodb_pq_btree_scan_ctx_clear(innodb_pq_btree_scan_ctx* ctx)
+{
+	innodb_pq_btree_queue_clear(&ctx->shared);
+	if (ctx->scan_start_key) {
+		my_free(ctx->scan_start_key);
+		ctx->scan_start_key = NULL;
+	}
+	if (ctx->scan_end_key) {
+		my_free(ctx->scan_end_key);
+		ctx->scan_end_key = NULL;
+	}
+	innodb_pq_clear_range(&ctx->scan_start_range);
+	innodb_pq_clear_range(&ctx->scan_end_range);
+	ctx->enabled = false;
+	ctx->boundary_available = false;
+	ctx->split_used = false;
+	ctx->rejected_reason = NULL;
+	ctx->keyno = 0;
+	ctx->dop = 0;
+}
+
+static bool
+innodb_pq_copy_range(
+	key_range* dst,
+	uchar** dst_key,
+	const key_range* src)
+{
+	innodb_pq_clear_range(dst);
+	*dst_key = NULL;
+
+	if (!src) {
+		return(true);
+	}
+
+	*dst = *src;
+	if (src->key && src->length) {
+		*dst_key = static_cast<uchar*>(
+			my_malloc(PSI_INSTRUMENT_ME, src->length, MYF(MY_WME)));
+		if (!*dst_key) {
+			innodb_pq_clear_range(dst);
+			return(false);
+		}
+		memcpy(*dst_key, src->key, src->length);
+		dst->key = *dst_key;
+	}
+
+	return(true);
+}
+
+static bool
+innodb_pq_btree_ctx_clone_with_ranges(
+	innodb_pq_btree_ctx** clone,
+	const innodb_pq_btree_ctx* src,
+	const key_range* start_range,
+	const key_range* end_range)
+{
+	*clone = NULL;
+	innodb_pq_btree_ctx* dst =
+		static_cast<innodb_pq_btree_ctx*>(
+			my_malloc(PSI_INSTRUMENT_ME, sizeof(*dst),
+				  MYF(MY_WME | MY_ZEROFILL)));
+	if (!dst) {
+		return(false);
+	}
+
+	*dst = *src;
+	dst->next = NULL;
+	dst->start_key = NULL;
+	dst->end_key = NULL;
+	innodb_pq_clear_range(&dst->start_range);
+	innodb_pq_clear_range(&dst->end_range);
+
+	if (!innodb_pq_copy_range(&dst->start_range, &dst->start_key,
+				  start_range)
+	    || !innodb_pq_copy_range(&dst->end_range, &dst->end_key,
+				     end_range)) {
+		innodb_pq_btree_ctx_free(dst);
+		return(false);
+	}
+
+	*clone = dst;
+	return(true);
+}
+
+static int
+innodb_pq_handler_key_cmp(TABLE* table, const key_range* lhs,
+			  const key_range* rhs)
+{
+	KEY* key_info = table->key_info + table->s->primary_key;
+	const uint min_length = std::min(lhs->length, rhs->length);
+	int cmp = key_tuple_cmp(key_info->key_part, lhs->key, rhs->key,
+				min_length);
+	if (cmp) {
+		return(cmp);
+	}
+
+	if (lhs->length == rhs->length) {
+		return(0);
+	}
+
+	/*
+	  A full composite boundary with the same prefix is greater than the
+	  prefix-only SQL range boundary. This preserves half-open ranges such
+	  as id < N when descriptor keys contain (id, part_no).
+	*/
+	return(lhs->length < rhs->length ? -1 : 1);
+}
+
+static bool
+innodb_pq_key_part_is_supported_integer(Field* field);
+
+static bool
+innodb_pq_btree_intersect_descriptor(
+	innodb_pq_btree_ctx** out,
+	const innodb_pq_btree_ctx* src,
+	const innodb_pq_btree_scan_ctx* scan,
+	TABLE* table)
+{
+	const key_range* start =
+		src->start_range.keypart_map ? &src->start_range : NULL;
+	const key_range* end =
+		src->end_range.keypart_map ? &src->end_range : NULL;
+	const key_range* scan_start =
+		scan->scan_start_range.keypart_map ? &scan->scan_start_range : NULL;
+	const key_range* scan_end =
+		scan->scan_end_range.keypart_map ? &scan->scan_end_range : NULL;
+
+	if (scan_start
+	    && (!start || innodb_pq_handler_key_cmp(table, start, scan_start) < 0)) {
+		start = scan_start;
+	}
+	if (scan_end
+	    && (!end || innodb_pq_handler_key_cmp(table, end, scan_end) > 0)) {
+		end = scan_end;
+	}
+
+	if (start && end && innodb_pq_handler_key_cmp(table, start, end) >= 0) {
+		*out = NULL;
+		return(true);
+	}
+
+	return(innodb_pq_btree_ctx_clone_with_ranges(out, src, start, end));
+}
+
+static bool
+innodb_pq_btree_finalize_descriptor_ranges(
+	innodb_pq_btree_scan_ctx* scan,
+	TABLE* table)
+{
+	if (!scan->enabled || !scan->boundary_available || !table
+	    || table->s->primary_key == MAX_KEY) {
+		return(false);
+	}
+
+	KEY* key_info = table->key_info + table->s->primary_key;
+	for (uint i = 0; i < key_info->user_defined_key_parts; i++) {
+		if (!innodb_pq_key_part_is_supported_integer(
+			    key_info->key_part[i].field)) {
+			return(false);
+		}
+	}
+
+	innodb_pq_btree_ctx_queue executable;
+	innodb_pq_btree_queue_init(&executable);
+
+	for (innodb_pq_btree_ctx* ctx = scan->shared.head; ctx;
+	     ctx = ctx->next) {
+		if (ctx->next && ctx->next->start_range.keypart_map) {
+			key_range end_range = ctx->next->start_range;
+			end_range.flag = HA_READ_BEFORE_KEY;
+			innodb_pq_btree_ctx* with_end = NULL;
+			if (!innodb_pq_btree_ctx_clone_with_ranges(
+				    &with_end, ctx,
+				    ctx->start_range.keypart_map ?
+				      &ctx->start_range : NULL,
+				    &end_range)) {
+				innodb_pq_btree_queue_clear(&executable);
+				return(false);
+			}
+
+			innodb_pq_btree_ctx* clipped = NULL;
+			if (!innodb_pq_btree_intersect_descriptor(
+				    &clipped, with_end, scan, table)) {
+				innodb_pq_btree_ctx_free(with_end);
+				innodb_pq_btree_queue_clear(&executable);
+				return(false);
+			}
+			innodb_pq_btree_ctx_free(with_end);
+			if (clipped) {
+				innodb_pq_btree_queue_push(&executable, clipped);
+			}
+			continue;
+		}
+
+		innodb_pq_btree_ctx* clipped = NULL;
+		if (!innodb_pq_btree_intersect_descriptor(&clipped, ctx, scan,
+							  table)) {
+			innodb_pq_btree_queue_clear(&executable);
+			return(false);
+		}
+		if (clipped) {
+			innodb_pq_btree_queue_push(&executable, clipped);
+		}
+	}
+
+	if (!executable.count) {
+		innodb_pq_btree_queue_clear(&executable);
+		return(false);
+	}
+
+	innodb_pq_btree_queue_clear(&scan->shared);
+	scan->shared = executable;
+	scan->split_used = true;
+	return(true);
+}
+
+static bool
+innodb_pq_btree_add_descriptor(
+	innodb_pq_btree_scan_ctx* scan,
+	const dict_index_t* index,
+	uint16_t root_level,
+	uint child_page_no,
+	uint root_slot_ordinal,
+	uint child_ordinal,
+	const uchar* start_key,
+	uint start_key_len)
+{
+	innodb_pq_btree_ctx* ctx =
+		static_cast<innodb_pq_btree_ctx*>(
+			my_malloc(PSI_INSTRUMENT_ME, sizeof(*ctx),
+				  MYF(MY_ZEROFILL)));
+	if (!ctx) {
+		return(false);
+	}
+
+	ctx->id = scan->shared.count;
+	ctx->keyno = scan->keyno;
+	ctx->reverse = false;
+	ctx->second_split_candidate = false;
+	ctx->split_depth = 0;
+	ctx->space_id = index->table->space->id;
+	ctx->index_id = index->id;
+	ctx->root_page_no = index->page;
+	ctx->root_level = root_level;
+	ctx->child_page_no = child_page_no;
+	ctx->child_level = static_cast<uint16_t>(root_level - 1);
+	ctx->root_slot_ordinal = root_slot_ordinal;
+	ctx->child_ordinal = child_ordinal;
+	ctx->child_records = 0;
+	ctx->first_page_hint = child_page_no;
+	ctx->last_page_hint = FIL_NULL;
+	ctx->estimated_rows = 0;
+	innodb_pq_clear_range(&ctx->start_range);
+	innodb_pq_clear_range(&ctx->end_range);
+	if (start_key && start_key_len) {
+		ctx->start_key = static_cast<uchar*>(
+			my_malloc(PSI_INSTRUMENT_ME, start_key_len, MYF(MY_WME)));
+		if (!ctx->start_key) {
+			my_free(ctx);
+			return(false);
+		}
+		memcpy(ctx->start_key, start_key, start_key_len);
+		ctx->start_range.key = ctx->start_key;
+		ctx->start_range.length = start_key_len;
+		ctx->start_range.keypart_map = 1;
+		ctx->start_range.flag = HA_READ_KEY_OR_NEXT;
+		scan->boundary_available = true;
+	}
+
+	innodb_pq_btree_queue_push(&scan->shared, ctx);
+	return(true);
+}
+
+static bool
+innodb_pq_key_part_is_supported_integer(Field* field)
+{
+	if (!field) {
+		return(false);
+	}
+
+	switch (field->key_type()) {
+	case HA_KEYTYPE_LONG_INT:
+	case HA_KEYTYPE_ULONG_INT:
+	case HA_KEYTYPE_LONGLONG:
+	case HA_KEYTYPE_ULONGLONG:
+		return(true);
+	default:
+		return(false);
+	}
+}
+
+static bool
+innodb_pq_store_root_node_ptr_integer_key_part(
+	Field* field,
+	const byte* data,
+	ulint len)
+{
+	const enum ha_base_keytype key_type = field->key_type();
+	const bool unsigned_key = key_type == HA_KEYTYPE_ULONG_INT
+		|| key_type == HA_KEYTYPE_ULONGLONG;
+	longlong value;
+	ulonglong unsigned_value = 0;
+
+	if (key_type == HA_KEYTYPE_LONGLONG
+	    || key_type == HA_KEYTYPE_ULONGLONG) {
+		if (len != 8) {
+			return(false);
+		}
+		const uint64 raw = mach_read_from_8(data);
+		if (unsigned_key) {
+			unsigned_value = static_cast<ulonglong>(raw);
+			value = static_cast<longlong>(unsigned_value);
+		} else {
+			value = static_cast<longlong>(
+				raw ^ 0x8000000000000000ULL);
+		}
+	} else {
+		if (len != 4) {
+			return(false);
+		}
+		uint32 raw = mach_read_from_4(data);
+		value = unsigned_key
+			? static_cast<longlong>(raw)
+			: static_cast<longlong>(
+				static_cast<int32>(raw ^ 0x80000000U));
+	}
+
+	if (key_type == HA_KEYTYPE_ULONGLONG) {
+		char value_buf[MY_INT64_NUM_DECIMAL_DIGITS + 1];
+		char* end = longlong10_to_str(
+			static_cast<longlong>(unsigned_value), value_buf, 10);
+		return(!field->store(
+			value_buf, static_cast<size_t>(end - value_buf),
+			&my_charset_numeric));
+	}
+
+	return(!field->store(value, unsigned_key));
+}
+
+static bool
+innodb_pq_root_node_ptr_integer_start_key(
+	TABLE* table,
+	const dict_index_t* index,
+	const rec_t* rec,
+	const rec_offs* offsets,
+	uchar* key_buf,
+	uint* key_len,
+	key_part_map* keypart_map,
+	bool* is_min_rec)
+{
+	if (!table || !index || !rec || !offsets || !key_buf || !key_len
+	    || !keypart_map || !is_min_rec || table->s->primary_key == MAX_KEY
+	    || !dict_index_is_clust(index)) {
+		return(false);
+	}
+
+	KEY* key_info = table->key_info + table->s->primary_key;
+	if (key_info->user_defined_key_parts == 0) {
+		return(false);
+	}
+
+	for (uint i = 0; i < key_info->user_defined_key_parts; i++) {
+		KEY_PART_INFO* key_part = key_info->key_part + i;
+		Field* field = key_part->field;
+		if (!field || !innodb_pq_key_part_is_supported_integer(field)) {
+			return(false);
+		}
+		const uint expected_key_len =
+			field->key_type() == HA_KEYTYPE_LONGLONG
+			|| field->key_type() == HA_KEYTYPE_ULONGLONG ? 8 : 4;
+		if (key_part->length != expected_key_len) {
+			return(false);
+		}
+	}
+
+	*is_min_rec =
+		(rec_get_info_bits(rec, rec_offs_comp(offsets))
+		 & REC_INFO_MIN_REC_FLAG) != 0;
+	*key_len = 0;
+	*keypart_map = 0;
+	if (*is_min_rec) {
+		return(true);
+	}
+
+	uchar* record_backup = static_cast<uchar*>(
+		my_malloc(PSI_INSTRUMENT_ME, table->s->reclength, MYF(MY_WME)));
+	if (!record_backup) {
+		return(false);
+	}
+	memcpy(record_backup, table->record[0], table->s->reclength);
+
+	Field* field = key_info->key_part[0].field;
+	const bool clear_write_set =
+		!bitmap_fast_test_and_set(table->write_set,
+					  field->field_index);
+
+	ulint len = 0;
+	const byte* data = rec_get_nth_cfield(rec, index, offsets, 0, &len);
+	bool store_failed =
+		!data || len == UNIV_SQL_NULL
+		|| !innodb_pq_store_root_node_ptr_integer_key_part(
+			field, data, len);
+	if (!store_failed) {
+		const uint prefix_key_len = key_info->key_part[0].store_length;
+		key_copy(key_buf, table->record[0],
+			 key_info, prefix_key_len);
+		*key_len = prefix_key_len;
+		*keypart_map = (key_part_map) 1;
+	}
+	memcpy(table->record[0], record_backup, table->s->reclength);
+	my_free(record_backup);
+	if (clear_write_set) {
+		bitmap_clear_bit(table->write_set, field->field_index);
+	}
+	if (store_failed) {
+		return(false);
+	}
+	return(true);
+}
+
+static bool
+innodb_pq_btree_build_descriptors(
+	innodb_pq_btree_scan_ctx* scan,
+	TABLE* table,
+	dict_index_t* index,
+	trx_t* trx)
+{
+	DBUG_ENTER("innodb_pq_btree_build_descriptors");
+
+	if (!scan || !index || !trx || !index->table || !index->table->space
+	    || !dict_index_is_clust(index) || index->is_corrupted()
+	    || !row_merge_is_index_usable(trx, index)) {
+		if (scan) {
+			scan->rejected_reason = "index_unavailable";
+		}
+		DBUG_RETURN(false);
+	}
+
+	if (!table || table->s->primary_key == MAX_KEY) {
+		scan->rejected_reason = "no_primary_key";
+		DBUG_RETURN(false);
+	}
+
+	KEY* key_info = table->key_info + table->s->primary_key;
+	for (uint i = 0; i < key_info->user_defined_key_parts; i++) {
+		if (!innodb_pq_key_part_is_supported_integer(
+			    key_info->key_part[i].field)) {
+			scan->rejected_reason = "unsupported_primary_key_shape";
+			DBUG_RETURN(false);
+		}
+	}
+
+	mtr_t mtr(trx);
+	mtr.start();
+
+	dberr_t err = DB_SUCCESS;
+	buf_block_t* root = btr_root_block_get(index, RW_S_LATCH, &mtr, &err);
+	if (!root) {
+		mtr.commit();
+		scan->rejected_reason = "root_page_unavailable";
+		DBUG_RETURN(false);
+	}
+
+	page_t* root_page = root->page.frame;
+	const uint16_t root_level = btr_page_get_level(root_page);
+	if (root_level < 2) {
+		mtr.commit();
+		scan->rejected_reason = "tree_too_shallow";
+		DBUG_RETURN(false);
+	}
+
+	mem_heap_t* heap = mem_heap_create(256);
+	rec_offs* offsets = NULL;
+	uint root_slot_ordinal = 0;
+	uint child_ordinal = 0;
+	bool ok = true;
+
+	for (const rec_t* rec = page_rec_get_next(page_get_infimum_rec(root_page));
+	     rec && !page_rec_is_supremum(rec);
+	     rec = page_rec_get_next_const(rec)) {
+		root_slot_ordinal++;
+		offsets = rec_get_offsets(rec, index, offsets, 0,
+					  ULINT_UNDEFINED, &heap);
+		const uint32_t child_page_no =
+			btr_node_ptr_get_child_page_no(rec, offsets);
+		child_ordinal++;
+		uchar start_key[MAX_KEY_LENGTH];
+		uint start_key_len = 0;
+		key_part_map start_keypart_map = 0;
+		bool is_min_rec = false;
+		if (!innodb_pq_root_node_ptr_integer_start_key(
+			    table, index, rec, offsets, start_key,
+			    &start_key_len, &start_keypart_map,
+			    &is_min_rec)) {
+			scan->rejected_reason = "boundary_copy_failed";
+			ok = false;
+			break;
+		}
+		if (!innodb_pq_btree_add_descriptor(
+			    scan, index, root_level, child_page_no,
+			    root_slot_ordinal, child_ordinal,
+			    is_min_rec ? NULL : start_key,
+			    is_min_rec ? 0 : start_key_len)) {
+			scan->rejected_reason = "descriptor_allocation_failed";
+			ok = false;
+			break;
+		}
+		if (!is_min_rec) {
+			scan->shared.tail->start_range.keypart_map =
+				start_keypart_map;
+		}
+	}
+
+	mem_heap_free(heap);
+	mtr.commit();
+
+	if (!ok || scan->shared.count < 2) {
+		if (ok) {
+			scan->rejected_reason = "descriptor_count_too_small";
+		}
+		innodb_pq_btree_queue_clear(&scan->shared);
+		scan->enabled = false;
+		DBUG_RETURN(false);
+	}
+
+	scan->enabled = true;
+	scan->rejected_reason = NULL;
+	DBUG_RETURN(true);
+}
+
+static void
+innodb_pq_free_worker_scan_ctx(innodb_pq_worker_scan_ctx* ctx)
+{
+	if (!ctx) {
+		return;
+	}
+
+	if (ctx->start_key) {
+		my_free(ctx->start_key);
+	}
+	if (ctx->end_key) {
+		my_free(ctx->end_key);
+	}
+	if (ctx->fast_scan_heap) {
+		mem_heap_free(ctx->fast_scan_heap);
+	}
+	if (ctx->fast_record_buffer_storage) {
+		my_free(ctx->fast_record_buffer_storage);
+	}
+	if (ctx->fast_row_heap) {
+		mem_heap_free(ctx->fast_row_heap);
+	}
+	if (ctx->active_btree_ctx) {
+		innodb_pq_btree_ctx_free(ctx->active_btree_ctx);
+	}
+	innodb_pq_btree_worker_queue_clear(&ctx->btree_queue);
+	my_free(ctx);
+}
+
+static void
+innodb_pq_fast_scan_reset(innodb_pq_worker_scan_ctx* ctx)
+{
+	ctx->fast_scan_available = false;
+	ctx->fast_scan_started = false;
+	ctx->fast_record_buffer.pos = 0;
+	ctx->fast_record_buffer.count = 0;
+	ctx->fast_start_buf = NULL;
+	ctx->fast_end_buf = NULL;
+	ctx->fast_start_tuple = NULL;
+	ctx->fast_end_tuple = NULL;
+	ctx->fast_start_mode = PAGE_CUR_UNSUPP;
+	ctx->fast_end_exclusive = true;
+	if (ctx->fast_scan_heap) {
+		mem_heap_empty(ctx->fast_scan_heap);
+	}
+}
+
+static bool
+innodb_pq_fast_scan_prepare_tuple(
+	row_prebuilt_t* prebuilt,
+	mem_heap_t* heap,
+	const key_range* range,
+	dtuple_t** tuple,
+	byte** key_buf)
+{
+	if (!range || !range->key || !range->length || !range->keypart_map) {
+		*tuple = NULL;
+		*key_buf = NULL;
+		return(true);
+	}
+
+	dict_index_t* index = prebuilt->index;
+	ulint n_fields = dict_index_get_n_unique_in_tree(index);
+	*tuple = dtuple_create(heap, n_fields);
+	dict_index_copy_types(*tuple, index, n_fields);
+
+	*key_buf = static_cast<byte*>(
+		mem_heap_alloc(heap, prebuilt->srch_key_val_len));
+	row_sel_convert_mysql_key_to_innobase(
+		*tuple, *key_buf, prebuilt->srch_key_val_len,
+		index, range->key, range->length);
+
+	return(true);
+}
+
+static const ulint INNODB_PQ_FAST_RECORD_BUFFER_ROWS = 16384;
+
+static bool
+innodb_pq_fast_scan_prepare_range(
+	row_prebuilt_t* prebuilt,
+	innodb_pq_worker_scan_ctx* ctx,
+	const key_range* start_range,
+	const key_range* end_range)
+{
+	innodb_pq_fast_scan_reset(ctx);
+
+	if (!row_pq_record_buffer_scan_supported(prebuilt)
+	    || ctx->reverse
+	    || !start_range
+	    || start_range->flag != HA_READ_KEY_OR_NEXT
+	    || (end_range && end_range->flag != HA_READ_BEFORE_KEY)) {
+		return(false);
+	}
+
+	if (!ctx->fast_scan_heap) {
+		ctx->fast_scan_heap = mem_heap_create(1024);
+	}
+	if (!ctx->fast_record_buffer_storage) {
+		ulint row_len = prebuilt->mysql_prefix_len
+			? prebuilt->mysql_prefix_len
+			: prebuilt->mysql_row_len;
+		ctx->fast_record_buffer_storage = static_cast<uchar*>(
+			my_malloc(PSI_INSTRUMENT_ME,
+				  row_len * INNODB_PQ_FAST_RECORD_BUFFER_ROWS,
+				  MYF(MY_WME)));
+		if (!ctx->fast_record_buffer_storage) {
+			innodb_pq_fast_scan_reset(ctx);
+			return(false);
+		}
+		ctx->fast_record_buffer.records = ctx->fast_record_buffer_storage;
+		ctx->fast_record_buffer.row_len = row_len;
+		ctx->fast_record_buffer.capacity =
+			INNODB_PQ_FAST_RECORD_BUFFER_ROWS;
+	}
+
+	if (!innodb_pq_fast_scan_prepare_tuple(
+		    prebuilt, ctx->fast_scan_heap, start_range,
+		    &ctx->fast_start_tuple, &ctx->fast_start_buf)
+	    || !ctx->fast_start_tuple
+	    || !innodb_pq_fast_scan_prepare_tuple(
+		    prebuilt, ctx->fast_scan_heap, end_range,
+		    &ctx->fast_end_tuple, &ctx->fast_end_buf)) {
+		innodb_pq_fast_scan_reset(ctx);
+		return(false);
+	}
+
+	ctx->fast_scan_available = true;
+	ctx->fast_scan_started = false;
+	ctx->fast_start_mode = PAGE_CUR_GE;
+	ctx->fast_end_exclusive = end_range != NULL;
+	return(true);
+}
+
+int
+ha_innobase::pq_leader_scan_init(
+	THD*,
+	const HA_pq_scan_init_param* param,
+	void** scan_ctx)
+{
+	DBUG_ENTER("ha_innobase::pq_leader_scan_init");
+
+	if (scan_ctx) {
+		*scan_ctx = NULL;
+	}
+
+	if (!scan_ctx || !param || !table
+	    || !m_prebuilt || !m_prebuilt->table
+	    || table->s->primary_key == MAX_KEY
+	    || param->keyno == MAX_KEY
+	    || param->keyno >= table->s->keys
+	    || !param->dop) {
+		DBUG_RETURN(HA_ERR_UNSUPPORTED);
+	}
+
+	innodb_pq_leader_scan_ctx* ctx =
+		static_cast<innodb_pq_leader_scan_ctx*>(
+			my_malloc(PSI_INSTRUMENT_ME, sizeof(*ctx), MYF(MY_WME)));
+	if (!ctx) {
+		DBUG_RETURN(HA_ERR_OUT_OF_MEM);
+	}
+
+	ctx->keyno = param->keyno;
+	ctx->dop = param->dop;
+	ctx->reverse = param->reverse;
+	innodb_pq_btree_scan_ctx_init(&ctx->btree, param->keyno, param->dop);
+	if (!innodb_pq_copy_range(&ctx->btree.scan_start_range,
+				  &ctx->btree.scan_start_key,
+				  param->scan_start_key)
+	    || !innodb_pq_copy_range(&ctx->btree.scan_end_range,
+				     &ctx->btree.scan_end_key,
+				     param->scan_end_key)) {
+		innodb_pq_btree_scan_ctx_clear(&ctx->btree);
+		my_free(ctx);
+		DBUG_RETURN(HA_ERR_OUT_OF_MEM);
+	}
+	if (ctx->reverse) {
+		ctx->btree.rejected_reason = "reverse_scan";
+	} else if (param->keyno != table->s->primary_key) {
+		ctx->btree.rejected_reason = "secondary_index";
+	} else {
+		innodb_pq_btree_build_descriptors(
+			&ctx->btree,
+			table,
+			dict_table_get_first_index(m_prebuilt->table),
+			m_prebuilt->trx);
+	}
+	if (!ctx->reverse && ctx->btree.enabled) {
+		if (!innodb_pq_btree_finalize_descriptor_ranges(&ctx->btree,
+								table)) {
+			innodb_pq_btree_queue_clear(&ctx->btree.shared);
+			ctx->btree.enabled = false;
+			ctx->btree.boundary_available = false;
+			ctx->btree.split_used = false;
+			ctx->btree.rejected_reason =
+				"descriptor_range_finalize_failed";
+		}
+	}
+	*scan_ctx = ctx;
+
+	DBUG_RETURN(0);
+}
+
+static bool
+innodb_pq_assign_worker_descriptors(
+	innodb_pq_worker_scan_ctx* worker_ctx,
+	const innodb_pq_btree_scan_ctx* scan,
+	const HA_pq_scan_range_param* range)
+{
+	if (!scan->split_used || !range->worker_count) {
+		return(false);
+	}
+
+	uint ordinal = 0;
+	for (const innodb_pq_btree_ctx* ctx = scan->shared.head; ctx;
+	     ctx = ctx->next, ordinal++) {
+		if (ordinal % range->worker_count != range->worker_id) {
+			continue;
+		}
+
+		innodb_pq_btree_ctx* clone = NULL;
+		if (!innodb_pq_btree_ctx_clone_with_ranges(
+			    &clone, ctx,
+			    ctx->start_range.keypart_map ? &ctx->start_range : NULL,
+			    ctx->end_range.keypart_map ? &ctx->end_range : NULL)) {
+			return(false);
+		}
+		innodb_pq_btree_queue_push(&worker_ctx->btree_queue.current,
+					   clone);
+	}
+
+	worker_ctx->use_btree_descriptors = true;
+	return(true);
+}
+
+static int
+innodb_pq_worker_scan_next_reverse(
+	ha_innobase* file,
+	innodb_pq_worker_scan_ctx* ctx,
+	uchar* buf)
+{
+	int error;
+	key_range* start = ctx->start_range.keypart_map ? &ctx->start_range : NULL;
+	key_range* end = ctx->end_range.keypart_map ? &ctx->end_range : NULL;
+
+	if (ctx->first_next) {
+		ctx->first_next = false;
+		if ((error = file->prepare_range_scan(start, end))) {
+			return(error);
+		}
+		file->set_end_range(start, handler::RANGE_SCAN_DESC);
+		if (end) {
+			error = file->ha_index_read_map(
+				file->get_table()->record[0],
+				end->key,
+				end->keypart_map,
+				HA_READ_BEFORE_KEY);
+		} else {
+			error = file->ha_index_last(file->get_table()->record[0]);
+		}
+	} else {
+		error = file->ha_index_prev(file->get_table()->record[0]);
+	}
+
+	if (error == HA_ERR_KEY_NOT_FOUND) {
+		error = HA_ERR_END_OF_FILE;
+	}
+	if (error) {
+		return(error);
+	}
+
+	if (start && file->compare_key2(start) > 0) {
+		file->unlock_row();
+		return(HA_ERR_END_OF_FILE);
+	}
+
+	if (buf && buf != file->get_table()->record[0]) {
+		memcpy(buf, file->get_table()->record[0],
+		       file->get_table()->s->reclength);
+	}
+
+	return(0);
+}
+
+int
+ha_innobase::pq_worker_scan_init(
+	THD*,
+	void* scan_ctx,
+	const HA_pq_scan_range_param* range)
+{
+	DBUG_ENTER("ha_innobase::pq_worker_scan_init");
+
+	pq_worker_scan_end();
+
+	innodb_pq_leader_scan_ctx* leader_ctx =
+		static_cast<innodb_pq_leader_scan_ctx*>(scan_ctx);
+
+	if (!leader_ctx || !range || leader_ctx->reverse != range->reverse
+	    || !table || table->s->primary_key == MAX_KEY
+	    || leader_ctx->keyno == MAX_KEY
+	    || leader_ctx->keyno >= table->s->keys
+	    || range->keyno != leader_ctx->keyno
+	    || !range->worker_count
+	    || range->worker_id >= range->worker_count) {
+		DBUG_RETURN(HA_ERR_UNSUPPORTED);
+	}
+
+	innodb_pq_worker_scan_ctx* ctx =
+		static_cast<innodb_pq_worker_scan_ctx*>(
+			my_malloc(PSI_INSTRUMENT_ME, sizeof(*ctx),
+				  MYF(MY_WME | MY_ZEROFILL)));
+	if (!ctx) {
+		DBUG_RETURN(HA_ERR_OUT_OF_MEM);
+	}
+
+	ctx->keyno = range->keyno;
+	ctx->reverse = range->reverse;
+	ctx->first_next = true;
+	ctx->use_btree_descriptors = false;
+	ctx->fast_scan_available = false;
+	ctx->fast_scan_started = false;
+	ctx->fast_scan_heap = NULL;
+	ctx->fast_start_buf = NULL;
+	ctx->fast_end_buf = NULL;
+	ctx->fast_start_tuple = NULL;
+	ctx->fast_end_tuple = NULL;
+	ctx->fast_start_mode = PAGE_CUR_UNSUPP;
+	ctx->fast_end_exclusive = true;
+	memset(&ctx->fast_record_buffer, 0, sizeof(ctx->fast_record_buffer));
+	ctx->fast_record_buffer_storage = NULL;
+	ctx->fast_row_heap = NULL;
+	ctx->active_btree_ctx = NULL;
+	innodb_pq_btree_worker_queue_init(&ctx->btree_queue);
+	innodb_pq_clear_range(&ctx->start_range);
+	innodb_pq_clear_range(&ctx->end_range);
+
+	if (leader_ctx->btree.split_used) {
+		if (!innodb_pq_assign_worker_descriptors(ctx, &leader_ctx->btree,
+							 range)) {
+			innodb_pq_free_worker_scan_ctx(ctx);
+			DBUG_RETURN(HA_ERR_OUT_OF_MEM);
+		}
+	} else {
+		if (!innodb_pq_copy_range(&ctx->start_range, &ctx->start_key,
+					  range->start_key)
+		    || !innodb_pq_copy_range(&ctx->end_range, &ctx->end_key,
+					     range->end_key)) {
+			innodb_pq_free_worker_scan_ctx(ctx);
+			DBUG_RETURN(HA_ERR_OUT_OF_MEM);
+		}
+	}
+
+	int error = ha_index_init(ctx->keyno, true);
+	if (error) {
+		innodb_pq_free_worker_scan_ctx(ctx);
+		DBUG_RETURN(error);
+	}
+	ctx->index_open = true;
+	m_pq_worker_scan_ctx = ctx;
+
+	DBUG_RETURN(0);
+}
+
+int
+ha_innobase::pq_worker_scan_next(void*, uchar* buf)
+{
+	DBUG_ENTER("ha_innobase::pq_worker_scan_next");
+
+	innodb_pq_worker_scan_ctx* ctx = m_pq_worker_scan_ctx;
+	if (!ctx || !ctx->index_open) {
+		DBUG_RETURN(HA_ERR_UNSUPPORTED);
+	}
+
+	int error;
+
+	if (ctx->reverse) {
+		DBUG_RETURN(innodb_pq_worker_scan_next_reverse(this, ctx, buf));
+	}
+
+	if (ctx->use_btree_descriptors) {
+		for (;;) {
+			if (!ctx->active_btree_ctx) {
+				ctx->active_btree_ctx =
+					innodb_pq_btree_queue_pop(
+						&ctx->btree_queue.current);
+				ctx->first_next = true;
+				if (!ctx->active_btree_ctx) {
+					DBUG_RETURN(HA_ERR_END_OF_FILE);
+				}
+			}
+
+			if (ctx->first_next) {
+				ctx->first_next = false;
+				key_range* start =
+					ctx->active_btree_ctx->start_range.keypart_map ?
+					  &ctx->active_btree_ctx->start_range : 0;
+				key_range* end =
+					ctx->active_btree_ctx->end_range.keypart_map ?
+					  &ctx->active_btree_ctx->end_range : 0;
+				if (innodb_pq_fast_scan_prepare_range(
+					    m_prebuilt, ctx, start, end)) {
+					ctx->fast_scan_started = true;
+					dberr_t db_err =
+						row_pq_record_buffer_scan_next(
+							buf ? buf : table->record[0],
+							m_prebuilt,
+							ctx->fast_start_tuple,
+							ctx->fast_start_mode,
+							ctx->fast_end_tuple,
+							ctx->fast_end_exclusive,
+							&ctx->fast_scan_started,
+							&ctx->fast_record_buffer,
+							&ctx->fast_row_heap);
+					switch (db_err) {
+					case DB_SUCCESS:
+						DBUG_RETURN(0);
+					case DB_RECORD_NOT_FOUND:
+					case DB_END_OF_INDEX:
+						error = HA_ERR_END_OF_FILE;
+						break;
+					case DB_UNSUPPORTED:
+						error = read_range_first(
+							start, end, false, true);
+						break;
+					default:
+						DBUG_RETURN(convert_error_code_to_mysql(
+							db_err, m_prebuilt->table->flags,
+							m_user_thd));
+					}
+				} else {
+					error = read_range_first(
+						start, end, false, true);
+				}
+			} else {
+				if (ctx->fast_scan_available) {
+					dberr_t db_err =
+						row_pq_record_buffer_scan_next(
+							buf ? buf : table->record[0],
+							m_prebuilt,
+							ctx->fast_start_tuple,
+							ctx->fast_start_mode,
+							ctx->fast_end_tuple,
+							ctx->fast_end_exclusive,
+							&ctx->fast_scan_started,
+							&ctx->fast_record_buffer,
+							&ctx->fast_row_heap);
+					switch (db_err) {
+					case DB_SUCCESS:
+						DBUG_RETURN(0);
+					case DB_RECORD_NOT_FOUND:
+					case DB_END_OF_INDEX:
+						error = HA_ERR_END_OF_FILE;
+						break;
+					case DB_UNSUPPORTED:
+						ctx->fast_scan_available = false;
+						error = read_range_next();
+						break;
+					default:
+						DBUG_RETURN(convert_error_code_to_mysql(
+							db_err, m_prebuilt->table->flags,
+							m_user_thd));
+					}
+				} else {
+					error = read_range_next();
+				}
+			}
+
+			if (!error) {
+				if (buf && buf != table->record[0]) {
+					memcpy(buf, table->record[0],
+					       table->s->reclength);
+				}
+				DBUG_RETURN(0);
+			}
+
+			if (error != HA_ERR_END_OF_FILE) {
+				DBUG_RETURN(error);
+			}
+
+			innodb_pq_btree_ctx_free(ctx->active_btree_ctx);
+			ctx->active_btree_ctx = NULL;
+		}
+	}
+
+	if (ctx->first_next) {
+		ctx->first_next = false;
+		key_range* start = ctx->start_range.keypart_map ?
+			&ctx->start_range : 0;
+		key_range* end = ctx->end_range.keypart_map ?
+			&ctx->end_range : 0;
+		if (innodb_pq_fast_scan_prepare_range(m_prebuilt, ctx,
+						      start, end)) {
+			ctx->fast_scan_started = true;
+			dberr_t db_err = row_pq_record_buffer_scan_next(
+				buf ? buf : table->record[0], m_prebuilt,
+				ctx->fast_start_tuple, ctx->fast_start_mode,
+				ctx->fast_end_tuple, ctx->fast_end_exclusive,
+				&ctx->fast_scan_started,
+				&ctx->fast_record_buffer,
+				&ctx->fast_row_heap);
+			switch (db_err) {
+			case DB_SUCCESS:
+				DBUG_RETURN(0);
+			case DB_RECORD_NOT_FOUND:
+			case DB_END_OF_INDEX:
+				error = HA_ERR_END_OF_FILE;
+				break;
+			case DB_UNSUPPORTED:
+				error = read_range_first(start, end, false, true);
+				break;
+			default:
+				DBUG_RETURN(convert_error_code_to_mysql(
+					db_err, m_prebuilt->table->flags,
+					m_user_thd));
+			}
+		} else {
+			error = read_range_first(start, end, false, true);
+		}
+	} else {
+		if (ctx->fast_scan_available) {
+			dberr_t db_err = row_pq_record_buffer_scan_next(
+				buf ? buf : table->record[0], m_prebuilt,
+				ctx->fast_start_tuple, ctx->fast_start_mode,
+				ctx->fast_end_tuple, ctx->fast_end_exclusive,
+				&ctx->fast_scan_started,
+				&ctx->fast_record_buffer,
+				&ctx->fast_row_heap);
+			switch (db_err) {
+			case DB_SUCCESS:
+				DBUG_RETURN(0);
+			case DB_RECORD_NOT_FOUND:
+			case DB_END_OF_INDEX:
+				error = HA_ERR_END_OF_FILE;
+				break;
+			case DB_UNSUPPORTED:
+				ctx->fast_scan_available = false;
+				error = read_range_next();
+				break;
+			default:
+				DBUG_RETURN(convert_error_code_to_mysql(
+					db_err, m_prebuilt->table->flags,
+					m_user_thd));
+			}
+		} else {
+			error = read_range_next();
+		}
+	}
+
+	if (!error && buf && buf != table->record[0]) {
+		memcpy(buf, table->record[0], table->s->reclength);
+	}
+
+	DBUG_RETURN(error);
+}
+
+int
+ha_innobase::pq_worker_scan_end()
+{
+	DBUG_ENTER("ha_innobase::pq_worker_scan_end");
+
+	innodb_pq_worker_scan_ctx* ctx = m_pq_worker_scan_ctx;
+	m_pq_worker_scan_ctx = NULL;
+
+	if (!ctx) {
+		DBUG_RETURN(0);
+	}
+
+	int error = 0;
+	if (ctx->index_open) {
+		error = ha_index_end();
+		ctx->index_open = false;
+	}
+	innodb_pq_free_worker_scan_ctx(ctx);
+
+	DBUG_RETURN(error);
+}
+
+int
+ha_innobase::pq_leader_scan_end(void* scan_ctx)
+{
+	DBUG_ENTER("ha_innobase::pq_leader_scan_end");
+
+	if (scan_ctx) {
+		innodb_pq_leader_scan_ctx* ctx =
+			static_cast<innodb_pq_leader_scan_ctx*>(scan_ctx);
+		innodb_pq_btree_scan_ctx_clear(&ctx->btree);
+		my_free(ctx);
+	}
+
+	DBUG_RETURN(0);
+}
+
+bool
+ha_innobase::pq_scan_btree_descriptor_available(void* scan_ctx)
+{
+	const innodb_pq_leader_scan_ctx* ctx =
+		static_cast<const innodb_pq_leader_scan_ctx*>(scan_ctx);
+
+	return ctx && ctx->btree.enabled && ctx->btree.shared.count > 0;
+}
+
+ulonglong
+ha_innobase::pq_scan_btree_descriptor_count(void* scan_ctx)
+{
+	const innodb_pq_leader_scan_ctx* ctx =
+		static_cast<const innodb_pq_leader_scan_ctx*>(scan_ctx);
+
+	return ctx ? ctx->btree.shared.count : 0;
+}
+
+bool
+ha_innobase::pq_scan_btree_scan_start_available(void* scan_ctx)
+{
+	const innodb_pq_leader_scan_ctx* ctx =
+		static_cast<const innodb_pq_leader_scan_ctx*>(scan_ctx);
+
+	return ctx && ctx->btree.scan_start_key;
+}
+
+bool
+ha_innobase::pq_scan_btree_scan_end_available(void* scan_ctx)
+{
+	const innodb_pq_leader_scan_ctx* ctx =
+		static_cast<const innodb_pq_leader_scan_ctx*>(scan_ctx);
+
+	return ctx && ctx->btree.scan_end_key;
+}
+
+bool
+ha_innobase::pq_scan_btree_boundary_available(void* scan_ctx)
+{
+	const innodb_pq_leader_scan_ctx* ctx =
+		static_cast<const innodb_pq_leader_scan_ctx*>(scan_ctx);
+
+	return ctx && ctx->btree.enabled && ctx->btree.boundary_available;
+}
+
+bool
+ha_innobase::pq_scan_btree_descriptor_split_used(void* scan_ctx)
+{
+	const innodb_pq_leader_scan_ctx* ctx =
+		static_cast<const innodb_pq_leader_scan_ctx*>(scan_ctx);
+
+	return ctx && ctx->btree.enabled && ctx->btree.split_used;
+}
+
+const char*
+ha_innobase::pq_scan_btree_descriptor_rejected_reason(void* scan_ctx)
+{
+	const innodb_pq_leader_scan_ctx* ctx =
+		static_cast<const innodb_pq_leader_scan_ctx*>(scan_ctx);
+
+	return ctx ? ctx->btree.rejected_reason : NULL;
+}
+
+bool
+ha_innobase::pq_scan_record_buffer_available(void*)
+{
+	return(row_pq_record_buffer_scan_supported(m_prebuilt));
+}
+
+const char*
+ha_innobase::pq_scan_worker_scan_api(void*)
+{
+	return(row_pq_record_buffer_scan_supported(m_prebuilt) ?
+	       "row_pq_record_buffer" : "read_range_next");
+}
+
+ulonglong
+ha_innobase::pq_scan_mysql_row_len(void*)
+{
+	return(m_prebuilt ? static_cast<ulonglong>(m_prebuilt->mysql_row_len) : 0);
+}
+
+ulonglong
+ha_innobase::pq_scan_mysql_prefix_len(void*)
+{
+	return(m_prebuilt ?
+	       static_cast<ulonglong>(m_prebuilt->mysql_prefix_len) : 0);
+}
+
+ulonglong
+ha_innobase::pq_scan_mysql_template_cols(void*)
+{
+	return(m_prebuilt ? static_cast<ulonglong>(m_prebuilt->n_template) : 0);
 }
 
 static
@@ -6435,6 +7921,8 @@ ha_innobase::close()
 /*================*/
 {
 	DBUG_ENTER("ha_innobase::close");
+
+	pq_worker_scan_end();
 
 	row_prebuilt_free(m_prebuilt);
 

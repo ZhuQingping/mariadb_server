@@ -202,6 +202,17 @@ public:
   */
   void open(trx_t *trx);
 
+  /**
+    Clone another transaction read view into this view.
+
+    The caller must own this view. The source view can belong to another
+    thread; this method protects access to the source view with its mutex.
+
+    @param src source view
+    @return whether an open source view was cloned
+  */
+  bool clone_from(const ReadView &src);
+
 
   /**
     Closes the view.

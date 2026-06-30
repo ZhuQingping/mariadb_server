@@ -29,6 +29,7 @@
 #include "sql_priv.h"
 #include "unireg.h"
 #include "sql_select.h"
+#include "mysqld.h"
 #include "sql_cache.h"                          // query_cache_*
 #include "sql_table.h"                          // primary_key_name
 #include "probes_mysql.h"
@@ -70,6 +71,17 @@
 #include "derived_handler.h"
 #include "opt_hints.h"
 #include "opt_group_by_cardinality.h"
+#include "transaction.h"
+#include <algorithm>
+#include <errno.h>
+#include <iterator>
+#include <map>
+#include <memory>
+#include <new>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
 /*
   A key part number that means we're using a fulltext scan.
@@ -238,6 +250,18 @@ static void join_const_unlock_row(JOIN_TAB *tab);
 static int join_read_always_key(JOIN_TAB *tab);
 static int join_read_last_key(JOIN_TAB *tab);
 static int join_no_more_records(READ_RECORD *info);
+static int try_parallel_count_select(JOIN *join);
+static int try_parallel_field_select(JOIN *join);
+static bool pq_projection_query_shape(JOIN *join);
+static bool pq_scalar_aggregate_query_shape(JOIN *join);
+static bool pq_item_is_cacheable_scalar_subquery_const(THD *thd, Item *item,
+                                                       bool evaluate_values);
+static bool pq_item_has_only_cacheable_scalar_subquery_consts(
+  THD *thd, Item *item, bool evaluate_values);
+
+#define PQ_SUPPORT_FEATURES_SWITCH_SIMPLE_AGG (1ULL << 0)
+#define PQ_SUPPORT_FEATURES_SWITCH_COUNT_DISTINCT (1ULL << 1)
+
 static int join_read_next(READ_RECORD *info);
 static int join_hlindex_read_next(READ_RECORD *info);
 static int join_init_quick_read_record(JOIN_TAB *tab);
@@ -541,6 +565,7 @@ void JOIN::init(THD *thd_arg, List<Item> &fields_arg,
   exec_const_cond= 0;
   group_optimized_away= 0;
   no_rows_in_result_called= 0;
+  pq_execution_not_applied_reason= 0;
   positions= best_positions= 0;
   pushdown_query= 0;
   original_join_tab= 0;
@@ -4523,7 +4548,7 @@ JOIN::optimize_distinct()
 bool
 JOIN::add_sorting_to_table(JOIN_TAB *tab, ORDER *order)
 {
-  tab->filesort= 
+  tab->filesort=
     new (thd->mem_root) Filesort(order, HA_ROWS_MAX, tab->keep_current_rowid,
                                  tab->select);
   if (!tab->filesort)
@@ -4681,8 +4706,8 @@ bool JOIN::setup_subquery_caches()
     FALSE     if all buffer have been successfully shrunk
     TRUE      otherwise
 */
-  
-bool JOIN::shrink_join_buffers(JOIN_TAB *jt, 
+
+bool JOIN::shrink_join_buffers(JOIN_TAB *jt,
                                ulonglong curr_space,
                                ulonglong needed_space)
 {
@@ -4694,12 +4719,12 @@ bool JOIN::shrink_join_buffers(JOIN_TAB *jt,
   {
     cache= tab->cache;
     if (cache)
-    { 
+    {
       size_t buff_size;
       if (needed_space < cache->get_min_join_buffer_size())
         return TRUE;
       if (cache->shrink_join_buffer_in_ratio(curr_space, needed_space))
-      { 
+      {
         revise_cache_usage(tab);
         return TRUE;
       }
@@ -4723,7 +4748,7 @@ bool JOIN::shrink_join_buffers(JOIN_TAB *jt,
   if (needed_space < cache->get_min_join_buffer_size())
     return TRUE;
   cache->set_join_buffer_size((size_t)needed_space);
-  
+
   return FALSE;
 }
 
@@ -4737,6 +4762,7 @@ JOIN::reinit()
   group_sent= false;
   cleaned= false;
   accepted_rows= 0;
+  pq_execution_not_applied_reason= 0;
 
   if (aggr_tables)
   {
@@ -4821,6 +4847,10459 @@ bool JOIN::prepare_result(List<Item> **columns_list)
 err:
   error= 1;
   DBUG_RETURN(TRUE);
+}
+
+struct Pq_count_predicate
+{
+  uint field_index;
+  enum Pq_predicate_type
+  {
+    PQ_PREDICATE_DATETIME,
+    PQ_PREDICATE_TIME,
+    PQ_PREDICATE_SIGNED_INT,
+    PQ_PREDICATE_UNSIGNED_INT,
+    PQ_PREDICATE_REAL,
+    PQ_PREDICATE_DECIMAL,
+    PQ_PREDICATE_STRING
+  } predicate_type;
+  enum Pq_predicate_op
+  {
+    PQ_PREDICATE_EQ,
+    PQ_PREDICATE_NE,
+    PQ_PREDICATE_LT,
+    PQ_PREDICATE_LE,
+    PQ_PREDICATE_GE,
+    PQ_PREDICATE_GT,
+    PQ_PREDICATE_LIKE,
+    PQ_PREDICATE_NOT_LIKE,
+    PQ_PREDICATE_IS_NULL,
+    PQ_PREDICATE_IS_NOT_NULL
+  } predicate_op;
+  longlong predicate_gt_value;
+  bool predicate_datetime_binary_valid;
+  std::vector<uchar> predicate_datetime_binary_value;
+  ulonglong predicate_unsigned_value;
+  double predicate_real_value;
+  my_decimal predicate_decimal_value;
+  bool predicate_decimal_binary_valid;
+  std::vector<uchar> predicate_decimal_binary_value;
+  int predicate_escape;
+  CHARSET_INFO *predicate_charset;
+  std::vector<char> predicate_string_value;
+};
+
+typedef std::vector<Pq_count_predicate> Pq_predicate_conjunction;
+
+struct Pq_predicate_filter
+{
+  std::vector<Pq_predicate_conjunction> disjuncts;
+};
+
+struct Pq_worker_error
+{
+  int error;
+  uint sql_errno;
+  char sqlstate[SQLSTATE_LENGTH + 1];
+  char message[MYSQL_ERRMSG_SIZE];
+
+  void clear()
+  {
+    error= 0;
+    sql_errno= 0;
+    sqlstate[0]= 0;
+    message[0]= 0;
+  }
+};
+
+static void pq_capture_worker_error(THD *thd, TABLE *table,
+                                    Pq_worker_error *worker_error)
+{
+  if (!worker_error || !worker_error->error)
+    return;
+
+  if (table && table->file &&
+      worker_error->error > 1 &&
+      worker_error->error != HA_ERR_QUERY_INTERRUPTED &&
+      !thd->is_error())
+    table->file->print_error(worker_error->error, MYF(0));
+
+  Diagnostics_area *da= thd->get_stmt_da();
+  if (!da->is_error())
+    return;
+
+  worker_error->sql_errno= da->sql_errno();
+  strmake_buf(worker_error->sqlstate, da->get_sqlstate());
+  strmake_buf(worker_error->message, da->message());
+}
+
+static void pq_remember_worker_error(Pq_worker_error *dst,
+                                     const Pq_worker_error &src)
+{
+  if (!dst->error && src.error)
+    *dst= src;
+}
+
+static bool pq_leader_killed(THD *leader_thd);
+
+class Pq_worker_cancel_state
+{
+public:
+  Pq_worker_cancel_state() : m_cancelled(0) {}
+
+  bool is_cancelled() const
+  {
+    return __sync_fetch_and_add(const_cast<int *>(&m_cancelled), 0) != 0;
+  }
+
+  void request_cancel()
+  {
+    __sync_bool_compare_and_swap(&m_cancelled, 0, 1);
+  }
+
+private:
+  int m_cancelled;
+};
+
+static void pq_request_worker_cancel(Pq_worker_cancel_state *cancel_state)
+{
+  if (cancel_state)
+    cancel_state->request_cancel();
+}
+
+static void pq_note_worker_startup_error(Pq_worker_cancel_state *cancel_state,
+                                         Pq_worker_error *worker_error)
+{
+  worker_error->error= 1;
+  pq_request_worker_cancel(cancel_state);
+}
+
+static bool pq_worker_cancelled(Pq_worker_cancel_state *cancel_state)
+{
+  return cancel_state && cancel_state->is_cancelled();
+}
+
+static bool pq_worker_should_stop(Pq_worker_cancel_state *cancel_state,
+                                  THD *leader_thd, THD *worker_thd)
+{
+  return pq_worker_cancelled(cancel_state) ||
+         pq_leader_killed(leader_thd) ||
+         (worker_thd && worker_thd->killed);
+}
+
+class Pq_worker_control
+{
+public:
+  Pq_worker_control() : m_thd(0), m_initialized(false)
+  {
+    m_initialized= pthread_mutex_init(&m_lock, 0) == 0;
+  }
+
+  ~Pq_worker_control()
+  {
+    if (m_initialized)
+      pthread_mutex_destroy(&m_lock);
+  }
+
+  bool is_initialized() const { return m_initialized; }
+
+  void publish(THD *thd)
+  {
+    if (!m_initialized)
+      return;
+    pthread_mutex_lock(&m_lock);
+    m_thd= thd;
+    pthread_mutex_unlock(&m_lock);
+  }
+
+  void clear(THD *thd)
+  {
+    if (!m_initialized)
+      return;
+    pthread_mutex_lock(&m_lock);
+    if (m_thd == thd)
+      m_thd= 0;
+    pthread_mutex_unlock(&m_lock);
+  }
+
+  void awake_if_running()
+  {
+    if (!m_initialized)
+      return;
+    pthread_mutex_lock(&m_lock);
+    if (m_thd)
+      m_thd->awake(KILL_QUERY);
+    pthread_mutex_unlock(&m_lock);
+  }
+
+private:
+  pthread_mutex_t m_lock;
+  THD *m_thd;
+  bool m_initialized;
+};
+
+static void pq_publish_worker_thd(Pq_worker_control *control, THD *thd)
+{
+  if (control)
+    control->publish(thd);
+}
+
+static void pq_clear_worker_thd(Pq_worker_control *control, THD *thd)
+{
+  if (control)
+    control->clear(thd);
+}
+
+static bool pq_init_worker_controls(
+            size_t count,
+            std::vector<std::unique_ptr<Pq_worker_control> > *controls)
+{
+  controls->clear();
+  controls->reserve(count);
+  for (size_t i= 0; i < count; i++)
+  {
+    std::unique_ptr<Pq_worker_control> control(
+        new (std::nothrow) Pq_worker_control());
+    if (!control.get() || !control->is_initialized())
+      return false;
+    controls->push_back(std::move(control));
+  }
+  return true;
+}
+
+static void pq_awake_launched_workers(
+            const std::vector<std::unique_ptr<Pq_worker_control> > &controls,
+            size_t launched)
+{
+  size_t count= std::min(launched, controls.size());
+  for (size_t i= 0; i < count; i++)
+    controls[i]->awake_if_running();
+}
+
+static int pq_create_worker_thread(pthread_t *thread,
+                                   void *(*start_routine)(void *),
+                                   void *arg,
+                                   size_t worker_index)
+{
+  DBUG_EXECUTE_IF("pq_fail_worker_create_first",
+                  if (worker_index == 0) return EAGAIN;);
+  DBUG_EXECUTE_IF("pq_fail_worker_create_after_first",
+                  if (worker_index > 0) return EAGAIN;);
+  return pthread_create(thread, 0, start_routine, arg);
+}
+
+enum Pq_range_key_kind
+{
+  PQ_RANGE_KEY_INTEGER,
+  PQ_RANGE_KEY_DATE,
+  PQ_RANGE_KEY_DATETIME,
+  PQ_RANGE_KEY_TIME
+};
+
+struct Pq_scan_range
+{
+  ulonglong start;
+  ulonglong end;
+  bool has_end;
+  bool key_is_unsigned;
+  Pq_range_key_kind key_kind;
+};
+
+enum Pq_scan_provider_kind
+{
+  PQ_SCAN_PROVIDER_SQL_PRIMARY_KEY_RANGE,
+  PQ_SCAN_PROVIDER_HANDLER_PRIMARY,
+  PQ_SCAN_PROVIDER_HANDLER_SECONDARY_RANGE
+};
+
+struct Pq_scan_provider
+{
+  Pq_scan_provider_kind provider_kind;
+  uint pk_field_index;
+  uint scan_keyno;
+  uint scan_field_index;
+  bool secondary_requires_cluster_lookup;
+  bool reverse;
+  bool handler_scan_available;
+  const char *handler_scan_rejected_reason;
+  void *handler_scan_ctx;
+  std::vector<Pq_scan_range> ranges;
+
+  Pq_scan_provider()
+    : provider_kind(PQ_SCAN_PROVIDER_SQL_PRIMARY_KEY_RANGE),
+      pk_field_index(0), scan_keyno(MAX_KEY), scan_field_index(0),
+      secondary_requires_cluster_lookup(false), reverse(false),
+      handler_scan_available(false), handler_scan_rejected_reason(NULL),
+      handler_scan_ctx(NULL)
+  {}
+
+  bool uses_handler() const
+  {
+    return provider_kind == PQ_SCAN_PROVIDER_HANDLER_PRIMARY ||
+           provider_kind == PQ_SCAN_PROVIDER_HANDLER_SECONDARY_RANGE;
+  }
+};
+
+struct Pq_count_worker_arg
+{
+  THD *leader_thd;
+  Pq_worker_control *worker_control;
+  Pq_worker_cancel_state *cancel_state;
+  const LEX_CSTRING *db;
+  const LEX_CSTRING *table_name;
+  std::vector<std::string> partition_names;
+  Pq_scan_provider_kind provider_kind;
+  void *handler_scan_ctx;
+  bool handler_scan_reverse;
+  bool secondary_requires_cluster_lookup;
+  uint scan_keyno;
+  uint scan_field_index;
+  uint worker_id;
+  uint worker_count;
+  Pq_scan_range range;
+  uint pk_field_index;
+  bool fail_thd_init;
+  bool fail_mid_scan;
+  bool has_count_field;
+  uint count_field_index;
+  bool has_sum_field;
+  uint sum_field_index;
+  bool has_sum_product_fields;
+  uint sum_product_left_field_index;
+  uint sum_product_right_field_index;
+  bool sum_decimal_result;
+  bool sum_count_nonnull;
+  bool has_minmax_field;
+  uint minmax_field_index;
+  bool minmax_is_min;
+  Pq_predicate_filter predicate_filter;
+  ulonglong count;
+  bool has_sum_value;
+  my_decimal sum_decimal;
+  double sum_real;
+  bool has_minmax_value;
+  std::vector<uchar> minmax_value;
+  ulonglong scanned_rows;
+  ulonglong qualified_rows;
+  ulonglong elapsed_us;
+  Pq_worker_error worker_error;
+};
+
+static int pq_store_range_key(Field *field, ulonglong value,
+                              bool unsigned_key,
+                              Pq_range_key_kind key_kind);
+
+static int pq_prepare_handler_key_range(TABLE *table, uint keyno,
+                                        uint field_index, ulonglong value,
+                                        bool unsigned_key,
+                                        Pq_range_key_kind key_kind,
+                                        enum ha_rkey_function flag,
+                                        std::vector<uchar> *key_buffer,
+                                        key_range *range);
+
+static constexpr size_t PQ_MAX_PREDICATE_DISJUNCTS= 16;
+
+static int pq_compare_minmax_field(Field *field, const uchar *left,
+                                   const uchar *right);
+static bool pq_save_field_payload(Field *field, std::vector<uchar> *value);
+static bool pq_restore_field_payload(Field *field,
+                                     const std::vector<uchar> &value);
+
+static void pq_copy_partition_names(TABLE *table,
+                                    std::vector<std::string> *partition_names)
+{
+  partition_names->clear();
+
+  TABLE_LIST *table_list= table ? table->pos_in_table_list : NULL;
+  if (!table_list || !table_list->partition_names ||
+      !table_list->partition_names->elements)
+    return;
+
+  List_iterator<String> it(*table_list->partition_names);
+  String *partition_name;
+  while ((partition_name= it++))
+    partition_names->push_back(std::string(partition_name->ptr(),
+                                           partition_name->length()));
+}
+
+static bool pq_init_worker_table_list(
+    THD *thd, TABLE_LIST *table_list, const LEX_CSTRING *db,
+    const LEX_CSTRING *table_name,
+    const std::vector<std::string> &partition_names,
+    std::vector<String> *worker_partition_strings,
+    List<String> *worker_partition_list)
+{
+  table_list->init_one_table(db, table_name, table_name, TL_READ);
+  if (partition_names.empty())
+    return false;
+
+  worker_partition_strings->clear();
+  worker_partition_strings->reserve(partition_names.size());
+  for (const std::string &partition_name : partition_names)
+  {
+    worker_partition_strings->push_back(
+        String(partition_name.data(), partition_name.length(),
+               system_charset_info));
+  }
+
+  for (String &partition_name : *worker_partition_strings)
+  {
+    if (worker_partition_list->push_back(&partition_name, thd->mem_root))
+      return true;
+  }
+  table_list->partition_names= worker_partition_list;
+  return false;
+}
+
+static bool pq_predicate_matches(THD *thd, Field *field,
+                                 const Pq_count_predicate &predicate)
+{
+  longlong value;
+  ulonglong unsigned_value;
+  double real_value;
+  my_decimal decimal_value;
+  my_decimal *field_decimal_value;
+
+  if (predicate.predicate_op == Pq_count_predicate::PQ_PREDICATE_IS_NULL)
+    return field->is_null();
+  if (predicate.predicate_op == Pq_count_predicate::PQ_PREDICATE_IS_NOT_NULL)
+    return !field->is_null();
+
+  if (field->is_null())
+    return false;
+
+  if (predicate.predicate_type == Pq_count_predicate::PQ_PREDICATE_STRING)
+  {
+    String field_value_buffer;
+    String *field_value= field->val_str(&field_value_buffer);
+    const char *ptr= predicate.predicate_string_value.empty() ?
+                    "" : predicate.predicate_string_value.data();
+    String const_value(ptr, predicate.predicate_string_value.size(),
+                       predicate.predicate_charset);
+    if (!field_value)
+      return false;
+    if (predicate.predicate_op == Pq_count_predicate::PQ_PREDICATE_LIKE ||
+        predicate.predicate_op == Pq_count_predicate::PQ_PREDICATE_NOT_LIKE)
+    {
+      bool matched= predicate.predicate_charset->wildcmp(
+                     field_value->ptr(),
+                     field_value->ptr() + field_value->length(),
+                     const_value.ptr(), const_value.ptr() + const_value.length(),
+                     predicate.predicate_escape, wild_one, wild_many) == 0;
+      return predicate.predicate_op == Pq_count_predicate::PQ_PREDICATE_LIKE ?
+             matched : !matched;
+    }
+    int cmp= sortcmp(field_value, &const_value,
+                     predicate.predicate_charset);
+    switch (predicate.predicate_op)
+    {
+    case Pq_count_predicate::PQ_PREDICATE_EQ:
+      return cmp == 0;
+    case Pq_count_predicate::PQ_PREDICATE_NE:
+      return cmp != 0;
+    case Pq_count_predicate::PQ_PREDICATE_LT:
+      return cmp < 0;
+    case Pq_count_predicate::PQ_PREDICATE_LE:
+      return cmp <= 0;
+    case Pq_count_predicate::PQ_PREDICATE_GE:
+      return cmp >= 0;
+    case Pq_count_predicate::PQ_PREDICATE_GT:
+      return cmp > 0;
+    case Pq_count_predicate::PQ_PREDICATE_LIKE:
+    case Pq_count_predicate::PQ_PREDICATE_NOT_LIKE:
+    case Pq_count_predicate::PQ_PREDICATE_IS_NULL:
+    case Pq_count_predicate::PQ_PREDICATE_IS_NOT_NULL:
+      return false;
+    }
+    return false;
+  }
+
+  if (predicate.predicate_type == Pq_count_predicate::PQ_PREDICATE_UNSIGNED_INT)
+  {
+    unsigned_value= (ulonglong) field->val_int();
+    switch (predicate.predicate_op)
+    {
+    case Pq_count_predicate::PQ_PREDICATE_EQ:
+      return unsigned_value == predicate.predicate_unsigned_value;
+    case Pq_count_predicate::PQ_PREDICATE_NE:
+      return unsigned_value != predicate.predicate_unsigned_value;
+    case Pq_count_predicate::PQ_PREDICATE_LT:
+      return unsigned_value < predicate.predicate_unsigned_value;
+    case Pq_count_predicate::PQ_PREDICATE_LE:
+      return unsigned_value <= predicate.predicate_unsigned_value;
+    case Pq_count_predicate::PQ_PREDICATE_GE:
+      return unsigned_value >= predicate.predicate_unsigned_value;
+    case Pq_count_predicate::PQ_PREDICATE_GT:
+      return unsigned_value > predicate.predicate_unsigned_value;
+    case Pq_count_predicate::PQ_PREDICATE_LIKE:
+    case Pq_count_predicate::PQ_PREDICATE_NOT_LIKE:
+    case Pq_count_predicate::PQ_PREDICATE_IS_NULL:
+    case Pq_count_predicate::PQ_PREDICATE_IS_NOT_NULL:
+      return false;
+    }
+    return false;
+  }
+
+  if (predicate.predicate_type == Pq_count_predicate::PQ_PREDICATE_REAL)
+  {
+    real_value= field->val_real();
+    switch (predicate.predicate_op)
+    {
+    case Pq_count_predicate::PQ_PREDICATE_EQ:
+      return real_value == predicate.predicate_real_value;
+    case Pq_count_predicate::PQ_PREDICATE_NE:
+      return real_value != predicate.predicate_real_value;
+    case Pq_count_predicate::PQ_PREDICATE_LT:
+      return real_value < predicate.predicate_real_value;
+    case Pq_count_predicate::PQ_PREDICATE_LE:
+      return real_value <= predicate.predicate_real_value;
+    case Pq_count_predicate::PQ_PREDICATE_GE:
+      return real_value >= predicate.predicate_real_value;
+    case Pq_count_predicate::PQ_PREDICATE_GT:
+      return real_value > predicate.predicate_real_value;
+    case Pq_count_predicate::PQ_PREDICATE_LIKE:
+    case Pq_count_predicate::PQ_PREDICATE_NOT_LIKE:
+    case Pq_count_predicate::PQ_PREDICATE_IS_NULL:
+    case Pq_count_predicate::PQ_PREDICATE_IS_NOT_NULL:
+      return false;
+    }
+    return false;
+  }
+
+  if (predicate.predicate_type == Pq_count_predicate::PQ_PREDICATE_DECIMAL)
+  {
+    if (predicate.predicate_decimal_binary_valid &&
+        field->real_type() == MYSQL_TYPE_NEWDECIMAL)
+    {
+      Field_new_decimal *decimal_field=
+        static_cast<Field_new_decimal *>(field);
+      int cmp= decimal_field->cmp(
+        field->ptr, predicate.predicate_decimal_binary_value.data());
+      switch (predicate.predicate_op)
+      {
+      case Pq_count_predicate::PQ_PREDICATE_EQ:
+        return cmp == 0;
+      case Pq_count_predicate::PQ_PREDICATE_NE:
+        return cmp != 0;
+      case Pq_count_predicate::PQ_PREDICATE_LT:
+        return cmp < 0;
+      case Pq_count_predicate::PQ_PREDICATE_LE:
+        return cmp <= 0;
+      case Pq_count_predicate::PQ_PREDICATE_GE:
+        return cmp >= 0;
+      case Pq_count_predicate::PQ_PREDICATE_GT:
+        return cmp > 0;
+      case Pq_count_predicate::PQ_PREDICATE_LIKE:
+      case Pq_count_predicate::PQ_PREDICATE_NOT_LIKE:
+      case Pq_count_predicate::PQ_PREDICATE_IS_NULL:
+      case Pq_count_predicate::PQ_PREDICATE_IS_NOT_NULL:
+        return false;
+      }
+      return false;
+    }
+
+    field_decimal_value= field->val_decimal(&decimal_value);
+    if (!field_decimal_value)
+      return false;
+    int cmp= my_decimal_cmp(field_decimal_value,
+                            &predicate.predicate_decimal_value);
+    switch (predicate.predicate_op)
+    {
+    case Pq_count_predicate::PQ_PREDICATE_EQ:
+      return cmp == 0;
+    case Pq_count_predicate::PQ_PREDICATE_NE:
+      return cmp != 0;
+    case Pq_count_predicate::PQ_PREDICATE_LT:
+      return cmp < 0;
+    case Pq_count_predicate::PQ_PREDICATE_LE:
+      return cmp <= 0;
+    case Pq_count_predicate::PQ_PREDICATE_GE:
+      return cmp >= 0;
+    case Pq_count_predicate::PQ_PREDICATE_GT:
+      return cmp > 0;
+    case Pq_count_predicate::PQ_PREDICATE_LIKE:
+    case Pq_count_predicate::PQ_PREDICATE_NOT_LIKE:
+    case Pq_count_predicate::PQ_PREDICATE_IS_NULL:
+    case Pq_count_predicate::PQ_PREDICATE_IS_NOT_NULL:
+      return false;
+    }
+    return false;
+  }
+
+  if (predicate.predicate_type == Pq_count_predicate::PQ_PREDICATE_DATETIME &&
+      predicate.predicate_datetime_binary_valid &&
+      (field->real_type() == MYSQL_TYPE_DATE ||
+       field->real_type() == MYSQL_TYPE_NEWDATE))
+  {
+    Field_newdate *date_field= static_cast<Field_newdate *>(field);
+    int cmp= date_field->cmp(
+      field->ptr, predicate.predicate_datetime_binary_value.data());
+    switch (predicate.predicate_op)
+    {
+    case Pq_count_predicate::PQ_PREDICATE_EQ:
+      return cmp == 0;
+    case Pq_count_predicate::PQ_PREDICATE_NE:
+      return cmp != 0;
+    case Pq_count_predicate::PQ_PREDICATE_LT:
+      return cmp < 0;
+    case Pq_count_predicate::PQ_PREDICATE_LE:
+      return cmp <= 0;
+    case Pq_count_predicate::PQ_PREDICATE_GE:
+      return cmp >= 0;
+    case Pq_count_predicate::PQ_PREDICATE_GT:
+      return cmp > 0;
+    case Pq_count_predicate::PQ_PREDICATE_LIKE:
+    case Pq_count_predicate::PQ_PREDICATE_NOT_LIKE:
+    case Pq_count_predicate::PQ_PREDICATE_IS_NULL:
+    case Pq_count_predicate::PQ_PREDICATE_IS_NOT_NULL:
+      return false;
+    }
+    return false;
+  }
+
+  switch (predicate.predicate_type)
+  {
+  case Pq_count_predicate::PQ_PREDICATE_DATETIME:
+    value= field->val_datetime_packed(thd);
+    break;
+  case Pq_count_predicate::PQ_PREDICATE_TIME:
+    value= field->val_time_packed(thd);
+    break;
+  case Pq_count_predicate::PQ_PREDICATE_SIGNED_INT:
+    value= field->val_int();
+    break;
+  default:
+    return false;
+  }
+
+  switch (predicate.predicate_op)
+  {
+  case Pq_count_predicate::PQ_PREDICATE_EQ:
+    return value == predicate.predicate_gt_value;
+  case Pq_count_predicate::PQ_PREDICATE_NE:
+    return value != predicate.predicate_gt_value;
+  case Pq_count_predicate::PQ_PREDICATE_LT:
+    return value < predicate.predicate_gt_value;
+  case Pq_count_predicate::PQ_PREDICATE_LE:
+    return value <= predicate.predicate_gt_value;
+  case Pq_count_predicate::PQ_PREDICATE_GE:
+    return value >= predicate.predicate_gt_value;
+  case Pq_count_predicate::PQ_PREDICATE_GT:
+    return value > predicate.predicate_gt_value;
+  case Pq_count_predicate::PQ_PREDICATE_LIKE:
+  case Pq_count_predicate::PQ_PREDICATE_NOT_LIKE:
+  case Pq_count_predicate::PQ_PREDICATE_IS_NULL:
+  case Pq_count_predicate::PQ_PREDICATE_IS_NOT_NULL:
+    return false;
+  }
+  return false;
+}
+
+static bool pq_predicate_conjunction_matches(THD *thd, TABLE *table,
+                                             const Pq_predicate_conjunction
+                                             &predicates)
+{
+  for (const Pq_count_predicate &predicate : predicates)
+  {
+    Field *field= table->field[predicate.field_index];
+    if (!pq_predicate_matches(thd, field, predicate))
+      return false;
+  }
+  return true;
+}
+
+static bool pq_predicate_filter_matches(THD *thd, TABLE *table,
+                                        const Pq_predicate_filter
+                                        &predicate_filter)
+{
+  if (predicate_filter.disjuncts.empty())
+    return true;
+
+  for (const Pq_predicate_conjunction &predicates :
+       predicate_filter.disjuncts)
+  {
+    if (pq_predicate_conjunction_matches(thd, table, predicates))
+      return true;
+  }
+  return false;
+}
+
+static bool pq_mark_predicate_filter_read_set(TABLE *table,
+                                             const Pq_predicate_filter
+                                             &predicate_filter)
+{
+  for (const Pq_predicate_conjunction &predicates :
+       predicate_filter.disjuncts)
+  {
+    for (const Pq_count_predicate &predicate : predicates)
+    {
+      if (predicate.field_index >= table->s->fields)
+        return false;
+      bitmap_set_bit(table->read_set, predicate.field_index);
+    }
+  }
+  return true;
+}
+
+static bool pq_decimal_add(THD *thd, my_decimal *result,
+                           const my_decimal *lhs, const my_decimal *rhs);
+static bool pq_decimal_mul(THD *thd, my_decimal *result,
+                           const my_decimal *lhs, const my_decimal *rhs);
+
+class Pq_worker_scan_cursor
+{
+public:
+  Pq_worker_scan_cursor()
+    : m_table(0), m_provider_kind(PQ_SCAN_PROVIDER_SQL_PRIMARY_KEY_RANGE),
+      m_handler_scan_ctx(NULL), m_handler_scan_reverse(false),
+      m_secondary_requires_cluster_lookup(false), m_worker_id(0),
+      m_worker_count(0), m_scan_keyno(MAX_KEY), m_handler_keyread(false),
+      m_has_end(false), m_open(false)
+  {
+    bzero(&m_start_range, sizeof(m_start_range));
+    bzero(&m_end_range, sizeof(m_end_range));
+  }
+
+  int init(TABLE *table, Pq_scan_provider_kind provider_kind,
+           void *handler_scan_ctx, bool handler_scan_reverse,
+           bool secondary_requires_cluster_lookup,
+           uint worker_id, uint worker_count, uint scan_keyno,
+           uint scan_field_index,
+           const Pq_scan_range &range)
+  {
+    m_table= table;
+    m_provider_kind= provider_kind;
+    m_handler_scan_ctx= handler_scan_ctx;
+    m_handler_scan_reverse= handler_scan_reverse;
+    m_secondary_requires_cluster_lookup= secondary_requires_cluster_lookup;
+    m_worker_id= worker_id;
+    m_worker_count= worker_count;
+    m_scan_keyno= scan_keyno;
+
+    switch (m_provider_kind)
+    {
+    case PQ_SCAN_PROVIDER_SQL_PRIMARY_KEY_RANGE:
+      return init_sql_range(scan_field_index, range);
+    case PQ_SCAN_PROVIDER_HANDLER_PRIMARY:
+    case PQ_SCAN_PROVIDER_HANDLER_SECONDARY_RANGE:
+      return init_handler_range(scan_field_index, range);
+    }
+    return HA_ERR_UNSUPPORTED;
+  }
+
+  int next()
+  {
+    switch (m_provider_kind)
+    {
+    case PQ_SCAN_PROVIDER_SQL_PRIMARY_KEY_RANGE:
+      return m_table->file->read_range_next();
+    case PQ_SCAN_PROVIDER_HANDLER_PRIMARY:
+    case PQ_SCAN_PROVIDER_HANDLER_SECONDARY_RANGE:
+      return m_table->file->ha_pq_worker_scan_next(m_handler_scan_ctx,
+                                                   m_table->record[0]);
+    }
+    return HA_ERR_UNSUPPORTED;
+  }
+
+  int end()
+  {
+    switch (m_provider_kind)
+    {
+    case PQ_SCAN_PROVIDER_SQL_PRIMARY_KEY_RANGE:
+      return end_sql_range();
+    case PQ_SCAN_PROVIDER_HANDLER_PRIMARY:
+    case PQ_SCAN_PROVIDER_HANDLER_SECONDARY_RANGE:
+      return end_handler_range();
+    }
+    return 0;
+  }
+
+private:
+  int prepare_range_keys(uint scan_field_index, const Pq_scan_range &range)
+  {
+    int error;
+    m_has_end= range.has_end;
+
+    if (m_scan_keyno == MAX_KEY || m_scan_keyno >= m_table->s->keys)
+      return HA_ERR_UNSUPPORTED;
+    KEY *key_info= m_table->key_info + m_scan_keyno;
+    uint key_length= key_info->key_part[0].store_length;
+    Field *scan_field= m_table->field[scan_field_index];
+    bool scan_field_was_written=
+      bitmap_is_set(m_table->write_set, scan_field_index);
+    m_start_key.resize(key_length);
+    m_end_key.resize(key_length);
+
+    if (!scan_field_was_written)
+      bitmap_set_bit(m_table->write_set, scan_field_index);
+    if ((error= pq_store_range_key(scan_field, range.start,
+                                   range.key_is_unsigned,
+                                   range.key_kind)))
+    {
+      if (!scan_field_was_written)
+        bitmap_clear_bit(m_table->write_set, scan_field_index);
+      return error;
+    }
+    key_copy(m_start_key.data(), m_table->record[0], key_info, key_length);
+    m_start_range.key= m_start_key.data();
+    m_start_range.length= key_length;
+    m_start_range.keypart_map= (key_part_map) 1;
+    m_start_range.flag= HA_READ_KEY_OR_NEXT;
+
+    if (range.has_end)
+    {
+      if ((error= pq_store_range_key(scan_field, range.end,
+                                     range.key_is_unsigned,
+                                     range.key_kind)))
+      {
+        if (!scan_field_was_written)
+          bitmap_clear_bit(m_table->write_set, scan_field_index);
+        return error;
+      }
+      key_copy(m_end_key.data(), m_table->record[0], key_info, key_length);
+      m_end_range.key= m_end_key.data();
+      m_end_range.length= key_length;
+      m_end_range.keypart_map= (key_part_map) 1;
+      m_end_range.flag= HA_READ_BEFORE_KEY;
+    }
+
+    if (!scan_field_was_written)
+      bitmap_clear_bit(m_table->write_set, scan_field_index);
+    return 0;
+  }
+
+  int init_sql_range(uint scan_field_index, const Pq_scan_range &range)
+  {
+    int error;
+    if ((error= m_table->file->ha_index_init(m_scan_keyno, true)))
+      return error;
+    m_open= true;
+
+    if ((error= prepare_range_keys(scan_field_index, range)))
+      return error;
+
+    return m_table->file->read_range_first(&m_start_range,
+                                           m_has_end ? &m_end_range : 0,
+                                           false, true);
+  }
+
+  int init_handler_range(uint scan_field_index, const Pq_scan_range &range)
+  {
+    int error;
+    if (!m_handler_scan_ctx || !m_worker_count)
+      return HA_ERR_UNSUPPORTED;
+
+    if ((error= prepare_range_keys(scan_field_index, range)))
+      return error;
+
+    HA_pq_scan_range_param param;
+    bzero(&param, sizeof(param));
+    param.keyno= m_scan_keyno;
+    param.worker_id= m_worker_id;
+    param.worker_count= m_worker_count;
+    param.start_key= &m_start_range;
+    param.end_key= m_has_end ? &m_end_range : 0;
+    param.reverse= m_handler_scan_reverse;
+
+    if (m_provider_kind == PQ_SCAN_PROVIDER_HANDLER_SECONDARY_RANGE &&
+        !m_secondary_requires_cluster_lookup)
+    {
+      if ((error= m_table->file->ha_start_keyread(m_scan_keyno)))
+        return error;
+      m_handler_keyread= true;
+      m_table->mark_index_columns(m_scan_keyno, m_table->read_set);
+    }
+
+    if ((error= m_table->file->ha_pq_worker_scan_init(
+           current_thd, m_handler_scan_ctx, &param)))
+    {
+      if (m_handler_keyread)
+      {
+        m_table->file->ha_end_keyread();
+        m_handler_keyread= false;
+      }
+      return error;
+    }
+    m_open= true;
+
+    return m_table->file->ha_pq_worker_scan_next(m_handler_scan_ctx,
+                                                 m_table->record[0]);
+  }
+
+  int end_sql_range()
+  {
+    if (!m_open)
+      return 0;
+    m_open= false;
+    return m_table->file->ha_index_end();
+  }
+
+  int end_handler_range()
+  {
+    if (!m_open)
+      return 0;
+    m_open= false;
+    int error= m_table->file->ha_pq_worker_scan_end();
+    if (m_handler_keyread)
+    {
+      int keyread_error= m_table->file->ha_end_keyread();
+      m_handler_keyread= false;
+      if (!error)
+        error= keyread_error;
+    }
+    return error;
+  }
+
+  TABLE *m_table;
+  Pq_scan_provider_kind m_provider_kind;
+  void *m_handler_scan_ctx;
+  bool m_handler_scan_reverse;
+  bool m_secondary_requires_cluster_lookup;
+  uint m_worker_id;
+  uint m_worker_count;
+  uint m_scan_keyno;
+  bool m_handler_keyread;
+  bool m_has_end;
+  bool m_open;
+  std::vector<uchar> m_start_key;
+  std::vector<uchar> m_end_key;
+  key_range m_start_range;
+  key_range m_end_range;
+};
+
+static bool pq_leader_killed(THD *leader_thd)
+{
+  return leader_thd && leader_thd->killed;
+}
+
+static void pq_prepare_worker_thd(THD *thd)
+{
+  thd->store_globals();
+  thd->init_for_queries();
+  init_thr_lock();
+  thd->security_ctx->skip_grants();
+  thd->system_thread= SYSTEM_THREAD_GENERIC;
+  thd->set_command(COM_DAEMON);
+  /*
+    The leader already owns the statement MDL while it waits for worker
+    pthreads. Do not let a worker queue for fresh MDL behind a concurrent DDL
+    request, otherwise DDL can wait for the leader while the leader waits for
+    the worker. A blocked worker open is treated as PQ execution failure.
+  */
+  thd->variables.lock_wait_timeout= 0;
+}
+
+static void *pq_count_worker(void *arg)
+{
+  Pq_count_worker_arg *worker= static_cast<Pq_count_worker_arg *>(arg);
+  const ulonglong start_us= my_hrtime().val;
+  THD *thd= 0;
+  TABLE_LIST table_list;
+  List<String> worker_partition_list;
+  std::vector<String> worker_partition_strings;
+  TABLE *table= 0;
+  int error= 0;
+
+  worker->count= 0;
+  worker->has_sum_value= false;
+  my_decimal_set_zero(&worker->sum_decimal);
+  worker->sum_real= 0.0;
+  worker->has_minmax_value= false;
+  worker->minmax_value.clear();
+  worker->scanned_rows= 0;
+  worker->qualified_rows= 0;
+  worker->elapsed_us= 0;
+  worker->worker_error.clear();
+
+  if (my_thread_init())
+  {
+    pq_note_worker_startup_error(worker->cancel_state, &worker->worker_error);
+    worker->elapsed_us= my_hrtime().val - start_us;
+    return 0;
+  }
+
+  if (unlikely(worker->fail_thd_init))
+  {
+    pq_note_worker_startup_error(worker->cancel_state, &worker->worker_error);
+    my_thread_end();
+    worker->elapsed_us= my_hrtime().val - start_us;
+    return 0;
+  }
+
+  if (!(thd= new THD(next_thread_id())))
+  {
+    pq_note_worker_startup_error(worker->cancel_state, &worker->worker_error);
+    my_thread_end();
+    worker->elapsed_us= my_hrtime().val - start_us;
+    return 0;
+  }
+
+  server_threads.insert(thd);
+  set_current_thd(thd);
+  pq_prepare_worker_thd(thd);
+  pq_publish_worker_thd(worker->worker_control, thd);
+
+  if (pq_init_worker_table_list(thd, &table_list, worker->db,
+                                worker->table_name,
+                                worker->partition_names,
+                                &worker_partition_strings,
+                                &worker_partition_list))
+  {
+    worker->worker_error.error= 1;
+    goto end;
+  }
+  if (!(table= open_n_lock_single_table(thd, &table_list, TL_READ, 0)))
+  {
+    worker->worker_error.error= 1;
+    goto end;
+  }
+
+  if (worker->pk_field_index >= table->s->fields ||
+      (worker->has_count_field &&
+       worker->count_field_index >= table->s->fields) ||
+      (worker->has_sum_field &&
+       worker->sum_field_index >= table->s->fields) ||
+      (worker->has_sum_product_fields &&
+       (worker->sum_product_left_field_index >= table->s->fields ||
+        worker->sum_product_right_field_index >= table->s->fields)) ||
+      (worker->has_minmax_field &&
+       worker->minmax_field_index >= table->s->fields))
+  {
+    worker->worker_error.error= 1;
+    goto end;
+  }
+  table->clear_column_bitmaps();
+  if (worker->scan_field_index >= table->s->fields)
+  {
+    worker->worker_error.error= 1;
+    goto end;
+  }
+  if (worker->provider_kind == PQ_SCAN_PROVIDER_SQL_PRIMARY_KEY_RANGE)
+  {
+    bitmap_set_bit(table->read_set, worker->scan_field_index);
+    bitmap_set_bit(table->write_set, worker->scan_field_index);
+  }
+  if (!pq_mark_predicate_filter_read_set(table, worker->predicate_filter))
+  {
+    worker->worker_error.error= 1;
+    goto end;
+  }
+  if (worker->has_count_field)
+    bitmap_set_bit(table->read_set, worker->count_field_index);
+  if (worker->has_sum_field)
+    bitmap_set_bit(table->read_set, worker->sum_field_index);
+  if (worker->has_sum_product_fields)
+  {
+    bitmap_set_bit(table->read_set, worker->sum_product_left_field_index);
+    bitmap_set_bit(table->read_set, worker->sum_product_right_field_index);
+  }
+  if (worker->has_minmax_field)
+    bitmap_set_bit(table->read_set, worker->minmax_field_index);
+
+  if ((error= table->file->ha_pq_clone_snapshot(thd, worker->leader_thd)))
+  {
+    worker->worker_error.error= error;
+    goto end;
+  }
+
+  {
+    Pq_worker_scan_cursor cursor;
+    error= cursor.init(table, worker->provider_kind,
+                       worker->handler_scan_ctx,
+                       worker->handler_scan_reverse,
+                       worker->secondary_requires_cluster_lookup,
+                       worker->worker_id,
+                       worker->worker_count, worker->scan_keyno,
+                       worker->scan_field_index,
+                       worker->range);
+    for (; !error; error= cursor.next())
+    {
+      worker->scanned_rows++;
+      if (unlikely(pq_worker_should_stop(worker->cancel_state,
+                                         worker->leader_thd, thd)))
+      {
+        if (pq_leader_killed(worker->leader_thd) || thd->killed)
+          error= worker->worker_error.error= HA_ERR_QUERY_INTERRUPTED;
+        else
+          error= HA_ERR_END_OF_FILE;
+        break;
+      }
+      if (unlikely(worker->fail_mid_scan))
+      {
+        error= worker->worker_error.error= 1;
+        break;
+      }
+      if (pq_predicate_filter_matches(thd, table, worker->predicate_filter))
+      {
+        worker->qualified_rows++;
+        if (worker->has_sum_product_fields)
+        {
+          Field *left_field=
+            table->field[worker->sum_product_left_field_index];
+          Field *right_field=
+            table->field[worker->sum_product_right_field_index];
+          if (!left_field->is_null() && !right_field->is_null())
+          {
+            worker->has_sum_value= true;
+            if (worker->sum_count_nonnull)
+              worker->count++;
+            if (worker->sum_decimal_result)
+            {
+              my_decimal left_value;
+              my_decimal right_value;
+              my_decimal product;
+              my_decimal result;
+              const my_decimal *left_decimal=
+                left_field->val_decimal(&left_value);
+              const my_decimal *right_decimal=
+                right_field->val_decimal(&right_value);
+              if (!left_decimal || !right_decimal ||
+                  !pq_decimal_mul(thd, &product, left_decimal,
+                                  right_decimal) ||
+                  !pq_decimal_add(thd, &result, &worker->sum_decimal,
+                                  &product))
+              {
+                error= worker->worker_error.error= 1;
+                break;
+              }
+              worker->sum_decimal= result;
+            }
+            else
+              worker->sum_real+= left_field->val_real() *
+                                  right_field->val_real();
+          }
+        }
+        else if (worker->has_sum_field)
+        {
+          Field *sum_field= table->field[worker->sum_field_index];
+          if (!sum_field->is_null())
+          {
+            worker->has_sum_value= true;
+            if (worker->sum_count_nonnull)
+              worker->count++;
+            if (worker->sum_decimal_result)
+            {
+              my_decimal value;
+              my_decimal result;
+              const my_decimal *field_value= sum_field->val_decimal(&value);
+              if (!field_value)
+              {
+                error= worker->worker_error.error= 1;
+                break;
+              }
+              if (!pq_decimal_add(thd, &result, &worker->sum_decimal,
+                                  field_value))
+              {
+                error= worker->worker_error.error= 1;
+                break;
+              }
+              worker->sum_decimal= result;
+            }
+            else
+              worker->sum_real+= sum_field->val_real();
+          }
+        }
+        else if (worker->has_minmax_field)
+        {
+          Field *minmax_field= table->field[worker->minmax_field_index];
+          if (!minmax_field->is_null())
+          {
+            if (!worker->has_minmax_value)
+            {
+              worker->has_minmax_value= true;
+              if (!pq_save_field_payload(minmax_field, &worker->minmax_value))
+              {
+                pq_request_worker_cancel(worker->cancel_state);
+                pq_capture_worker_error(thd, table, &worker->worker_error);
+                break;
+              }
+            }
+            else
+            {
+              std::vector<uchar> current_minmax_value;
+              if (!pq_save_field_payload(minmax_field, &current_minmax_value))
+              {
+                pq_request_worker_cancel(worker->cancel_state);
+                pq_capture_worker_error(thd, table, &worker->worker_error);
+                break;
+              }
+              int cmp= pq_compare_minmax_field(
+                minmax_field, current_minmax_value.data(),
+                worker->minmax_value.data());
+              if ((worker->minmax_is_min && cmp < 0) ||
+                  (!worker->minmax_is_min && cmp > 0))
+                worker->minmax_value= current_minmax_value;
+            }
+          }
+        }
+        else if (!worker->has_count_field ||
+                 !table->field[worker->count_field_index]->is_null())
+          worker->count++;
+      }
+    }
+
+    int scan_error= error;
+    if (scan_error != HA_ERR_END_OF_FILE && !worker->worker_error.error)
+      worker->worker_error.error= scan_error;
+    if ((error= cursor.end()) && !worker->worker_error.error)
+      worker->worker_error.error= error;
+  }
+
+end:
+  if (worker->worker_error.error)
+  {
+    pq_request_worker_cancel(worker->cancel_state);
+    pq_capture_worker_error(thd, table, &worker->worker_error);
+    trans_rollback_stmt(thd);
+  }
+  else if (trans_commit_stmt(thd))
+  {
+    worker->worker_error.error= 1;
+    pq_request_worker_cancel(worker->cancel_state);
+    pq_capture_worker_error(thd, table, &worker->worker_error);
+  }
+  close_thread_tables(thd);
+  thd->clear_error();
+  thd->catalog= 0;
+  thd->reset_query();
+  thd->reset_db(&null_clex_str);
+  pq_clear_worker_thd(worker->worker_control, thd);
+  server_threads.erase(thd);
+  delete thd;
+  set_current_thd(0);
+  my_thread_end();
+  worker->elapsed_us= my_hrtime().val - start_us;
+  return 0;
+}
+
+struct Pq_count_target
+{
+  enum Pq_aggregate_kind
+  {
+    PQ_AGGREGATE_COUNT,
+    PQ_AGGREGATE_COUNT_DISTINCT,
+    PQ_AGGREGATE_SUM,
+    PQ_AGGREGATE_AVG,
+    PQ_AGGREGATE_MIN,
+    PQ_AGGREGATE_MAX
+  } aggregate_kind;
+  Item_sum *sum_item;
+  bool has_field;
+  uint field_index;
+  bool has_sum_product_fields;
+  uint sum_product_left_field_index;
+  uint sum_product_right_field_index;
+  bool aggregate_arg_on_leader;
+  std::vector<uint> aggregate_arg_field_indices;
+  bool sum_decimal_result;
+};
+
+struct Pq_distinct_field_key
+{
+  std::vector<uchar> value;
+
+  bool operator<(const Pq_distinct_field_key &rhs) const
+  {
+    size_t cmp_len= std::min(value.size(), rhs.value.size());
+    int cmp= cmp_len ? memcmp(value.data(), rhs.value.data(), cmp_len) : 0;
+    if (cmp != 0)
+      return cmp < 0;
+    return value.size() < rhs.value.size();
+  }
+};
+
+static void pq_append_distinct_key_bytes(Pq_distinct_field_key *key,
+                                         const void *ptr, size_t length)
+{
+  const uchar *bytes= static_cast<const uchar *>(ptr);
+  key->value.insert(key->value.end(), bytes, bytes + length);
+}
+
+static bool pq_count_distinct_field_uses_string_key(Field *field)
+{
+  switch (field->real_type())
+  {
+  case MYSQL_TYPE_VARCHAR:
+  case MYSQL_TYPE_VAR_STRING:
+  case MYSQL_TYPE_STRING:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool pq_count_distinct_string_field_has_safe_equality(Field *field)
+{
+  CHARSET_INFO *charset= field->charset();
+  if (!(charset->state & MY_CS_BINSORT))
+    return false;
+
+  switch (field->real_type())
+  {
+  case MYSQL_TYPE_VARCHAR:
+  case MYSQL_TYPE_VAR_STRING:
+    return charset->state & MY_CS_NOPAD;
+  case MYSQL_TYPE_STRING:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool pq_make_distinct_item_key(THD *thd, Item *item,
+                                      Pq_distinct_field_key *key,
+                                      bool *is_null)
+{
+  key->value.clear();
+  *is_null= false;
+
+  Item_result result_type= item->result_type();
+  key->value.push_back(static_cast<uchar>(result_type));
+  switch (result_type)
+  {
+  case INT_RESULT:
+  {
+    bool unsigned_flag= item->unsigned_flag;
+    longlong value= item->val_int();
+    if (thd->is_error())
+      return false;
+    if (item->null_value)
+    {
+      *is_null= true;
+      return true;
+    }
+    key->value.push_back(unsigned_flag ? 1 : 0);
+    if (unsigned_flag)
+    {
+      ulonglong unsigned_value= static_cast<ulonglong>(value);
+      pq_append_distinct_key_bytes(key, &unsigned_value,
+                                   sizeof(unsigned_value));
+    }
+    else
+      pq_append_distinct_key_bytes(key, &value, sizeof(value));
+    return true;
+  }
+  case DECIMAL_RESULT:
+  {
+    my_decimal decimal_value;
+    my_decimal *value= item->val_decimal(&decimal_value);
+    if (thd->is_error())
+      return false;
+    if (item->null_value || !value)
+    {
+      *is_null= true;
+      return true;
+    }
+    String str;
+    if (!value->to_string(&str))
+      return false;
+    pq_append_distinct_key_bytes(key, str.ptr(), str.length());
+    return true;
+  }
+  case REAL_RESULT:
+    return false;
+  case STRING_RESULT:
+  {
+    Item *real_item= item->real_item();
+    if (real_item->type() != Item::FIELD_ITEM)
+      return false;
+    Field *field= static_cast<Item_field *>(real_item)->field;
+    if (!pq_count_distinct_string_field_has_safe_equality(field))
+      return false;
+    String tmp;
+    String *value= item->val_str(&tmp);
+    if (thd->is_error())
+      return false;
+    if (item->null_value || !value)
+    {
+      *is_null= true;
+      return true;
+    }
+    pq_append_distinct_key_bytes(key, value->ptr(), value->length());
+    return true;
+  }
+  case ROW_RESULT:
+  case TIME_RESULT:
+    return false;
+  }
+
+  return false;
+}
+
+struct Pq_field_row
+{
+  longlong order_key;
+  ulonglong unsigned_order_key;
+  bool order_key_is_unsigned;
+  std::vector<bool> null_values;
+  std::vector<std::vector<uchar> > values;
+  std::vector<bool> expression_order_nulls;
+  std::vector<longlong> expression_order_int_values;
+  std::vector<ulonglong> expression_order_uint_values;
+  std::vector<my_decimal> expression_order_decimal_values;
+  std::vector<double> expression_order_real_values;
+};
+
+struct Pq_projection_order_key
+{
+  uint field_index;
+  bool desc;
+  bool expression;
+  Item *expression_item;
+  std::vector<uint> expression_field_indices;
+  size_t expression_value_index;
+  Item_result expression_result_type;
+  bool expression_unsigned;
+
+  Pq_projection_order_key()
+    : field_index(0), desc(false), expression(false), expression_item(NULL),
+      expression_value_index(0), expression_result_type(INT_RESULT),
+      expression_unsigned(false)
+  {}
+};
+
+struct Pq_scalar_aggregate_result
+{
+  ulonglong count;
+  bool has_sum_value;
+  my_decimal sum_decimal;
+  double sum_real;
+  bool has_minmax_value;
+  std::vector<uchar> minmax_value;
+  std::vector<Pq_field_row> aggregate_arg_rows;
+
+  Pq_scalar_aggregate_result()
+    : count(0), has_sum_value(false), sum_real(0.0),
+      has_minmax_value(false)
+  {
+    my_decimal_set_zero(&sum_decimal);
+  }
+};
+
+struct Pq_group_key
+{
+  std::vector<bool> null_values;
+  std::vector<std::vector<uchar> > values;
+  std::vector<std::vector<uchar> > sort_values;
+
+  bool operator<(const Pq_group_key &rhs) const
+  {
+    size_t count= std::min(sort_values.size(), rhs.sort_values.size());
+    for (size_t i= 0; i < count; i++)
+    {
+      if (null_values[i] != rhs.null_values[i])
+        return null_values[i];
+      if (null_values[i])
+        continue;
+      int cmp= memcmp(sort_values[i].data(), rhs.sort_values[i].data(),
+                      std::min(sort_values[i].size(),
+                               rhs.sort_values[i].size()));
+      if (cmp != 0)
+        return cmp < 0;
+      if (sort_values[i].size() != rhs.sort_values[i].size())
+        return sort_values[i].size() < rhs.sort_values[i].size();
+    }
+    return sort_values.size() < rhs.sort_values.size();
+  }
+};
+
+enum Pq_group_worker_expr_kind
+{
+  PQ_GROUP_WORKER_EXPR_NONE,
+  PQ_GROUP_WORKER_EXPR_PRICE_DISCOUNT,
+  PQ_GROUP_WORKER_EXPR_PRICE_DISCOUNT_TAX
+};
+
+struct Pq_group_aggregate_target
+{
+  Pq_count_target::Pq_aggregate_kind aggregate_kind;
+  Item_sum *sum_item;
+  bool orderable;
+  bool has_field;
+  uint field_index;
+  bool aggregate_arg_on_leader;
+  std::vector<uint> aggregate_arg_field_indices;
+  bool sum_decimal_result;
+  Pq_group_worker_expr_kind worker_expr_kind;
+  uint worker_expr_price_field_index;
+  uint worker_expr_discount_field_index;
+  uint worker_expr_tax_field_index;
+};
+
+struct Pq_group_aggregate_value
+{
+  ulonglong count;
+  bool has_sum_value;
+  my_decimal sum_decimal;
+  double sum_real;
+  bool has_minmax_value;
+  std::vector<uchar> minmax_value;
+  std::vector<Pq_field_row> aggregate_arg_rows;
+  std::set<Pq_distinct_field_key> distinct_values;
+
+  Pq_group_aggregate_value()
+    : count(0), has_sum_value(false), sum_real(0.0),
+      has_minmax_value(false)
+  {
+    my_decimal_set_zero(&sum_decimal);
+  }
+};
+
+struct Pq_group_partial
+{
+  std::vector<Pq_group_aggregate_value> aggregates;
+};
+
+typedef std::map<Pq_group_key, Pq_group_partial> Pq_group_map;
+
+class Pq_projection_row_transport
+{
+public:
+  explicit Pq_projection_row_transport(std::vector<Pq_field_row> *rows)
+    : m_rows(rows)
+  {}
+
+  void clear()
+  {
+    m_rows->clear();
+  }
+
+  void append_worker_rows(std::vector<Pq_field_row> *worker_rows)
+  {
+    m_rows->insert(m_rows->end(),
+                   std::make_move_iterator(worker_rows->begin()),
+                   std::make_move_iterator(worker_rows->end()));
+  }
+
+private:
+  std::vector<Pq_field_row> *m_rows;
+};
+
+class Pq_scalar_aggregate_transport
+{
+public:
+  explicit Pq_scalar_aggregate_transport(Pq_scalar_aggregate_result *result)
+    : m_result(result)
+  {}
+
+  void clear()
+  {
+    m_result->count= 0;
+    m_result->has_sum_value= false;
+    my_decimal_set_zero(&m_result->sum_decimal);
+    m_result->sum_real= 0.0;
+    m_result->has_minmax_value= false;
+    m_result->minmax_value.clear();
+    m_result->aggregate_arg_rows.clear();
+  }
+
+  bool append_worker_partial(THD *thd, TABLE *table,
+                             const Pq_count_target &target,
+                             const Pq_count_worker_arg &worker)
+  {
+    m_result->count+= worker.count;
+
+    if ((target.aggregate_kind == Pq_count_target::PQ_AGGREGATE_SUM ||
+         target.aggregate_kind == Pq_count_target::PQ_AGGREGATE_AVG) &&
+        worker.has_sum_value)
+    {
+      m_result->has_sum_value= true;
+      if (target.sum_decimal_result)
+      {
+        my_decimal decimal_result;
+        if (!pq_decimal_add(thd, &decimal_result, &m_result->sum_decimal,
+                            &worker.sum_decimal))
+          return false;
+        m_result->sum_decimal= decimal_result;
+      }
+      else
+        m_result->sum_real+= worker.sum_real;
+    }
+
+    if ((target.aggregate_kind == Pq_count_target::PQ_AGGREGATE_MIN ||
+         target.aggregate_kind == Pq_count_target::PQ_AGGREGATE_MAX) &&
+        worker.has_minmax_value)
+    {
+      if (!m_result->has_minmax_value)
+      {
+        m_result->has_minmax_value= true;
+        m_result->minmax_value= worker.minmax_value;
+      }
+      else
+      {
+        Field *minmax_field= table->field[target.field_index];
+        int cmp= pq_compare_minmax_field(minmax_field,
+                                         worker.minmax_value.data(),
+                                         m_result->minmax_value.data());
+        if ((target.aggregate_kind == Pq_count_target::PQ_AGGREGATE_MIN &&
+             cmp < 0) ||
+            (target.aggregate_kind == Pq_count_target::PQ_AGGREGATE_MAX &&
+             cmp > 0))
+          m_result->minmax_value= worker.minmax_value;
+      }
+    }
+
+    return true;
+  }
+
+  bool finalize_worker_item(THD *thd, TABLE *table,
+                            const Pq_count_target &target)
+  {
+    if (target.aggregate_kind == Pq_count_target::PQ_AGGREGATE_SUM)
+    {
+      Item_sum_sum *sum_item= static_cast<Item_sum_sum *>(target.sum_item);
+      sum_item->clear();
+      if (target.sum_decimal_result)
+        sum_item->direct_add(m_result->has_sum_value ?
+                             &m_result->sum_decimal : 0);
+      else
+        sum_item->direct_add(m_result->sum_real, !m_result->has_sum_value);
+      return !sum_item->add();
+    }
+
+    if (target.aggregate_kind == Pq_count_target::PQ_AGGREGATE_AVG)
+    {
+      Item_sum_avg *avg_item= static_cast<Item_sum_avg *>(target.sum_item);
+      avg_item->clear();
+      if (target.sum_decimal_result)
+        avg_item->direct_add(m_result->has_sum_value ?
+                             &m_result->sum_decimal : 0);
+      else
+        avg_item->direct_add(m_result->sum_real, !m_result->has_sum_value);
+      if (avg_item->Item_sum_sum::add())
+        return false;
+      avg_item->count= m_result->count;
+      return true;
+    }
+
+    if (target.aggregate_kind == Pq_count_target::PQ_AGGREGATE_MIN ||
+        target.aggregate_kind == Pq_count_target::PQ_AGGREGATE_MAX)
+    {
+      Item_sum_min_max *minmax_item=
+        static_cast<Item_sum_min_max *>(target.sum_item);
+      Field *minmax_field= table->field[target.field_index];
+      minmax_item->clear();
+      if (!m_result->has_minmax_value)
+        return true;
+      minmax_field->set_notnull();
+      if (!pq_restore_field_payload(minmax_field, m_result->minmax_value))
+        return false;
+      minmax_item->direct_add(minmax_item->get_arg(0));
+      return !minmax_item->add();
+    }
+
+    return true;
+  }
+
+private:
+  Pq_scalar_aggregate_result *m_result;
+};
+
+struct Pq_group_order_key
+{
+  enum Kind
+  {
+    GROUP_FIELD,
+    AGGREGATE
+  };
+
+  Kind kind;
+  size_t index;
+  bool descending;
+};
+
+struct Pq_ordered_group
+{
+  const Pq_group_map::value_type *entry;
+  std::vector<Pq_group_aggregate_value> evaluated_aggregates;
+};
+
+class Pq_memory_reservation;
+
+static bool pq_is_supported_sum_field(Field *field);
+
+static bool pq_decimal_add(THD *thd, my_decimal *result,
+                           const my_decimal *lhs, const my_decimal *rhs)
+{
+  if (my_decimal_add(E_DEC_FATAL_ERROR, result, lhs, rhs))
+  {
+    if (thd && !thd->is_error())
+      my_error(ER_DATA_OUT_OF_RANGE, MYF(0), "DECIMAL", "parallel query");
+    return false;
+  }
+  return true;
+}
+
+static bool pq_decimal_mul(THD *thd, my_decimal *result,
+                           const my_decimal *lhs, const my_decimal *rhs)
+{
+  if (my_decimal_mul(E_DEC_FATAL_ERROR, result, lhs, rhs))
+  {
+    if (thd && !thd->is_error())
+      my_error(ER_DATA_OUT_OF_RANGE, MYF(0), "DECIMAL", "parallel query");
+    return false;
+  }
+  return true;
+}
+
+static bool pq_decimal_sub(THD *thd, my_decimal *result,
+                           const my_decimal *lhs, const my_decimal *rhs)
+{
+  if (my_decimal_sub(E_DEC_FATAL_ERROR, result, lhs, rhs))
+  {
+    if (thd && !thd->is_error())
+      my_error(ER_DATA_OUT_OF_RANGE, MYF(0), "DECIMAL", "parallel query");
+    return false;
+  }
+  return true;
+}
+
+static bool pq_item_func_is(Item *item, char func_name)
+{
+  Item *real_item= item ? item->real_item() : 0;
+  if (!real_item || real_item->type() != Item::FUNC_ITEM)
+    return false;
+  Item_func *func= static_cast<Item_func *>(real_item);
+  LEX_CSTRING name= func->func_name_cstring();
+  return func->argument_count() == 2 &&
+         name.length == 1 && name.str[0] == func_name;
+}
+
+static bool pq_item_const_one(Item *item)
+{
+  Item *real_item= item ? item->real_item() : 0;
+  return real_item && real_item->const_item() && !real_item->used_tables() &&
+         !real_item->is_null() && real_item->val_int() == 1;
+}
+
+static bool pq_item_field_index(TABLE *table, Item *item, uint *field_index)
+{
+  Item *real_item= item ? item->real_item() : 0;
+  if (!real_item || real_item->type() != Item::FIELD_ITEM)
+    return false;
+  Field *field= static_cast<Item_field *>(real_item)->field;
+  if (!field || field->table != table || !pq_is_supported_sum_field(field))
+    return false;
+  *field_index= field->field_index;
+  return true;
+}
+
+static bool pq_extract_one_minus_field(TABLE *table, Item *item,
+                                       uint *field_index)
+{
+  if (!pq_item_func_is(item, '-'))
+    return false;
+  Item_func *func= static_cast<Item_func *>(item->real_item());
+  Item **args= func->arguments();
+  return pq_item_const_one(args[0]) &&
+         pq_item_field_index(table, args[1], field_index);
+}
+
+static bool pq_extract_one_plus_field(TABLE *table, Item *item,
+                                      uint *field_index)
+{
+  if (!pq_item_func_is(item, '+'))
+    return false;
+  Item_func *func= static_cast<Item_func *>(item->real_item());
+  Item **args= func->arguments();
+  return (pq_item_const_one(args[0]) &&
+          pq_item_field_index(table, args[1], field_index)) ||
+         (pq_item_const_one(args[1]) &&
+          pq_item_field_index(table, args[0], field_index));
+}
+
+static bool pq_extract_price_discount_expr(TABLE *table, Item *item,
+                                           uint *price_field_index,
+                                           uint *discount_field_index)
+{
+  if (!pq_item_func_is(item, '*'))
+    return false;
+  Item_func *func= static_cast<Item_func *>(item->real_item());
+  Item **args= func->arguments();
+  return (pq_item_field_index(table, args[0], price_field_index) &&
+          pq_extract_one_minus_field(table, args[1], discount_field_index)) ||
+         (pq_item_field_index(table, args[1], price_field_index) &&
+          pq_extract_one_minus_field(table, args[0], discount_field_index));
+}
+
+static bool pq_extract_q1_worker_sum_expr(TABLE *table, Item *item,
+                                          Pq_group_worker_expr_kind *kind,
+                                          uint *price_field_index,
+                                          uint *discount_field_index,
+                                          uint *tax_field_index)
+{
+  *kind= PQ_GROUP_WORKER_EXPR_NONE;
+  *tax_field_index= 0;
+  if (pq_extract_price_discount_expr(table, item, price_field_index,
+                                     discount_field_index))
+  {
+    *kind= PQ_GROUP_WORKER_EXPR_PRICE_DISCOUNT;
+    return true;
+  }
+
+  if (!pq_item_func_is(item, '*'))
+    return false;
+
+  Item_func *func= static_cast<Item_func *>(item->real_item());
+  Item **args= func->arguments();
+  if ((pq_extract_price_discount_expr(table, args[0], price_field_index,
+                                      discount_field_index) &&
+       pq_extract_one_plus_field(table, args[1], tax_field_index)) ||
+      (pq_extract_price_discount_expr(table, args[1], price_field_index,
+                                      discount_field_index) &&
+       pq_extract_one_plus_field(table, args[0], tax_field_index)))
+  {
+    *kind= PQ_GROUP_WORKER_EXPR_PRICE_DISCOUNT_TAX;
+    return true;
+  }
+
+  return false;
+}
+
+static bool pq_field_name_is(Field *field, const char *name)
+{
+  return field && field->field_name.str &&
+         field->field_name.length == strlen(name) &&
+         !memcmp(field->field_name.str, name, field->field_name.length);
+}
+
+static bool pq_extract_q1_worker_sum_expr_by_fields(
+    TABLE *table,
+    const std::vector<uint> &fields,
+    Pq_group_worker_expr_kind *kind,
+    uint *price_field_index,
+    uint *discount_field_index,
+    uint *tax_field_index)
+{
+  bool has_price= false;
+  bool has_discount= false;
+  bool has_tax= false;
+  *kind= PQ_GROUP_WORKER_EXPR_NONE;
+  *price_field_index= 0;
+  *discount_field_index= 0;
+  *tax_field_index= 0;
+
+  for (uint field_index : fields)
+  {
+    if (field_index >= table->s->fields)
+      return false;
+    Field *field= table->field[field_index];
+    if (pq_field_name_is(field, "l_extendedprice"))
+    {
+      if (has_price)
+        return false;
+      has_price= true;
+      *price_field_index= field_index;
+    }
+    else if (pq_field_name_is(field, "l_discount"))
+    {
+      if (has_discount)
+        return false;
+      has_discount= true;
+      *discount_field_index= field_index;
+    }
+    else if (pq_field_name_is(field, "l_tax"))
+    {
+      if (has_tax)
+        return false;
+      has_tax= true;
+      *tax_field_index= field_index;
+    }
+    else
+      return false;
+  }
+
+  if (has_price && has_discount && !has_tax && fields.size() == 2)
+  {
+    *kind= PQ_GROUP_WORKER_EXPR_PRICE_DISCOUNT;
+    return true;
+  }
+  if (has_price && has_discount && has_tax && fields.size() == 3)
+  {
+    *kind= PQ_GROUP_WORKER_EXPR_PRICE_DISCOUNT_TAX;
+    return true;
+  }
+
+  return false;
+}
+
+static bool pq_eval_q1_worker_sum_expr(TABLE *table,
+                                       const Pq_group_aggregate_target &target,
+                                       my_decimal *value,
+                                       bool *is_null)
+{
+  *is_null= true;
+  Field *price_field= table->field[target.worker_expr_price_field_index];
+  Field *discount_field= table->field[target.worker_expr_discount_field_index];
+  Field *tax_field= target.worker_expr_kind ==
+                    PQ_GROUP_WORKER_EXPR_PRICE_DISCOUNT_TAX ?
+                    table->field[target.worker_expr_tax_field_index] : 0;
+  if (price_field->is_null() || discount_field->is_null() ||
+      (tax_field && tax_field->is_null()))
+    return true;
+
+  THD *thd= table->in_use;
+  my_decimal one;
+  my_decimal price;
+  my_decimal discount;
+  my_decimal discount_factor;
+  my_decimal result;
+  my_decimal *price_value= price_field->val_decimal(&price);
+  my_decimal *discount_value= discount_field->val_decimal(&discount);
+  if (!price_value || !discount_value)
+    return false;
+  int2my_decimal(E_DEC_FATAL_ERROR, 1, false, &one);
+  if (!pq_decimal_sub(thd, &discount_factor, &one, discount_value) ||
+      !pq_decimal_mul(thd, &result, price_value, &discount_factor))
+    return false;
+
+  if (tax_field)
+  {
+    my_decimal tax;
+    my_decimal tax_factor;
+    my_decimal product;
+    my_decimal *tax_value= tax_field->val_decimal(&tax);
+    if (!tax_value ||
+        !pq_decimal_add(thd, &tax_factor, &one, tax_value) ||
+        !pq_decimal_mul(thd, &product, &result, &tax_factor))
+      return false;
+    result= product;
+  }
+
+  *value= result;
+  *is_null= false;
+  return true;
+}
+
+static bool pq_store_group_key_value(Field *field,
+                                     const std::vector<uchar> &value)
+{
+  switch (field->real_type())
+  {
+  case MYSQL_TYPE_VARCHAR:
+  case MYSQL_TYPE_VAR_STRING:
+  case MYSQL_TYPE_STRING:
+    return !field->store(value.empty() ? "" :
+                         reinterpret_cast<const char *>(value.data()),
+                         value.size(), field->charset());
+  default:
+    if (value.size() != field->pack_length())
+      return false;
+    memcpy(field->ptr, value.data(), field->pack_length());
+    return true;
+  }
+}
+
+static size_t pq_field_payload_length(Field *field)
+{
+  if (field->real_type() == MYSQL_TYPE_BIT)
+    return static_cast<Field_bit *>(field)->row_pack_length();
+  return field->pack_length();
+}
+
+static bool pq_save_field_payload(Field *field, std::vector<uchar> *value)
+{
+  size_t length= pq_field_payload_length(field);
+  value->resize(length);
+  if (field->real_type() == MYSQL_TYPE_BIT)
+  {
+    Field_bit *bit_field= static_cast<Field_bit *>(field);
+    memcpy(value->data(), field->ptr, bit_field->bytes_in_rec);
+    if (bit_field->bit_len)
+      (*value)[bit_field->bytes_in_rec]=
+        get_rec_bits(bit_field->bit_ptr, bit_field->bit_ofs,
+                     bit_field->bit_len);
+    return true;
+  }
+
+  memcpy(value->data(), field->ptr, field->pack_length());
+  return true;
+}
+
+static bool pq_restore_field_payload(Field *field,
+                                     const std::vector<uchar> &value)
+{
+  if (value.size() != pq_field_payload_length(field))
+    return false;
+  if (field->real_type() == MYSQL_TYPE_BIT)
+  {
+    Field_bit *bit_field= static_cast<Field_bit *>(field);
+    memcpy(field->ptr, value.data(), bit_field->bytes_in_rec);
+    if (bit_field->bit_len)
+      set_rec_bits(value[bit_field->bytes_in_rec], bit_field->bit_ptr,
+                   bit_field->bit_ofs, bit_field->bit_len);
+    return true;
+  }
+
+  memcpy(field->ptr, value.data(), field->pack_length());
+  return true;
+}
+
+struct Pq_field_worker_arg
+{
+  THD *leader_thd;
+  Pq_worker_control *worker_control;
+  Pq_worker_cancel_state *cancel_state;
+  const LEX_CSTRING *db;
+  const LEX_CSTRING *table_name;
+  std::vector<std::string> partition_names;
+  Pq_scan_provider_kind provider_kind;
+  void *handler_scan_ctx;
+  bool handler_scan_reverse;
+  bool secondary_requires_cluster_lookup;
+  uint scan_keyno;
+  uint scan_field_index;
+  uint worker_id;
+  uint worker_count;
+  Pq_scan_range range;
+  uint pk_field_index;
+  bool fail_thd_init;
+  bool fail_mid_scan;
+  Pq_predicate_filter predicate_filter;
+  std::vector<uint> selected_field_indices;
+  Pq_memory_reservation *memory_reservation;
+  std::vector<Pq_field_row> rows;
+  Pq_worker_error worker_error;
+};
+
+struct Pq_group_worker_arg
+{
+  THD *leader_thd;
+  Pq_worker_control *worker_control;
+  Pq_worker_cancel_state *cancel_state;
+  const LEX_CSTRING *db;
+  const LEX_CSTRING *table_name;
+  std::vector<std::string> partition_names;
+  Pq_scan_provider_kind provider_kind;
+  void *handler_scan_ctx;
+  bool handler_scan_reverse;
+  bool secondary_requires_cluster_lookup;
+  uint scan_keyno;
+  uint scan_field_index;
+  uint worker_id;
+  uint worker_count;
+  Pq_scan_range range;
+  uint pk_field_index;
+  bool fail_thd_init;
+  bool fail_mid_scan;
+  Pq_predicate_filter predicate_filter;
+  std::vector<uint> group_field_indices;
+  std::vector<Pq_group_aggregate_target> aggregate_targets;
+  Pq_memory_reservation *memory_reservation;
+  Pq_group_map groups;
+  Pq_worker_error worker_error;
+};
+
+static bool pq_restore_field_row(TABLE *table,
+                                 const std::vector<uint> &selected_fields,
+                                 const Pq_field_row &row)
+{
+  if (row.values.size() != selected_fields.size() ||
+      row.null_values.size() != selected_fields.size())
+    return false;
+  for (size_t i= 0; i < row.values.size(); i++)
+  {
+    Field *field= table->field[selected_fields[i]];
+    if (row.null_values[i])
+    {
+      field->set_null();
+      continue;
+    }
+    field->set_notnull();
+    if (!pq_restore_field_payload(field, row.values[i]))
+      return false;
+  }
+  return true;
+}
+
+static bool pq_field_is_string(Field *field)
+{
+  switch (field->real_type())
+  {
+  case MYSQL_TYPE_VARCHAR:
+  case MYSQL_TYPE_VAR_STRING:
+  case MYSQL_TYPE_STRING:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool pq_make_string_sort_key(Field *field, const String *value,
+                                    std::vector<uchar> *sort_value)
+{
+  CHARSET_INFO *charset= field->charset();
+  if (!charset)
+    return false;
+
+  size_t length= field->char_length() * charset->strxfrm_multiply;
+  if (!length)
+    length= charset->strnxfrmlen(value->length());
+  if (!length)
+    length= value->length();
+  sort_value->assign(length ? length : 1, 0);
+
+  my_strnxfrm_ret_t rc=
+    charset->strnxfrm(sort_value->data(), sort_value->size(),
+                      (uint) sort_value->size(),
+                      reinterpret_cast<const uchar *>(value->ptr()),
+                      value->length(),
+                      MY_STRXFRM_PAD_WITH_SPACE |
+                      MY_STRXFRM_PAD_TO_MAXLEN);
+  if (rc.m_warnings & MY_STRNXFRM_TRUNCATED_WEIGHT_REAL_CHAR)
+    return false;
+  sort_value->resize(rc.m_result_length);
+  return true;
+}
+
+static bool pq_make_group_key(TABLE *table,
+                              const std::vector<uint> &group_fields,
+                              Pq_group_key *key)
+{
+  key->null_values.clear();
+  key->values.clear();
+  key->sort_values.clear();
+  key->null_values.reserve(group_fields.size());
+  key->values.reserve(group_fields.size());
+  key->sort_values.reserve(group_fields.size());
+  for (uint field_index : group_fields)
+  {
+    if (field_index >= table->s->fields)
+      return false;
+    Field *field= table->field[field_index];
+    if (field->is_null())
+    {
+      key->null_values.push_back(true);
+      key->values.emplace_back();
+      key->sort_values.emplace_back();
+      continue;
+    }
+    key->null_values.push_back(false);
+    switch (field->real_type())
+    {
+    case MYSQL_TYPE_VARCHAR:
+    case MYSQL_TYPE_VAR_STRING:
+    case MYSQL_TYPE_STRING:
+    {
+      String tmp;
+      String *value= field->val_str(&tmp);
+      if (!value)
+        return false;
+      key->values.emplace_back(value->length());
+      if (value->length())
+        memcpy(key->values.back().data(), value->ptr(), value->length());
+      key->sort_values.emplace_back();
+      if (!pq_make_string_sort_key(field, value, &key->sort_values.back()))
+        return false;
+      break;
+    }
+    default:
+      key->values.emplace_back(field->pack_length());
+      memcpy(key->values.back().data(), field->ptr, field->pack_length());
+      key->sort_values.push_back(key->values.back());
+      break;
+    }
+  }
+  return true;
+}
+
+static bool pq_restore_group_key(TABLE *table,
+                                 const std::vector<uint> &group_fields,
+                                 const Pq_group_key &key)
+{
+  if (key.values.size() != group_fields.size() ||
+      key.null_values.size() != group_fields.size())
+    return false;
+  for (size_t i= 0; i < group_fields.size(); i++)
+  {
+    Field *field= table->field[group_fields[i]];
+    if (key.null_values[i])
+    {
+      field->set_null();
+      continue;
+    }
+    field->set_notnull();
+    if (!pq_store_group_key_value(field, key.values[i]))
+      return false;
+  }
+  return true;
+}
+
+static bool pq_restore_group_output_fields(JOIN *join,
+                                           const std::vector<uint> &group_fields,
+                                           const Pq_group_key &key)
+{
+  TABLE *table= join->join_tab[0].table;
+  size_t group_index= 0;
+  List_iterator_fast<Item> it(join->fields_list);
+  Item *item;
+  while ((item= it++))
+  {
+    if (item->type() == Item::SUM_FUNC_ITEM)
+      continue;
+    if (group_index >= group_fields.size())
+      return false;
+
+    Item *real_item= item->real_item();
+    if (real_item->type() == Item::FIELD_ITEM)
+    {
+      Field *source= table->field[group_fields[group_index]];
+      Item_field *field_item= static_cast<Item_field *>(real_item);
+      Field *fields_to_restore[2]= { field_item->field,
+                                     field_item->result_field };
+      for (Field *field : fields_to_restore)
+      {
+        if (!field || field == source)
+          continue;
+        if (key.null_values[group_index])
+        {
+          field->set_null();
+        }
+        else
+        {
+          field->set_notnull();
+          if (!pq_store_group_key_value(field, key.values[group_index]))
+            return false;
+        }
+      }
+    }
+    group_index++;
+  }
+  return group_index == group_fields.size();
+}
+
+static constexpr ulong PQ_PHASE1_MAX_DOP= 64;
+static constexpr ulonglong PQ_PHASE1_MEMORY_PER_WORKER= 1024ULL * 1024ULL;
+static constexpr ulonglong PQ_GROUP_ESTIMATED_GROUPS= 4096ULL;
+static constexpr ulong PQ_TIME_THOUSAND= 1000;
+static constexpr long PQ_TIME_MILLION= 1000000;
+static constexpr long PQ_TIME_BILLION= 1000000000;
+static pthread_mutex_t pq_thread_admission_lock= PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t pq_thread_admission_cond= PTHREAD_COND_INITIALIZER;
+
+static bool pq_add_projection_field(TABLE *table, Field *field,
+                                    std::vector<uint> *fields);
+static bool pq_extract_leader_aggregate_arg(TABLE *table, Item *arg,
+                                            std::vector<uint> *fields);
+
+static ulonglong pq_estimated_memory(size_t dop)
+{
+  if (dop > ((ulonglong)~(intptr)0) / PQ_PHASE1_MEMORY_PER_WORKER)
+    return (ulonglong)~(intptr)0;
+  return dop * PQ_PHASE1_MEMORY_PER_WORKER;
+}
+
+static bool pq_thread_admission_would_fail(size_t dop)
+{
+  ulong requested= (ulong) dop;
+  if (requested == 0 || requested != dop)
+    return true;
+
+  pthread_mutex_lock(&pq_thread_admission_lock);
+  ulong max_threads= parallel_max_threads;
+  ulong running= parallel_threads_running;
+  bool failed= max_threads < requested || running > max_threads - requested;
+  pthread_mutex_unlock(&pq_thread_admission_lock);
+
+  return failed;
+}
+
+static bool pq_memory_admission_would_fail(ulonglong bytes)
+{
+  if (bytes == 0)
+    return false;
+
+  ulonglong limit= parallel_memory_limit;
+  ulonglong used= __sync_fetch_and_add(&parallel_memory_used, 0);
+
+  return limit < bytes || used > limit - bytes;
+}
+
+static bool pq_try_reserve_memory(ulonglong bytes)
+{
+  if (bytes == 0)
+    return true;
+
+  for (;;)
+  {
+    ulonglong limit= parallel_memory_limit;
+    ulonglong used= __sync_fetch_and_add(&parallel_memory_used, 0);
+
+    if (limit < bytes || used > limit - bytes)
+    {
+      __sync_fetch_and_add(&parallel_memory_refused, 1);
+      return false;
+    }
+
+    if (__sync_bool_compare_and_swap(&parallel_memory_used, used,
+                                     used + bytes))
+      return true;
+  }
+}
+
+static void pq_release_memory(ulonglong bytes)
+{
+  if (bytes)
+    __sync_fetch_and_sub(&parallel_memory_used, bytes);
+}
+
+class Pq_memory_reservation
+{
+public:
+  Pq_memory_reservation() : m_bytes(0), m_prepaid_materialized_bytes(0) {}
+  ~Pq_memory_reservation()
+  {
+    pq_release_memory(__sync_fetch_and_add(&m_bytes, 0));
+  }
+
+  bool reserve(ulonglong bytes)
+  {
+    if (!pq_try_reserve_memory(bytes))
+      return false;
+    m_bytes= bytes;
+    return true;
+  }
+
+  bool reserve_more(ulonglong bytes)
+  {
+    if (!pq_try_reserve_memory(bytes))
+      return false;
+    __sync_fetch_and_add(&m_bytes, bytes);
+    return true;
+  }
+
+  bool prepay_materialized(ulonglong bytes)
+  {
+    if (!reserve_more(bytes))
+      return false;
+    __sync_fetch_and_add(&m_prepaid_materialized_bytes, bytes);
+    return true;
+  }
+
+  bool consume_materialized(ulonglong bytes)
+  {
+    while (bytes)
+    {
+      ulonglong prepaid= __sync_fetch_and_add(&m_prepaid_materialized_bytes, 0);
+      if (prepaid >= bytes)
+      {
+        if (__sync_bool_compare_and_swap(&m_prepaid_materialized_bytes,
+                                         prepaid, prepaid - bytes))
+          return true;
+        continue;
+      }
+      if (prepaid &&
+          !__sync_bool_compare_and_swap(&m_prepaid_materialized_bytes,
+                                        prepaid, 0))
+        continue;
+
+      bytes-= prepaid;
+      return reserve_more(bytes);
+    }
+    return true;
+  }
+
+private:
+  ulonglong m_bytes;
+  ulonglong m_prepaid_materialized_bytes;
+};
+
+static ulonglong pq_add_memory_estimate(ulonglong lhs, ulonglong rhs)
+{
+  if (lhs > ULONGLONG_MAX - rhs)
+    return ULONGLONG_MAX;
+  return lhs + rhs;
+}
+
+static ulonglong pq_multiply_memory_estimate(ulonglong lhs, ulonglong rhs)
+{
+  if (lhs && rhs > ULONGLONG_MAX / lhs)
+    return ULONGLONG_MAX;
+  return lhs * rhs;
+}
+
+static ulonglong pq_estimate_field_row_memory(TABLE *table,
+                                              const std::vector<uint> &fields)
+{
+  ulonglong bytes= sizeof(Pq_field_row) + 64;
+  for (uint field_index : fields)
+  {
+    if (field_index >= table->s->fields)
+      return ULONGLONG_MAX;
+    Field *field= table->field[field_index];
+    bytes= pq_add_memory_estimate(bytes, pq_field_payload_length(field) + 32);
+  }
+  return bytes;
+}
+
+static ulonglong pq_estimate_materialized_rows_memory(
+    TABLE *table, const std::vector<uint> &fields)
+{
+  ha_rows records= table->file->stats.records;
+  if (records == 0 || records == HA_POS_ERROR)
+    return 0;
+  return pq_multiply_memory_estimate(
+      (ulonglong) records, pq_estimate_field_row_memory(table, fields));
+}
+
+static ulonglong pq_estimate_materialized_peak_memory(
+    TABLE *table, const std::vector<uint> &fields)
+{
+  return pq_multiply_memory_estimate(
+      pq_estimate_materialized_rows_memory(table, fields), 2);
+}
+
+static bool pq_store_projection_worker_row(
+    TABLE *table, const std::vector<uint> &selected_fields,
+    Pq_memory_reservation *memory_reservation, Pq_field_row *row,
+    std::vector<Pq_field_row> *rows)
+{
+  if (memory_reservation &&
+      !memory_reservation->consume_materialized(
+          pq_estimate_field_row_memory(table, selected_fields)))
+    return false;
+  rows->push_back(std::move(*row));
+  return true;
+}
+
+static ulonglong pq_estimate_group_materialized_rows_memory(
+    TABLE *table,
+    const std::vector<uint> &group_fields,
+    const std::vector<Pq_group_aggregate_target> &aggregate_targets)
+{
+  ha_rows records= table->file->stats.records;
+  if (records == 0 || records == HA_POS_ERROR)
+    return 0;
+
+  ulonglong group_count= std::min((ulonglong) records,
+                                  PQ_GROUP_ESTIMATED_GROUPS);
+  ulonglong bytes= pq_multiply_memory_estimate(
+      group_count,
+      pq_add_memory_estimate(
+          pq_estimate_field_row_memory(table, group_fields),
+          pq_multiply_memory_estimate(
+              (ulonglong) aggregate_targets.size(),
+              (ulonglong) sizeof(Pq_group_aggregate_value) + 64)));
+  for (const Pq_group_aggregate_target &target : aggregate_targets)
+  {
+    if (target.aggregate_kind == Pq_count_target::PQ_AGGREGATE_COUNT_DISTINCT)
+    {
+      bytes= pq_add_memory_estimate(
+          bytes,
+          pq_multiply_memory_estimate(
+              (ulonglong) records,
+              pq_estimate_field_row_memory(
+                  table, target.aggregate_arg_field_indices)));
+      continue;
+    }
+    if (!target.aggregate_arg_on_leader)
+      continue;
+    bytes= pq_add_memory_estimate(
+        bytes,
+        pq_multiply_memory_estimate(
+            (ulonglong) records,
+            pq_estimate_field_row_memory(
+                table, target.aggregate_arg_field_indices)));
+  }
+  return bytes;
+}
+
+static ulonglong pq_estimate_group_materialized_peak_memory(
+    TABLE *table,
+    const std::vector<uint> &group_fields,
+    const std::vector<Pq_group_aggregate_target> &aggregate_targets)
+{
+  return pq_multiply_memory_estimate(
+      pq_estimate_group_materialized_rows_memory(table, group_fields,
+                                                 aggregate_targets), 2);
+}
+
+static void pq_set_timeout_ms(struct timespec *abstime, ulong timeout_ms)
+{
+  set_timespec(*abstime, 0);
+  abstime->tv_sec+= timeout_ms / PQ_TIME_THOUSAND;
+  abstime->tv_nsec+= (timeout_ms % PQ_TIME_THOUSAND) * PQ_TIME_MILLION;
+  if (abstime->tv_nsec >= PQ_TIME_BILLION)
+  {
+    abstime->tv_sec++;
+    abstime->tv_nsec-= PQ_TIME_BILLION;
+  }
+}
+
+static bool pq_try_reserve_threads(THD *thd, size_t dop)
+{
+  ulong requested= (ulong) dop;
+  if (requested == 0 || requested != dop)
+    return false;
+  if (unlikely(thd->check_killed(true)))
+    return false;
+
+  pthread_mutex_lock(&pq_thread_admission_lock);
+  for (;;)
+  {
+    if (unlikely(thd->check_killed(true)))
+      goto refused;
+
+    ulong max_threads= parallel_max_threads;
+    ulong running= parallel_threads_running;
+
+    if (max_threads >= requested && running <= max_threads - requested)
+    {
+      parallel_threads_running+= requested;
+      pthread_mutex_unlock(&pq_thread_admission_lock);
+      return true;
+    }
+
+    if (thd->variables.parallel_queue_timeout == 0)
+      break;
+
+    struct timespec abstime;
+    pq_set_timeout_ms(&abstime, thd->variables.parallel_queue_timeout);
+
+    do
+    {
+      DEBUG_SYNC(thd, "before_pq_thread_wait");
+      int wait_result= pthread_cond_timedwait(&pq_thread_admission_cond,
+                                              &pq_thread_admission_lock,
+                                              &abstime);
+      if (unlikely(thd->check_killed(true)))
+        goto refused;
+      if (wait_result == ETIMEDOUT)
+        goto refused;
+      max_threads= parallel_max_threads;
+      running= parallel_threads_running;
+    } while (max_threads < requested || running > max_threads - requested);
+
+    parallel_threads_running+= requested;
+    pthread_mutex_unlock(&pq_thread_admission_lock);
+    return true;
+  }
+
+refused:
+  parallel_threads_refused++;
+  pthread_mutex_unlock(&pq_thread_admission_lock);
+  return false;
+}
+
+static void pq_release_threads(size_t dop)
+{
+  if (dop)
+  {
+    pthread_mutex_lock(&pq_thread_admission_lock);
+    parallel_threads_running-= (ulong) dop;
+    pthread_cond_broadcast(&pq_thread_admission_cond);
+    pthread_mutex_unlock(&pq_thread_admission_lock);
+  }
+}
+
+class Pq_thread_reservation
+{
+public:
+  Pq_thread_reservation() : m_dop(0) {}
+  ~Pq_thread_reservation() { pq_release_threads(m_dop); }
+
+  bool reserve(THD *thd, size_t dop)
+  {
+    if (!pq_try_reserve_threads(thd, dop))
+      return false;
+    m_dop= dop;
+    return true;
+  }
+
+private:
+  size_t m_dop;
+};
+
+static ulong pq_effective_dop(THD *thd, TABLE_LIST *table_list)
+{
+  ulonglong dop= 0;
+  if (table_list->opt_hints_table &&
+      table_list->opt_hints_table->is_specified(PQ_HINT_ENUM))
+    dop= table_list->opt_hints_table->pq_hint_dop;
+  if (dop == 0 && table_list->opt_hints_qb &&
+      table_list->opt_hints_qb->is_specified(PQ_HINT_ENUM))
+    dop= table_list->opt_hints_qb->pq_hint_dop;
+  if (dop == 0)
+    dop= thd->variables.parallel_default_dop;
+  if (dop > PQ_PHASE1_MAX_DOP)
+    dop= PQ_PHASE1_MAX_DOP;
+  return (ulong) dop;
+}
+
+static ulong pq_worker_dop(THD *thd, TABLE_LIST *table_list)
+{
+  ulong dop= pq_effective_dop(thd, table_list);
+  ulong max_threads= parallel_max_threads;
+  if (max_threads && dop > max_threads)
+    dop= max_threads;
+  return dop;
+}
+
+static bool pq_auto_rbo_admits(JOIN *join)
+{
+  THD *thd= join->thd;
+  if (thd->variables.force_parallel_execute || thd->no_pq)
+    return false;
+  if (!join->join_tab || !join->join_tab[0].table)
+    return false;
+
+  double cost= join->best_read;
+  if (cost < (double) thd->variables.parallel_cost_threshold)
+    return false;
+
+  double rows= join->join_tab[0].get_examined_rows();
+  if (rows < (double) thd->variables.parallel_rows_threshold)
+    return false;
+
+  double dop=
+    (double) pq_worker_dop(thd,
+                           join->join_tab[0].table->pos_in_table_list);
+  if (dop < 2.0)
+    return false;
+
+  double parallel_cost=
+    (cost / dop) +
+    (rows * dop * thd->variables.parallel_tuple_cost) +
+    thd->variables.parallel_setup_cost;
+  if (parallel_cost > cost)
+    return false;
+
+  return true;
+}
+
+static bool pq_query_block_is_nested(JOIN *join)
+{
+  return join->select_lex->outer_select() ||
+         join->select_lex->master_unit()->derived;
+}
+
+static bool pq_query_block_is_materialized_derived(JOIN *join)
+{
+  TABLE_LIST *derived= join->select_lex->master_unit()->derived;
+  return derived && derived->is_materialized_derived() &&
+         !join->select_lex->master_unit()->is_unit_op();
+}
+
+static const char *pq_nested_query_block_reason(JOIN *join)
+{
+  if (!pq_query_block_is_nested(join))
+    return 0;
+  if (pq_query_block_is_materialized_derived(join))
+    return "unsupported_materialized_derived";
+  if (join->select_lex->outer_select())
+    return "unsupported_nested_subquery";
+  if (join->select_lex->master_unit()->derived)
+    return "unsupported_derived";
+  return "unsupported_nested_query_block";
+}
+
+static bool pq_order_uses_outer_reference(ORDER *order)
+{
+  for (; order; order= order->next)
+  {
+    if (order->item && *order->item &&
+        ((*order->item)->used_tables() & OUTER_REF_TABLE_BIT))
+      return true;
+  }
+  return false;
+}
+
+static bool pq_join_uses_outer_reference(JOIN *join)
+{
+  if ((join->conds && (join->conds->used_tables() & OUTER_REF_TABLE_BIT)) ||
+      (join->having && (join->having->used_tables() & OUTER_REF_TABLE_BIT)) ||
+      (join->tmp_having &&
+       (join->tmp_having->used_tables() & OUTER_REF_TABLE_BIT)))
+    return true;
+
+  List_iterator_fast<Item> item_it(join->fields_list);
+  Item *item;
+  while ((item= item_it++))
+  {
+    if (item->used_tables() & OUTER_REF_TABLE_BIT)
+      return true;
+  }
+
+  return pq_order_uses_outer_reference(join->select_lex->group_list.first) ||
+         pq_order_uses_outer_reference(join->select_lex->order_list.first);
+}
+
+static bool pq_query_block_is_cacheable_scalar_subquery(JOIN *join)
+{
+  st_select_lex_unit *unit= join->select_lex->master_unit();
+  Item_subselect *subselect= unit->item;
+
+  return join->select_lex->outer_select() &&
+         !unit->derived &&
+         !unit->is_unit_op() &&
+         unit->uncacheable == 0 &&
+         subselect &&
+         subselect->upper_refs.is_empty() &&
+         !join->select_lex->is_correlated &&
+         !subselect->is_correlated &&
+         !(join->select_lex->uncacheable & UNCACHEABLE_DEPENDENT) &&
+         !(unit->uncacheable & UNCACHEABLE_DEPENDENT) &&
+         !pq_join_uses_outer_reference(join) &&
+         subselect->substype() == Item_subselect::SINGLEROW_SUBS;
+}
+
+static bool pq_statement_is_write_select(JOIN *join)
+{
+  switch (join->thd->lex->sql_command)
+  {
+  case SQLCOM_CREATE_TABLE:
+  case SQLCOM_INSERT_SELECT:
+  case SQLCOM_REPLACE_SELECT:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool pq_statement_is_prepare_sp_or_trigger(JOIN *join)
+{
+  THD *thd= join->thd;
+
+  if (!thd->stmt_arena->is_conventional())
+    return true;
+  if (thd->in_sub_stmt & (SUB_STMT_FUNCTION | SUB_STMT_TRIGGER))
+    return true;
+  if (thd->in_stored_procedure())
+    return true;
+
+  return false;
+}
+
+static bool pq_query_has_explicit_order_by(JOIN *join)
+{
+  return join->select_lex->order_list.first != NULL;
+}
+
+static bool pq_table_is_session_temporary(TABLE *table)
+{
+  return table->s->tmp_table != NO_TMP_TABLE;
+}
+
+static bool pq_table_is_supported_innodb(TABLE *table)
+{
+  if (!table || !table->file)
+    return false;
+
+  handlerton *ht= table->file->ht;
+  if (ht && ht->db_type == DB_TYPE_INNODB)
+    return true;
+
+  handlerton *partition_ht= table->file->partition_ht();
+  return partition_ht && partition_ht->db_type == DB_TYPE_INNODB;
+}
+
+static bool pq_partition_table_allowed_for_join(JOIN *join, TABLE *table)
+{
+  if (!table || !table->part_info)
+    return true;
+
+  return pq_projection_query_shape(join) ||
+         pq_scalar_aggregate_query_shape(join) ||
+         join->group || join->group_list || join->select_lex->group_list.first;
+}
+
+static bool pq_get_supported_primary_key(TABLE *table, uint *pk_field_index,
+                                         Pq_range_key_kind *key_kind);
+static bool pq_get_supported_split_key(TABLE *table, uint keyno,
+                                       uint *field_index,
+                                       Pq_range_key_kind *key_kind);
+uint find_shortest_key(TABLE *table, const key_map *usable_keys);
+
+static bool pq_table_has_supported_split_key(TABLE *table)
+{
+  uint pk_field_index= 0;
+  Pq_range_key_kind key_kind;
+  return pq_get_supported_primary_key(table, &pk_field_index, &key_kind);
+}
+
+static bool pq_join_has_result_interceptor(JOIN *join)
+{
+  if (join->result && join->result->result_interceptor())
+    return true;
+  return join->thd && join->thd->lex && join->thd->lex->result &&
+         join->thd->lex->result->result_interceptor();
+}
+
+static bool pq_session_has_locked_tables(THD *thd)
+{
+  return thd->locked_tables_mode == LTM_LOCK_TABLES ||
+         thd->locked_tables_mode == LTM_PRELOCKED_UNDER_LOCK_TABLES;
+}
+
+static bool pq_session_has_unsupported_sql_mode(THD *thd)
+{
+  return thd->variables.sql_mode & MODE_ONLY_FULL_GROUP_BY;
+}
+
+static bool pq_join_has_outer_join(JOIN *join)
+{
+  return join->outer_join != 0;
+}
+
+static bool pq_join_has_semijoin(JOIN *join)
+{
+  return join->select_lex && !join->select_lex->sj_nests.is_empty();
+}
+
+static bool pq_query_base_is_supported(JOIN *join, bool allow_order,
+                                       bool allow_having= false,
+                                       bool allow_offset= false,
+                                       bool allow_found_rows= false,
+                                       bool allow_nested_scalar_aggregate= false,
+                                       bool allow_with_ties= false)
+{
+  THD *thd= join->thd;
+
+  if (pq_query_block_is_nested(join) &&
+      (!allow_nested_scalar_aggregate ||
+       (!pq_query_block_is_materialized_derived(join) &&
+        !pq_query_block_is_cacheable_scalar_subquery(join))))
+    return false;
+  if (pq_statement_is_prepare_sp_or_trigger(join))
+    return false;
+  if (pq_statement_is_write_select(join))
+    return false;
+  if (join->select_options & OPTION_BUFFER_RESULT)
+    return false;
+  if (pq_join_has_result_interceptor(join))
+    return false;
+
+  if (join->table_count != 1 ||
+      join->const_tables != 0 ||
+      join->need_tmp ||
+      join->group ||
+      join->group_list ||
+      (join->having && !allow_having) ||
+      join->procedure ||
+      join->select_distinct ||
+      join->select_lex->have_window_funcs() ||
+      join->select_lex->master_unit()->is_unit_op())
+    return false;
+  if (join->order && !allow_order)
+    return false;
+  if ((join->unit->lim.get_offset_limit() != 0 && !allow_offset) ||
+      (join->unit->lim.is_with_ties() && !allow_with_ties))
+    return false;
+  if (join->select_lex->olap == ROLLUP_TYPE ||
+      join->rollup.state != ROLLUP::STATE_NONE)
+    return false;
+  if ((join->select_options & OPTION_FOUND_ROWS) && !allow_found_rows)
+    return false;
+
+  if (!join->tables_list || !join->join_tab || !join->join_tab[0].table)
+    return false;
+
+  TABLE *table= join->join_tab[0].table;
+  if (!pq_table_is_supported_innodb(table))
+    return false;
+  if (!pq_partition_table_allowed_for_join(join, table))
+    return false;
+  if (pq_table_is_session_temporary(table))
+    return false;
+  if (!pq_table_has_supported_split_key(table))
+    return false;
+
+  if (join->select_lex->select_lock != st_select_lex::NONE ||
+      (thd->tx_isolation != ISO_REPEATABLE_READ &&
+       thd->tx_isolation != ISO_READ_COMMITTED))
+    return false;
+  if (pq_session_has_unsupported_sql_mode(thd))
+    return false;
+  if (pq_session_has_locked_tables(thd))
+    return false;
+  if (thd->in_multi_stmt_transaction_mode())
+    return false;
+
+  TABLE_LIST *table_list= table->pos_in_table_list;
+  if (!pq_master_enable)
+    return false;
+  if (!optimizer_flag(thd, OPTIMIZER_SWITCH_PARALLEL_QUERY))
+    return false;
+  if (thd->no_pq)
+    return false;
+
+  const hint_state pq_hint= hint_table_state(thd, table_list, PQ_HINT_ENUM);
+  if (pq_hint == hint_state::DISABLED)
+    return false;
+  if (!thd->variables.force_parallel_execute &&
+      pq_hint != hint_state::ENABLED &&
+      !pq_auto_rbo_admits(join))
+    return false;
+  if (pq_worker_dop(thd, table_list) < 2)
+    return false;
+
+  return true;
+}
+
+static bool pq_function_name_matches(LEX_CSTRING name,
+                                     const char *function_name)
+{
+  return name.length == strlen(function_name) &&
+         !my_strcasecmp_latin1(name.str, function_name);
+}
+
+static const char *pq_function_name_unsupported_reason(LEX_CSTRING name)
+{
+  static const char *time_function_names[]= {
+    "curdate",
+    "current_date",
+    "current_time",
+    "current_timestamp",
+    "curtime",
+    "localtime",
+    "localtimestamp",
+    "now",
+    "sysdate",
+    "utc_date",
+    "utc_time",
+    "utc_timestamp",
+  };
+  static const char *nondeterministic_function_names[]= {
+    "connection_id",
+    "found_rows",
+    "rand",
+    "random_bytes",
+    "uuid",
+    "uuid_short",
+  };
+  static const char *side_effect_function_names[]= {
+    "benchmark",
+    "get_lock",
+    "is_free_lock",
+    "is_used_lock",
+    "last_insert_id",
+    "load_file",
+    "master_gtid_wait",
+    "master_pos_wait",
+    "release_all_locks",
+    "release_lock",
+    "row_count",
+    "sleep",
+  };
+
+  for (const char *function_name : time_function_names)
+  {
+    if (pq_function_name_matches(name, function_name))
+      return "unsupported_time_function";
+  }
+  for (const char *function_name : nondeterministic_function_names)
+  {
+    if (pq_function_name_matches(name, function_name))
+      return "unsupported_nondeterministic_function";
+  }
+  for (const char *function_name : side_effect_function_names)
+  {
+    if (pq_function_name_matches(name, function_name))
+      return "unsupported_side_effect_function";
+  }
+  return 0;
+}
+
+static bool pq_function_name_is_unsupported(LEX_CSTRING name)
+{
+  static const char *unsupported_names[]= {
+    "benchmark",
+    "connection_id",
+    "curdate",
+    "current_role",
+    "current_timestamp",
+    "current_user",
+    "curtime",
+    "database",
+    "found_rows",
+    "get_lock",
+    "is_free_lock",
+    "is_used_lock",
+    "json_contains_path",
+    "json_depth",
+    "json_exists",
+    "json_length",
+    "json_overlaps",
+    "json_query",
+    "json_quote",
+    "json_schema_valid",
+    "json_search",
+    "json_type",
+    "json_unquote",
+    "json_valid",
+    "json_value",
+    "kdf",
+    "lastval",
+    "last_insert_id",
+    "load_file",
+    "localtimestamp",
+    "master_gtid_wait",
+    "master_pos_wait",
+    "md5",
+    "nextval",
+    "old_password",
+    "password",
+    "rand",
+    "random_bytes",
+    "release_all_locks",
+    "release_lock",
+    "rownum",
+    "row_count",
+    "session_user",
+    "setval",
+    "sha",
+    "sha2",
+    "user",
+    "utc_date",
+    "utc_time",
+    "utc_timestamp",
+    "uuid",
+    "uuid_short",
+    "weight_string",
+  };
+
+  for (const char *unsupported_name : unsupported_names)
+  {
+    if (pq_function_name_matches(name, unsupported_name))
+      return true;
+  }
+  return false;
+}
+
+static bool pq_function_name_is_sequence(LEX_CSTRING name)
+{
+  return (name.length == 7 && !my_strcasecmp_latin1(name.str, "lastval")) ||
+         (name.length == 7 && !my_strcasecmp_latin1(name.str, "nextval")) ||
+         (name.length == 6 && !my_strcasecmp_latin1(name.str, "setval"));
+}
+
+static bool pq_item_has_unsupported_function(Item *item)
+{
+  if (!item)
+    return false;
+
+  Item *real_item= item->real_item();
+  if (!real_item)
+    return false;
+
+  if (real_item->type() == Item::SUM_FUNC_ITEM)
+  {
+    Item_sum *sum_item= static_cast<Item_sum *>(real_item);
+    for (uint i= 0; i < sum_item->get_arg_count(); i++)
+    {
+      if (pq_item_has_unsupported_function(sum_item->get_arg(i)))
+        return true;
+    }
+    return false;
+  }
+
+  if (real_item->type() != Item::FUNC_ITEM &&
+      real_item->type() != Item::COND_ITEM)
+    return false;
+
+  Item_func *func= static_cast<Item_func *>(real_item);
+  if (func->functype() == Item_func::FUNC_SP ||
+      func->functype() == Item_func::SUSERVAR_FUNC ||
+      func->functype() == Item_func::UDF_FUNC)
+    return true;
+  if (pq_function_name_is_unsupported(func->func_name_cstring()))
+    return true;
+
+  Item **args= func->arguments();
+  for (uint i= 0; i < func->argument_count(); i++)
+  {
+    if (pq_item_has_unsupported_function(args[i]))
+      return true;
+  }
+  return false;
+}
+
+static const char *pq_item_unsupported_function_reason(Item *item)
+{
+  if (!item)
+    return 0;
+
+  Item *real_item= item->real_item();
+  if (!real_item)
+    return 0;
+
+  if (real_item->type() == Item::SUM_FUNC_ITEM)
+  {
+    Item_sum *sum_item= static_cast<Item_sum *>(real_item);
+    for (uint i= 0; i < sum_item->get_arg_count(); i++)
+    {
+      if (const char *reason=
+            pq_item_unsupported_function_reason(sum_item->get_arg(i)))
+        return reason;
+    }
+    return 0;
+  }
+
+  if (real_item->type() != Item::FUNC_ITEM &&
+      real_item->type() != Item::COND_ITEM)
+    return 0;
+
+  Item_func *func= static_cast<Item_func *>(real_item);
+  if (const char *reason=
+        pq_function_name_unsupported_reason(func->func_name_cstring()))
+    return reason;
+
+  Item **args= func->arguments();
+  for (uint i= 0; i < func->argument_count(); i++)
+  {
+    if (const char *reason= pq_item_unsupported_function_reason(args[i]))
+      return reason;
+  }
+  return 0;
+}
+
+static const char *pq_item_list_unsupported_function_reason(List<Item> &items)
+{
+  List_iterator_fast<Item> it(items);
+  Item *item;
+  while ((item= it++))
+  {
+    if (const char *reason= pq_item_unsupported_function_reason(item))
+      return reason;
+  }
+  return 0;
+}
+
+static bool pq_item_has_sequence_function(Item *item)
+{
+  if (!item)
+    return false;
+
+  Item *real_item= item->real_item();
+  if (!real_item)
+    return false;
+
+  if (real_item->type() == Item::SUM_FUNC_ITEM)
+  {
+    Item_sum *sum_item= static_cast<Item_sum *>(real_item);
+    for (uint i= 0; i < sum_item->get_arg_count(); i++)
+    {
+      if (pq_item_has_sequence_function(sum_item->get_arg(i)))
+        return true;
+    }
+    return false;
+  }
+
+  if (real_item->type() != Item::FUNC_ITEM &&
+      real_item->type() != Item::COND_ITEM)
+    return false;
+
+  Item_func *func= static_cast<Item_func *>(real_item);
+  if (pq_function_name_is_sequence(func->func_name_cstring()))
+    return true;
+
+  Item **args= func->arguments();
+  for (uint i= 0; i < func->argument_count(); i++)
+  {
+    if (pq_item_has_sequence_function(args[i]))
+      return true;
+  }
+  return false;
+}
+
+static bool pq_item_list_has_sequence_function(List<Item> &items)
+{
+  List_iterator_fast<Item> it(items);
+  Item *item;
+  while ((item= it++))
+  {
+    if (pq_item_has_sequence_function(item))
+      return true;
+  }
+  return false;
+}
+
+static bool pq_having_item_matches_target(Item *item,
+                                          const Pq_count_target &target)
+{
+  item= item->real_item();
+  if (item == target.sum_item)
+    return true;
+
+  if (item->type() != Item::SUM_FUNC_ITEM || !target.sum_item)
+    return false;
+
+  Item_sum *sum_item= static_cast<Item_sum *>(item);
+  if (sum_item->has_with_distinct() || target.sum_item->has_with_distinct())
+    return false;
+
+  switch (target.aggregate_kind)
+  {
+  case Pq_count_target::PQ_AGGREGATE_COUNT_DISTINCT:
+    return false;
+  case Pq_count_target::PQ_AGGREGATE_COUNT:
+    if (sum_item->sum_func() != Item_sum::COUNT_FUNC)
+      return false;
+    break;
+  case Pq_count_target::PQ_AGGREGATE_SUM:
+    if (sum_item->sum_func() != Item_sum::SUM_FUNC)
+      return false;
+    break;
+  case Pq_count_target::PQ_AGGREGATE_AVG:
+    if (sum_item->sum_func() != Item_sum::AVG_FUNC)
+      return false;
+    break;
+  case Pq_count_target::PQ_AGGREGATE_MIN:
+    if (sum_item->sum_func() != Item_sum::MIN_FUNC)
+      return false;
+    break;
+  case Pq_count_target::PQ_AGGREGATE_MAX:
+    if (sum_item->sum_func() != Item_sum::MAX_FUNC)
+      return false;
+    break;
+  }
+
+  if (sum_item->get_arg_count() != 1 ||
+      target.sum_item->get_arg_count() != 1)
+    return false;
+
+  Item *having_arg= sum_item->get_arg(0)->real_item();
+  Item *target_arg= target.sum_item->get_arg(0)->real_item();
+  if (having_arg == target_arg)
+    return true;
+
+  if (target.aggregate_kind == Pq_count_target::PQ_AGGREGATE_COUNT &&
+      !having_arg->used_tables() && !target_arg->used_tables() &&
+      !having_arg->is_null() && !target_arg->is_null())
+    return true;
+
+  if (having_arg->type() == Item::FIELD_ITEM &&
+      target_arg->type() == Item::FIELD_ITEM)
+  {
+    Item_field *having_field= static_cast<Item_field *>(having_arg);
+    Item_field *target_field= static_cast<Item_field *>(target_arg);
+    return having_field->field == target_field->field;
+  }
+
+  return having_arg->eq(target_arg, Item::Eq_config(true));
+}
+
+static bool pq_having_item_is_supported(THD *thd, Item *item,
+                                        const Pq_count_target &target)
+{
+  Item *real_item= item->real_item();
+  if ((real_item->type() == Item::SUBSELECT_ITEM ||
+       real_item->type() == Item::EXPR_CACHE_ITEM) &&
+      pq_item_has_only_cacheable_scalar_subquery_consts(thd, real_item, true))
+    return true;
+  if (pq_having_item_matches_target(real_item, target))
+    return true;
+  if (real_item->const_item())
+    return true;
+  if (real_item->type() != Item::FUNC_ITEM &&
+      real_item->type() != Item::COND_ITEM)
+    return false;
+
+  Item_func *func= static_cast<Item_func *>(real_item);
+  switch (func->functype())
+  {
+  case Item_func::EQ_FUNC:
+  case Item_func::EQUAL_FUNC:
+  case Item_func::NE_FUNC:
+  case Item_func::LT_FUNC:
+  case Item_func::LE_FUNC:
+  case Item_func::GE_FUNC:
+  case Item_func::GT_FUNC:
+  case Item_func::ISNULL_FUNC:
+  case Item_func::ISNOTNULL_FUNC:
+  case Item_func::COND_AND_FUNC:
+  case Item_func::COND_OR_FUNC:
+    break;
+  default:
+    return false;
+  }
+
+  Item **args= func->arguments();
+  for (uint i= 0; i < func->argument_count(); i++)
+  {
+    if (!pq_having_item_is_supported(thd, args[i], target))
+      return false;
+  }
+  return true;
+}
+
+static bool pq_having_is_supported(JOIN *join,
+                                   const Pq_count_target &target)
+{
+  if (!join->having)
+    return true;
+
+  THD *thd= join->thd;
+  if ((join->having->with_subquery() &&
+       !pq_item_has_only_cacheable_scalar_subquery_consts(
+         thd, join->having, true)) ||
+      pq_item_has_unsupported_function(join->having) ||
+      join->having->walk(&Item::is_expensive_processor, 0, 0))
+    return false;
+
+  return pq_having_item_is_supported(thd, join->having, target);
+}
+
+static bool pq_scalar_aggregate_order_func_is_supported(Item_func *func)
+{
+  if (func->functype() == Item_func::NEG_FUNC)
+    return func->argument_count() == 1;
+
+  LEX_CSTRING name= func->func_name_cstring();
+  if (func->argument_count() == 1)
+    return name.length == 3 && !my_strcasecmp_latin1(name.str, "abs");
+
+  if (func->argument_count() != 2)
+    return false;
+
+  if (name.length == 1 &&
+      (name.str[0] == '+' || name.str[0] == '-' ||
+       name.str[0] == '*' || name.str[0] == '/'))
+    return true;
+
+  return (name.length == 3 && !my_strcasecmp_latin1(name.str, "div")) ||
+         (name.length == 3 && !my_strcasecmp_latin1(name.str, "mod"));
+}
+
+static bool pq_scalar_aggregate_order_item_is_supported(
+    THD *thd, TABLE *table, Item *item, const Pq_count_target &target,
+    bool evaluate_scalar_subqueries)
+{
+  Item *real_item= item->real_item();
+  if (pq_having_item_matches_target(real_item, target))
+    return true;
+  if (real_item->basic_const_item())
+    return true;
+  if ((real_item->type() == Item::SUBSELECT_ITEM ||
+       real_item->type() == Item::EXPR_CACHE_ITEM) &&
+      pq_item_has_only_cacheable_scalar_subquery_consts(
+        thd, real_item, evaluate_scalar_subqueries) &&
+      (!table || !(real_item->used_tables() & table->map)) &&
+      !pq_item_has_unsupported_function(real_item) &&
+      !real_item->walk(&Item::is_expensive_processor, 0, 0))
+    return true;
+
+  if (real_item->type() != Item::FUNC_ITEM)
+    return false;
+
+  switch (real_item->result_type())
+  {
+  case INT_RESULT:
+  case REAL_RESULT:
+  case DECIMAL_RESULT:
+    break;
+  default:
+    return false;
+  }
+
+  Item_func *func= static_cast<Item_func *>(real_item);
+  if (!pq_scalar_aggregate_order_func_is_supported(func))
+    return false;
+
+  Item **args= func->arguments();
+  for (uint i= 0; i < func->argument_count(); i++)
+  {
+    if (!pq_scalar_aggregate_order_item_is_supported(
+          thd, table, args[i], target, evaluate_scalar_subqueries))
+      return false;
+  }
+  return true;
+}
+
+static bool pq_scalar_aggregate_order_is_supported(
+    JOIN *join, const Pq_count_target &target)
+{
+  THD *thd= join->thd;
+  TABLE *table= join->join_tab && join->join_tab[0].table ?
+                join->join_tab[0].table : NULL;
+  ORDER *order_list= join->order ? join->order :
+                     join->select_lex->order_list.first;
+  for (ORDER *order= order_list; order; order= order->next)
+  {
+    if (!order->item || !*order->item)
+      return false;
+    bool evaluate_scalar_subqueries= !thd->lex->describe;
+    if (!pq_scalar_aggregate_order_item_is_supported(
+          thd, table, *order->item, target, evaluate_scalar_subqueries))
+      return false;
+  }
+  return true;
+}
+
+static bool pq_inject_scalar_aggregate_value(
+            THD *thd,
+            TABLE *table,
+            const Pq_count_target &target,
+            const Pq_scalar_aggregate_result &result,
+            Item_sum *sum_item)
+{
+  switch (target.aggregate_kind)
+  {
+  case Pq_count_target::PQ_AGGREGATE_COUNT:
+    static_cast<Item_sum_count *>(sum_item)->
+      make_const((longlong) result.count);
+    return true;
+  case Pq_count_target::PQ_AGGREGATE_COUNT_DISTINCT:
+    if (sum_item->set_aggregator(thd, Aggregator::SIMPLE_AGGREGATOR))
+      return false;
+    static_cast<Item_sum_count *>(sum_item)->
+      make_const((longlong) result.count);
+    return true;
+  case Pq_count_target::PQ_AGGREGATE_SUM:
+  {
+    Item_sum_sum *sum= static_cast<Item_sum_sum *>(sum_item);
+    sum->clear();
+    if (target.sum_decimal_result)
+      sum->direct_add(result.has_sum_value ?
+                      const_cast<my_decimal *>(&result.sum_decimal) : 0);
+    else
+      sum->direct_add(result.sum_real, !result.has_sum_value);
+    if (sum->add())
+      return false;
+    sum->make_const();
+    return !thd->is_error();
+  }
+  case Pq_count_target::PQ_AGGREGATE_AVG:
+  {
+    Item_sum_avg *avg= static_cast<Item_sum_avg *>(sum_item);
+    avg->clear();
+    if (target.sum_decimal_result)
+      avg->direct_add(result.has_sum_value ?
+                      const_cast<my_decimal *>(&result.sum_decimal) : 0);
+    else
+      avg->direct_add(result.sum_real, !result.has_sum_value);
+    if (avg->Item_sum_sum::add())
+      return false;
+    avg->count= result.count;
+    avg->make_const();
+    return !thd->is_error();
+  }
+  case Pq_count_target::PQ_AGGREGATE_MIN:
+  case Pq_count_target::PQ_AGGREGATE_MAX:
+  {
+    Item_sum_min_max *minmax= static_cast<Item_sum_min_max *>(sum_item);
+    if (target.aggregate_arg_on_leader)
+    {
+      Item *minmax_arg= minmax->get_arg(0);
+      minmax->clear();
+      for (const Pq_field_row &row : result.aggregate_arg_rows)
+      {
+        if (!pq_restore_field_row(table, target.aggregate_arg_field_indices,
+                                  row))
+          return false;
+        minmax->direct_add(minmax_arg);
+        if (minmax->add())
+          return false;
+        if (thd->is_error())
+          return false;
+      }
+      return true;
+    }
+
+    Field *field= table->field[target.field_index];
+    minmax->clear();
+    if (result.has_minmax_value)
+    {
+      field->set_notnull();
+      if (!pq_restore_field_payload(field, result.minmax_value))
+        return false;
+      minmax->direct_add(minmax->get_arg(0));
+      if (minmax->add())
+        return false;
+    }
+    return !thd->is_error();
+  }
+  default:
+    return false;
+  }
+}
+
+static bool pq_inject_having_aggregate_values(
+            THD *thd,
+            TABLE *table,
+            Item *item,
+            const Pq_count_target &target,
+            const Pq_scalar_aggregate_result &result)
+{
+  Item *real_item= item->real_item();
+  if (real_item != target.sum_item &&
+      real_item->type() == Item::SUM_FUNC_ITEM &&
+      pq_having_item_matches_target(real_item, target))
+  {
+    if (!pq_inject_scalar_aggregate_value(
+          thd, table, target, result,
+          static_cast<Item_sum *>(real_item)))
+      return false;
+  }
+
+  if (real_item->type() != Item::FUNC_ITEM &&
+      real_item->type() != Item::COND_ITEM)
+    return true;
+
+  Item_func *func= static_cast<Item_func *>(real_item);
+  Item **args= func->arguments();
+  for (uint i= 0; i < func->argument_count(); i++)
+  {
+    if (!pq_inject_having_aggregate_values(thd, table, args[i], target,
+                                           result))
+      return false;
+  }
+  return true;
+}
+
+static bool pq_item_has_field_outside_sum(Item *item)
+{
+  if (!item)
+    return false;
+
+  Item *real_item= item->real_item();
+  if (!real_item)
+    return false;
+
+  if (real_item->type() == Item::SUM_FUNC_ITEM)
+    return false;
+  if (real_item->type() == Item::FIELD_ITEM)
+    return true;
+  if (real_item->type() != Item::FUNC_ITEM &&
+      real_item->type() != Item::COND_ITEM)
+    return false;
+
+  Item_func *func= static_cast<Item_func *>(real_item);
+  Item **args= func->arguments();
+  for (uint i= 0; i < func->argument_count(); i++)
+  {
+    if (pq_item_has_field_outside_sum(args[i]))
+      return true;
+  }
+  return false;
+}
+
+static Item_sum *pq_get_single_sum_item_from_select(JOIN *join)
+{
+  if (join->fields_list.elements != 1)
+    return 0;
+
+  List_iterator_fast<Item> it(join->fields_list);
+  Item *item= it++;
+  if (!item)
+    return 0;
+  if (item->type() == Item::SUM_FUNC_ITEM)
+    return static_cast<Item_sum *>(item);
+
+  if (!join->sum_funcs || !join->sum_funcs[0] || join->sum_funcs[1] ||
+      item->with_subquery() ||
+      pq_item_has_unsupported_function(item) ||
+      pq_item_has_field_outside_sum(item))
+    return 0;
+
+  return join->sum_funcs[0];
+}
+
+static Item_sum_count *pq_get_single_count_item(JOIN *join)
+{
+  Item_sum *sum_item= pq_get_single_sum_item_from_select(join);
+  if (!sum_item || sum_item->sum_func() != Item_sum::COUNT_FUNC)
+    return 0;
+
+  if (sum_item->has_with_distinct() || sum_item->get_arg_count() != 1)
+    return 0;
+
+  return static_cast<Item_sum_count *>(sum_item);
+}
+
+static Item_sum_count *pq_get_single_count_distinct_item(JOIN *join)
+{
+  Item_sum *sum_item= pq_get_single_sum_item_from_select(join);
+  if (!sum_item ||
+      sum_item->sum_func() != Item_sum::COUNT_DISTINCT_FUNC ||
+      !sum_item->has_with_distinct() ||
+      sum_item->get_arg_count() != 1)
+    return 0;
+
+  return static_cast<Item_sum_count *>(sum_item);
+}
+
+static Item_sum_sum *pq_get_single_sum_item(JOIN *join)
+{
+  Item_sum *sum_item= pq_get_single_sum_item_from_select(join);
+  if (!sum_item || sum_item->sum_func() != Item_sum::SUM_FUNC)
+    return 0;
+
+  if (sum_item->has_with_distinct() || sum_item->get_arg_count() != 1)
+    return 0;
+
+  return static_cast<Item_sum_sum *>(sum_item);
+}
+
+static Item_sum_avg *pq_get_single_avg_item(JOIN *join)
+{
+  Item_sum *sum_item= pq_get_single_sum_item_from_select(join);
+  if (!sum_item || sum_item->sum_func() != Item_sum::AVG_FUNC)
+    return 0;
+
+  if (sum_item->has_with_distinct() || sum_item->get_arg_count() != 1)
+    return 0;
+
+  return static_cast<Item_sum_avg *>(sum_item);
+}
+
+static Item_sum_min_max *pq_get_single_minmax_item(JOIN *join)
+{
+  Item_sum *sum_item= pq_get_single_sum_item_from_select(join);
+  if (!sum_item ||
+      (sum_item->sum_func() != Item_sum::MIN_FUNC &&
+       sum_item->sum_func() != Item_sum::MAX_FUNC))
+    return 0;
+
+  if (sum_item->has_with_distinct() || sum_item->get_arg_count() != 1)
+    return 0;
+
+  return static_cast<Item_sum_min_max *>(sum_item);
+}
+
+static bool pq_is_supported_sum_field(Field *field)
+{
+  if (field->vcol_info)
+    return false;
+
+  switch (field->real_type())
+  {
+  case MYSQL_TYPE_TINY:
+  case MYSQL_TYPE_SHORT:
+  case MYSQL_TYPE_INT24:
+  case MYSQL_TYPE_LONG:
+  case MYSQL_TYPE_LONGLONG:
+  case MYSQL_TYPE_FLOAT:
+  case MYSQL_TYPE_DOUBLE:
+  case MYSQL_TYPE_NEWDECIMAL:
+    return true;
+  case MYSQL_TYPE_BIT:
+    return field->max_display_length() % 8 == 0 &&
+           static_cast<Field_bit *>(field)->bit_len == 0;
+  default:
+    return false;
+  }
+}
+
+static bool pq_is_supported_minmax_field(Field *field)
+{
+  if (field->pack_length() == 0 || field->vcol_info)
+    return false;
+
+  switch (field->real_type())
+  {
+  case MYSQL_TYPE_TINY:
+  case MYSQL_TYPE_SHORT:
+  case MYSQL_TYPE_INT24:
+  case MYSQL_TYPE_LONG:
+  case MYSQL_TYPE_LONGLONG:
+  case MYSQL_TYPE_FLOAT:
+  case MYSQL_TYPE_DOUBLE:
+  case MYSQL_TYPE_NEWDECIMAL:
+  case MYSQL_TYPE_DATE:
+  case MYSQL_TYPE_NEWDATE:
+  case MYSQL_TYPE_TIME:
+  case MYSQL_TYPE_TIME2:
+  case MYSQL_TYPE_DATETIME:
+  case MYSQL_TYPE_DATETIME2:
+  case MYSQL_TYPE_TIMESTAMP:
+  case MYSQL_TYPE_TIMESTAMP2:
+  case MYSQL_TYPE_VARCHAR:
+  case MYSQL_TYPE_VAR_STRING:
+  case MYSQL_TYPE_STRING:
+    return true;
+  case MYSQL_TYPE_BIT:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static int pq_compare_minmax_field(Field *field, const uchar *left,
+                                   const uchar *right)
+{
+  if (field->real_type() == MYSQL_TYPE_BIT)
+  {
+    Field_bit *bit_field= static_cast<Field_bit *>(field);
+    if (bit_field->bit_len)
+    {
+      int cmp= static_cast<int>(left[bit_field->bytes_in_rec]) -
+               static_cast<int>(right[bit_field->bytes_in_rec]);
+      if (cmp)
+        return cmp;
+    }
+    if (!bit_field->bytes_in_rec)
+      return 0;
+    return memcmp(left, right, bit_field->bytes_in_rec);
+  }
+  return field->cmp(left, right);
+}
+
+static bool pq_is_supported_count_distinct_field(Field *field)
+{
+  if (field->vcol_info)
+    return false;
+
+  switch (field->real_type())
+  {
+  case MYSQL_TYPE_TINY:
+  case MYSQL_TYPE_SHORT:
+  case MYSQL_TYPE_INT24:
+  case MYSQL_TYPE_LONG:
+  case MYSQL_TYPE_LONGLONG:
+  case MYSQL_TYPE_NEWDECIMAL:
+  case MYSQL_TYPE_DATE:
+  case MYSQL_TYPE_NEWDATE:
+  case MYSQL_TYPE_TIME:
+  case MYSQL_TYPE_TIME2:
+  case MYSQL_TYPE_DATETIME:
+  case MYSQL_TYPE_DATETIME2:
+    return true;
+  case MYSQL_TYPE_VARCHAR:
+  case MYSQL_TYPE_VAR_STRING:
+  case MYSQL_TYPE_STRING:
+    return pq_count_distinct_string_field_has_safe_equality(field);
+  case MYSQL_TYPE_BIT:
+    return field->max_display_length() % 8 == 0 &&
+           static_cast<Field_bit *>(field)->bit_len == 0;
+  default:
+    return false;
+  }
+}
+
+static bool pq_count_distinct_expr_fields_are_supported(
+    TABLE *table, const std::vector<uint> &fields)
+{
+  for (uint field_index : fields)
+  {
+    if (field_index >= table->s->fields ||
+        !pq_is_supported_count_distinct_field(table->field[field_index]))
+      return false;
+  }
+  return true;
+}
+
+static bool pq_count_distinct_expr_result_is_supported(Item *arg)
+{
+  switch (arg->result_type())
+  {
+  case INT_RESULT:
+  case DECIMAL_RESULT:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool pq_extract_worker_sum_product_arg(TABLE *table, Item *arg,
+                                              uint *left_field_index,
+                                              uint *right_field_index)
+{
+  Item *real_arg= arg ? arg->real_item() : 0;
+  if (!table || !real_arg || real_arg->type() != Item::FUNC_ITEM)
+    return false;
+
+  Item_func *func= static_cast<Item_func *>(real_arg);
+  LEX_CSTRING func_name= func->func_name_cstring();
+  if (func->argument_count() != 2 ||
+      func_name.length != 1 || func_name.str[0] != '*')
+    return false;
+
+  Item **args= func->arguments();
+  Item *left= args[0] ? args[0]->real_item() : 0;
+  Item *right= args[1] ? args[1]->real_item() : 0;
+  if (!left || !right ||
+      left->type() != Item::FIELD_ITEM ||
+      right->type() != Item::FIELD_ITEM)
+    return false;
+
+  Field *left_field= static_cast<Item_field *>(left)->field;
+  Field *right_field= static_cast<Item_field *>(right)->field;
+  if (!left_field || !right_field ||
+      left_field->table != table || right_field->table != table ||
+      !pq_is_supported_sum_field(left_field) ||
+      !pq_is_supported_sum_field(right_field))
+    return false;
+
+  *left_field_index= left_field->field_index;
+  *right_field_index= right_field->field_index;
+  return true;
+}
+
+static bool pq_extract_count_target(JOIN *join, Pq_count_target *target)
+{
+  TABLE *table= join->join_tab[0].table;
+  target->has_sum_product_fields= false;
+  target->sum_product_left_field_index= 0;
+  target->sum_product_right_field_index= 0;
+
+  Item_sum_count *count_item= pq_get_single_count_item(join);
+  if (count_item)
+  {
+    Item *arg= count_item->get_arg(0);
+    target->aggregate_kind= Pq_count_target::PQ_AGGREGATE_COUNT;
+    target->sum_item= count_item;
+    target->has_field= false;
+    target->field_index= 0;
+    target->aggregate_arg_on_leader= false;
+    target->aggregate_arg_field_indices.clear();
+    target->sum_decimal_result= false;
+
+    if (arg->type() != Item::FIELD_ITEM)
+    {
+      if (pq_item_has_unsupported_function(arg))
+        return false;
+      if (arg->used_tables())
+      {
+        if (!pq_extract_leader_aggregate_arg(
+              table, arg, &target->aggregate_arg_field_indices))
+          return false;
+        target->aggregate_arg_on_leader= true;
+        return true;
+      }
+      if (arg->is_null())
+        return false;
+      return true;
+    }
+
+    Item_field *field_item= static_cast<Item_field *>(arg);
+    if (field_item->field->table != table)
+      return false;
+    if (field_item->field->vcol_info)
+      return false;
+
+    target->has_field= true;
+    target->field_index= field_item->field->field_index;
+    target->aggregate_arg_on_leader= false;
+    return true;
+  }
+
+  Item_sum_count *count_distinct_item= pq_get_single_count_distinct_item(join);
+  if (count_distinct_item)
+  {
+    if (!(join->thd->variables.pq_support_features_switch &
+          PQ_SUPPORT_FEATURES_SWITCH_COUNT_DISTINCT))
+      return false;
+
+    Item *arg= count_distinct_item->get_arg(0);
+    if (arg->type() != Item::FIELD_ITEM)
+    {
+      std::vector<uint> arg_fields;
+      if (!pq_extract_leader_aggregate_arg(table, arg, &arg_fields) ||
+          !pq_count_distinct_expr_result_is_supported(arg) ||
+          !pq_count_distinct_expr_fields_are_supported(table, arg_fields))
+        return false;
+
+      target->aggregate_kind= Pq_count_target::PQ_AGGREGATE_COUNT_DISTINCT;
+      target->sum_item= count_distinct_item;
+      target->has_field= false;
+      target->field_index= 0;
+      target->aggregate_arg_on_leader= true;
+      target->aggregate_arg_field_indices= arg_fields;
+      target->sum_decimal_result= false;
+      return true;
+    }
+
+    Item_field *field_item= static_cast<Item_field *>(arg);
+    if (field_item->field->table != table)
+      return false;
+    if (!pq_is_supported_count_distinct_field(field_item->field))
+      return false;
+
+    target->aggregate_kind= Pq_count_target::PQ_AGGREGATE_COUNT_DISTINCT;
+    target->sum_item= count_distinct_item;
+    target->has_field= true;
+    target->field_index= field_item->field->field_index;
+    target->aggregate_arg_on_leader= true;
+    target->aggregate_arg_field_indices.clear();
+    target->aggregate_arg_field_indices.push_back(target->field_index);
+    target->sum_decimal_result= false;
+    return true;
+  }
+
+  Item_sum_sum *sum_item= pq_get_single_sum_item(join);
+  if (sum_item)
+  {
+    Item *arg= sum_item->get_arg(0);
+    if (arg->type() != Item::FIELD_ITEM)
+    {
+      uint left_field_index;
+      uint right_field_index;
+      if (pq_extract_worker_sum_product_arg(table, arg, &left_field_index,
+                                            &right_field_index))
+      {
+        target->aggregate_kind= Pq_count_target::PQ_AGGREGATE_SUM;
+        target->sum_item= sum_item;
+        target->has_field= false;
+        target->field_index= 0;
+        target->has_sum_product_fields= true;
+        target->sum_product_left_field_index= left_field_index;
+        target->sum_product_right_field_index= right_field_index;
+        target->aggregate_arg_on_leader= false;
+        target->aggregate_arg_field_indices.clear();
+        target->sum_decimal_result=
+          sum_item->result_type() == DECIMAL_RESULT;
+        return true;
+      }
+      if (!pq_extract_leader_aggregate_arg(
+            table, arg, &target->aggregate_arg_field_indices))
+        return false;
+      target->aggregate_kind= Pq_count_target::PQ_AGGREGATE_SUM;
+      target->sum_item= sum_item;
+      target->has_field= false;
+      target->field_index= 0;
+      target->has_sum_product_fields= false;
+      target->aggregate_arg_on_leader= true;
+      target->sum_decimal_result= sum_item->result_type() == DECIMAL_RESULT;
+      return true;
+    }
+
+    Item_field *field_item= static_cast<Item_field *>(arg);
+    if (field_item->field->table != table)
+      return false;
+    if (!pq_is_supported_sum_field(field_item->field))
+      return false;
+
+    target->aggregate_kind= Pq_count_target::PQ_AGGREGATE_SUM;
+    target->sum_item= sum_item;
+    target->has_field= true;
+    target->field_index= field_item->field->field_index;
+    target->has_sum_product_fields= false;
+    target->aggregate_arg_on_leader= false;
+    target->aggregate_arg_field_indices.clear();
+    target->sum_decimal_result= sum_item->result_type() == DECIMAL_RESULT;
+    return true;
+  }
+
+  Item_sum_avg *avg_item= pq_get_single_avg_item(join);
+  if (avg_item)
+  {
+    Item *arg= avg_item->get_arg(0);
+    if (arg->type() != Item::FIELD_ITEM)
+    {
+      if (!pq_extract_leader_aggregate_arg(
+            table, arg, &target->aggregate_arg_field_indices))
+        return false;
+      target->aggregate_kind= Pq_count_target::PQ_AGGREGATE_AVG;
+      target->sum_item= avg_item;
+      target->has_field= false;
+      target->field_index= 0;
+      target->has_sum_product_fields= false;
+      target->aggregate_arg_on_leader= true;
+      target->sum_decimal_result= avg_item->result_type() == DECIMAL_RESULT;
+      return true;
+    }
+
+    Item_field *field_item= static_cast<Item_field *>(arg);
+    if (field_item->field->table != table)
+      return false;
+    if (!pq_is_supported_sum_field(field_item->field))
+      return false;
+
+    target->aggregate_kind= Pq_count_target::PQ_AGGREGATE_AVG;
+    target->sum_item= avg_item;
+    target->has_field= true;
+    target->field_index= field_item->field->field_index;
+    target->has_sum_product_fields= false;
+    target->aggregate_arg_on_leader= false;
+    target->aggregate_arg_field_indices.clear();
+    target->sum_decimal_result= avg_item->result_type() == DECIMAL_RESULT;
+    return true;
+  }
+
+  Item_sum_min_max *minmax_item= pq_get_single_minmax_item(join);
+  if (!minmax_item)
+    return false;
+
+  Item *arg= minmax_item->get_arg(0);
+  if (arg->type() != Item::FIELD_ITEM)
+  {
+    if (!pq_extract_leader_aggregate_arg(
+          table, arg, &target->aggregate_arg_field_indices))
+      return false;
+    target->aggregate_kind=
+      minmax_item->sum_func() == Item_sum::MIN_FUNC ?
+      Pq_count_target::PQ_AGGREGATE_MIN : Pq_count_target::PQ_AGGREGATE_MAX;
+    target->sum_item= minmax_item;
+    target->has_field= false;
+    target->field_index= 0;
+    target->has_sum_product_fields= false;
+    target->aggregate_arg_on_leader= true;
+    target->sum_decimal_result= false;
+    return true;
+  }
+
+  Item_field *field_item= static_cast<Item_field *>(arg);
+  if (field_item->field->table != table)
+    return false;
+  if (!pq_is_supported_minmax_field(field_item->field))
+    return false;
+
+  target->aggregate_kind=
+    minmax_item->sum_func() == Item_sum::MIN_FUNC ?
+    Pq_count_target::PQ_AGGREGATE_MIN : Pq_count_target::PQ_AGGREGATE_MAX;
+  target->sum_item= minmax_item;
+  target->has_field= true;
+  target->field_index= field_item->field->field_index;
+  target->has_sum_product_fields= false;
+  target->aggregate_arg_on_leader= false;
+  target->aggregate_arg_field_indices.clear();
+  target->sum_decimal_result= false;
+  return true;
+}
+
+static bool pq_extract_leader_aggregate_arg(TABLE *table, Item *arg,
+                                            std::vector<uint> *fields)
+{
+  table_map allowed_tables= table->map;
+  fields->clear();
+  if (!arg->used_tables() ||
+      (arg->with_subquery() &&
+       table->in_use->tx_isolation != ISO_REPEATABLE_READ) ||
+      (arg->with_subquery() &&
+       !pq_item_has_only_cacheable_scalar_subquery_consts(table->in_use, arg,
+                                                          false)) ||
+      pq_item_has_unsupported_function(arg) ||
+      (arg->used_tables() & ~(allowed_tables | PARAM_TABLE_BIT)) ||
+      arg->walk(&Item::is_expensive_processor, 0, 0))
+    return false;
+
+  List<Item_field> item_fields;
+  if (arg->walk(&Item::collect_item_field_processor, &item_fields, 0))
+    return false;
+
+  List_iterator_fast<Item_field> field_it(item_fields);
+  Item_field *field_item;
+  while ((field_item= field_it++))
+  {
+    if (!pq_add_projection_field(table, field_item->field, fields))
+      return false;
+  }
+  return !fields->empty();
+}
+
+static bool pq_count_query_is_supported(JOIN *join)
+{
+  Pq_count_target target;
+  return pq_query_base_is_supported(join, true, true, true, true, true) &&
+         (join->thd->variables.pq_support_features_switch &
+          PQ_SUPPORT_FEATURES_SWITCH_SIMPLE_AGG) &&
+         pq_extract_count_target(join, &target) &&
+         pq_scalar_aggregate_order_is_supported(join, target) &&
+         pq_having_is_supported(join, target);
+}
+
+static bool pq_group_field_is_supported(Field *field);
+static bool pq_group_field_has_safe_raw_order(Field *field);
+
+static bool pq_extract_group_fields(JOIN *join, std::vector<uint> *fields)
+{
+  TABLE *table= join->join_tab[0].table;
+  fields->clear();
+  ORDER *group_list= join->group_list ? join->group_list :
+                     join->select_lex->group_list.first;
+  if (!group_list)
+    return false;
+
+  for (ORDER *group= group_list; group; group= group->next)
+  {
+    if (!group->item || !*group->item)
+      return false;
+    Item *item= (*group->item)->real_item();
+    if (item->type() != Item::FIELD_ITEM)
+      return false;
+    Item_field *field_item= static_cast<Item_field *>(item);
+    Field *field= field_item->field;
+    if (!pq_group_field_is_supported(field))
+      return false;
+    if (!pq_add_projection_field(table, field_item->field, fields))
+      return false;
+  }
+  return !fields->empty();
+}
+
+static bool pq_group_field_is_supported(Field *field)
+{
+  if (field->vcol_info)
+    return false;
+
+  switch (field->real_type())
+  {
+  case MYSQL_TYPE_TINY:
+  case MYSQL_TYPE_SHORT:
+  case MYSQL_TYPE_INT24:
+  case MYSQL_TYPE_LONG:
+  case MYSQL_TYPE_LONGLONG:
+  case MYSQL_TYPE_NEWDECIMAL:
+  case MYSQL_TYPE_DATE:
+  case MYSQL_TYPE_NEWDATE:
+  case MYSQL_TYPE_TIME:
+  case MYSQL_TYPE_TIME2:
+  case MYSQL_TYPE_DATETIME:
+  case MYSQL_TYPE_DATETIME2:
+    return true;
+  case MYSQL_TYPE_VARCHAR:
+  case MYSQL_TYPE_VAR_STRING:
+  case MYSQL_TYPE_STRING:
+    return field->charset() != NULL;
+  default:
+    return false;
+  }
+}
+
+static bool pq_group_field_has_safe_raw_order(Field *field)
+{
+  CHARSET_INFO *charset= field->charset();
+  if (!(charset->state & MY_CS_BINSORT))
+    return false;
+
+  switch (field->real_type())
+  {
+  case MYSQL_TYPE_VARCHAR:
+  case MYSQL_TYPE_VAR_STRING:
+    return charset->state & MY_CS_NOPAD;
+  case MYSQL_TYPE_STRING:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool pq_group_select_fields_match_group_order(
+            JOIN *join, const std::vector<uint> &group_fields)
+{
+  TABLE *table= join->join_tab[0].table;
+  size_t group_index= 0;
+  List_iterator_fast<Item> it(join->fields_list);
+  Item *item;
+  while ((item= it++))
+  {
+    if (item->type() == Item::SUM_FUNC_ITEM)
+      continue;
+    if (group_index >= group_fields.size())
+      return false;
+
+    Item *real_item= item->real_item();
+    if (real_item->type() != Item::FIELD_ITEM)
+      return false;
+
+    Item_field *field_item= static_cast<Item_field *>(real_item);
+    if (field_item->field != table->field[group_fields[group_index]])
+      return false;
+    group_index++;
+  }
+  return group_index == group_fields.size();
+}
+
+static bool pq_group_item_matches_group_field(
+            TABLE *table, Item *item, const std::vector<uint> &group_fields,
+            size_t *group_index)
+{
+  item= item->real_item();
+  if (item->type() != Item::FIELD_ITEM)
+    return false;
+  Item_field *field_item= static_cast<Item_field *>(item);
+  if (field_item->field->table != table)
+    return false;
+
+  for (size_t i= 0; i < group_fields.size(); i++)
+  {
+    if (field_item->field == table->field[group_fields[i]])
+    {
+      *group_index= i;
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool pq_group_item_matches_aggregate(
+            Item *item,
+            const std::vector<Pq_group_aggregate_target> &aggregate_targets,
+            size_t *aggregate_index)
+{
+  item= item->real_item();
+  if (item->type() != Item::SUM_FUNC_ITEM)
+    return false;
+
+  for (size_t i= 0; i < aggregate_targets.size(); i++)
+  {
+    if (!aggregate_targets[i].orderable)
+      continue;
+    if (item == aggregate_targets[i].sum_item)
+    {
+      switch (aggregate_targets[i].aggregate_kind)
+      {
+      case Pq_count_target::PQ_AGGREGATE_COUNT:
+      case Pq_count_target::PQ_AGGREGATE_COUNT_DISTINCT:
+      case Pq_count_target::PQ_AGGREGATE_SUM:
+      case Pq_count_target::PQ_AGGREGATE_AVG:
+        break;
+      case Pq_count_target::PQ_AGGREGATE_MIN:
+      case Pq_count_target::PQ_AGGREGATE_MAX:
+        if (!aggregate_targets[i].has_field ||
+            aggregate_targets[i].aggregate_arg_on_leader)
+          return false;
+        break;
+      default:
+        return false;
+      }
+      *aggregate_index= i;
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool pq_group_order_keys(JOIN *join,
+                                const std::vector<uint> &group_fields,
+                                const std::vector<Pq_group_aggregate_target>
+                                  &aggregate_targets,
+                                std::vector<Pq_group_order_key> *order_keys)
+{
+  TABLE *table= join->join_tab[0].table;
+  ORDER *order= join->select_lex->order_list.first ?
+                join->select_lex->order_list.first : join->order;
+  order_keys->clear();
+  if (!order)
+    return true;
+
+  std::vector<bool> seen_group_fields(group_fields.size(), false);
+  std::vector<bool> seen_aggregates(aggregate_targets.size(), false);
+  size_t next_group_index= 0;
+  bool saw_aggregate= false;
+  while (order)
+  {
+    if ((order->direction != ORDER::ORDER_ASC &&
+         order->direction != ORDER::ORDER_DESC) ||
+        !order->item || !*order->item)
+      return false;
+    Item *item= *order->item;
+    Pq_group_order_key key;
+    key.descending= order->direction == ORDER::ORDER_DESC;
+    size_t index= 0;
+    if (pq_group_item_matches_group_field(table, item, group_fields, &index))
+    {
+      if (!saw_aggregate && index != next_group_index)
+        return false;
+      if (seen_group_fields[index])
+        return false;
+      seen_group_fields[index]= true;
+      next_group_index= std::max(next_group_index, index + 1);
+      key.kind= Pq_group_order_key::GROUP_FIELD;
+      key.index= index;
+    }
+    else if (pq_group_item_matches_aggregate(item, aggregate_targets, &index))
+    {
+      if (seen_aggregates[index])
+        return false;
+      seen_aggregates[index]= true;
+      saw_aggregate= true;
+      key.kind= Pq_group_order_key::AGGREGATE;
+      key.index= index;
+    }
+    else
+      return false;
+    order_keys->push_back(key);
+    order= order->next;
+  }
+  return !order_keys->empty();
+}
+
+static bool pq_group_order_is_supported(JOIN *join,
+                                        const std::vector<uint> &group_fields,
+                                        const std::vector<Pq_group_aggregate_target>
+                                          &aggregate_targets)
+{
+  std::vector<Pq_group_order_key> order_keys;
+  return pq_group_order_keys(join, group_fields, aggregate_targets,
+                             &order_keys);
+}
+
+static int pq_compare_group_key_field(Field *field,
+                                      const std::vector<uchar> &left,
+                                      const std::vector<uchar> &right)
+{
+  switch (field->real_type())
+  {
+  case MYSQL_TYPE_VARCHAR:
+  case MYSQL_TYPE_VAR_STRING:
+  case MYSQL_TYPE_STRING:
+  {
+    size_t cmp_len= std::min(left.size(), right.size());
+    int cmp= cmp_len == 0 ? 0 : memcmp(left.data(), right.data(), cmp_len);
+    if (cmp != 0)
+      return cmp;
+    if (left.size() == right.size())
+      return 0;
+    return left.size() < right.size() ? -1 : 1;
+  }
+  default:
+    return field->cmp(left.data(), right.data());
+  }
+}
+
+static int pq_compare_group_key(TABLE *table,
+                                const std::vector<uint> &group_fields,
+                                const Pq_group_key &left,
+                                const Pq_group_key &right)
+{
+  if (left.values.size() != group_fields.size() ||
+      right.values.size() != group_fields.size() ||
+      left.sort_values.size() != group_fields.size() ||
+      right.sort_values.size() != group_fields.size() ||
+      left.null_values.size() != group_fields.size() ||
+      right.null_values.size() != group_fields.size())
+    return left.values.size() < right.values.size() ? -1 :
+           (left.values.size() == right.values.size() ? 0 : 1);
+
+  for (size_t i= 0; i < group_fields.size(); i++)
+  {
+    if (left.null_values[i] != right.null_values[i])
+      return left.null_values[i] ? -1 : 1;
+    if (left.null_values[i])
+      continue;
+
+    Field *field= table->field[group_fields[i]];
+    const std::vector<uchar> &left_value=
+      pq_field_is_string(field) ? left.sort_values[i] : left.values[i];
+    const std::vector<uchar> &right_value=
+      pq_field_is_string(field) ? right.sort_values[i] : right.values[i];
+    int cmp= pq_compare_group_key_field(field, left_value, right_value);
+    if (cmp != 0)
+      return cmp;
+  }
+  return 0;
+}
+
+static bool pq_group_aggregate_value_is_null(
+            const Pq_group_aggregate_target &target,
+            const Pq_group_aggregate_value &value)
+{
+  switch (target.aggregate_kind)
+  {
+  case Pq_count_target::PQ_AGGREGATE_COUNT:
+  case Pq_count_target::PQ_AGGREGATE_COUNT_DISTINCT:
+    return false;
+  case Pq_count_target::PQ_AGGREGATE_SUM:
+  case Pq_count_target::PQ_AGGREGATE_AVG:
+    return !value.has_sum_value || value.count == 0;
+  case Pq_count_target::PQ_AGGREGATE_MIN:
+  case Pq_count_target::PQ_AGGREGATE_MAX:
+    return !value.has_minmax_value;
+  default:
+    return true;
+  }
+}
+
+static int pq_compare_group_aggregate_value(
+            TABLE *table,
+            const Pq_group_aggregate_target &target,
+            const Pq_group_aggregate_value &left,
+            const Pq_group_aggregate_value &right)
+{
+  bool left_null= pq_group_aggregate_value_is_null(target, left);
+  bool right_null= pq_group_aggregate_value_is_null(target, right);
+  if (left_null != right_null)
+    return left_null ? -1 : 1;
+  if (left_null)
+    return 0;
+
+  switch (target.aggregate_kind)
+  {
+  case Pq_count_target::PQ_AGGREGATE_COUNT:
+  case Pq_count_target::PQ_AGGREGATE_COUNT_DISTINCT:
+    return left.count < right.count ? -1 : (left.count == right.count ? 0 : 1);
+  case Pq_count_target::PQ_AGGREGATE_SUM:
+  {
+    if (target.sum_decimal_result)
+      return my_decimal_cmp(&left.sum_decimal, &right.sum_decimal);
+    return left.sum_real < right.sum_real ? -1 :
+           (left.sum_real == right.sum_real ? 0 : 1);
+  }
+  case Pq_count_target::PQ_AGGREGATE_AVG:
+  {
+    if (target.sum_decimal_result)
+    {
+      my_decimal left_count;
+      my_decimal right_count;
+      my_decimal left_avg;
+      my_decimal right_avg;
+      Item_sum_avg *avg_item= static_cast<Item_sum_avg *>(target.sum_item);
+      int2my_decimal(E_DEC_FATAL_ERROR, left.count, false, &left_count);
+      int2my_decimal(E_DEC_FATAL_ERROR, right.count, false, &right_count);
+      my_decimal_div(E_DEC_FATAL_ERROR, &left_avg, &left.sum_decimal,
+                     &left_count, avg_item->prec_increment);
+      my_decimal_div(E_DEC_FATAL_ERROR, &right_avg, &right.sum_decimal,
+                     &right_count, avg_item->prec_increment);
+      return my_decimal_cmp(&left_avg, &right_avg);
+    }
+    double left_avg= left.sum_real / ulonglong2double(left.count);
+    double right_avg= right.sum_real / ulonglong2double(right.count);
+    return left_avg < right_avg ? -1 : (left_avg == right_avg ? 0 : 1);
+  }
+  case Pq_count_target::PQ_AGGREGATE_MIN:
+  case Pq_count_target::PQ_AGGREGATE_MAX:
+  {
+    if (!target.has_field || target.aggregate_arg_on_leader)
+      return 0;
+    Field *field= table->field[target.field_index];
+    return pq_compare_minmax_field(field, left.minmax_value.data(),
+                                   right.minmax_value.data());
+  }
+  default:
+    return 0;
+  }
+}
+
+static int pq_compare_ordered_group_by_key(
+            TABLE *table,
+            const std::vector<uint> &group_fields,
+            const std::vector<Pq_group_aggregate_target> &aggregate_targets,
+            const Pq_group_order_key &key,
+            const Pq_ordered_group &left,
+            const Pq_ordered_group &right)
+{
+  int cmp= 0;
+  if (key.kind == Pq_group_order_key::GROUP_FIELD)
+  {
+    const Pq_group_key &left_key= left.entry->first;
+    const Pq_group_key &right_key= right.entry->first;
+    if (key.index >= group_fields.size() ||
+        left_key.null_values.size() <= key.index ||
+        right_key.null_values.size() <= key.index ||
+        left_key.values.size() <= key.index ||
+        right_key.values.size() <= key.index ||
+        left_key.sort_values.size() <= key.index ||
+        right_key.sort_values.size() <= key.index)
+      return 0;
+    if (left_key.null_values[key.index] != right_key.null_values[key.index])
+      cmp= left_key.null_values[key.index] ? -1 : 1;
+    else if (!left_key.null_values[key.index])
+    {
+      Field *field= table->field[group_fields[key.index]];
+      const std::vector<uchar> &left_value=
+        pq_field_is_string(field) ? left_key.sort_values[key.index] :
+                                    left_key.values[key.index];
+      const std::vector<uchar> &right_value=
+        pq_field_is_string(field) ? right_key.sort_values[key.index] :
+                                    right_key.values[key.index];
+      cmp= pq_compare_group_key_field(field, left_value, right_value);
+    }
+  }
+  else
+  {
+    if (key.index >= left.evaluated_aggregates.size() ||
+        key.index >= right.evaluated_aggregates.size() ||
+        key.index >= aggregate_targets.size())
+      return 0;
+    const Pq_group_aggregate_target &target=
+      aggregate_targets[key.index];
+    cmp= pq_compare_group_aggregate_value(table, target,
+                                          left.evaluated_aggregates[key.index],
+                                          right.evaluated_aggregates[key.index]);
+  }
+  return key.descending ? -cmp : cmp;
+}
+
+static int pq_compare_ordered_group(
+            TABLE *table,
+            const std::vector<uint> &group_fields,
+            const std::vector<Pq_group_aggregate_target> &aggregate_targets,
+            const std::vector<Pq_group_order_key> &order_keys,
+            const Pq_ordered_group &left,
+            const Pq_ordered_group &right)
+{
+  for (const Pq_group_order_key &key : order_keys)
+  {
+    int cmp= pq_compare_ordered_group_by_key(table, group_fields,
+                                             aggregate_targets, key,
+                                             left, right);
+    if (cmp != 0)
+      return cmp;
+  }
+  return pq_compare_group_key(table, group_fields, left.entry->first,
+                              right.entry->first);
+}
+
+static int pq_compare_ordered_group_ties(
+            TABLE *table,
+            const std::vector<uint> &group_fields,
+            const std::vector<Pq_group_aggregate_target> &aggregate_targets,
+            const std::vector<Pq_group_order_key> &order_keys,
+            const Pq_ordered_group &left,
+            const Pq_ordered_group &right)
+{
+  if (order_keys.empty())
+    return pq_compare_group_key(table, group_fields, left.entry->first,
+                                right.entry->first);
+
+  for (const Pq_group_order_key &key : order_keys)
+  {
+    int cmp= pq_compare_ordered_group_by_key(table, group_fields,
+                                             aggregate_targets, key,
+                                             left, right);
+    if (cmp != 0)
+      return cmp;
+  }
+  return 0;
+}
+
+static bool pq_group_having_item_matches_target(
+            Item *item, const std::vector<Pq_group_aggregate_target> &targets)
+{
+  item= item->real_item();
+  for (const Pq_group_aggregate_target &target : targets)
+  {
+    if (item == target.sum_item)
+      return true;
+  }
+  return false;
+}
+
+static bool pq_group_having_item_matches_group_field(
+            TABLE *table, Item *item, const std::vector<uint> &group_fields)
+{
+  item= item->real_item();
+  if (item->type() != Item::FIELD_ITEM)
+    return false;
+
+  Item_field *field_item= static_cast<Item_field *>(item);
+  if (field_item->field->table != table)
+    return false;
+
+  for (uint field_index : group_fields)
+  {
+    if (field_item->field == table->field[field_index])
+      return true;
+  }
+  return false;
+}
+
+static bool pq_group_having_item_is_supported(
+            THD *thd,
+            TABLE *table,
+            Item *item,
+            const std::vector<uint> &group_fields,
+            const std::vector<Pq_group_aggregate_target> &targets)
+{
+  Item *real_item= item->real_item();
+  if ((real_item->type() == Item::SUBSELECT_ITEM ||
+       real_item->type() == Item::EXPR_CACHE_ITEM) &&
+      pq_item_has_only_cacheable_scalar_subquery_consts(thd, real_item, true))
+    return true;
+  if (pq_group_having_item_matches_target(real_item, targets) ||
+      pq_group_having_item_matches_group_field(table, real_item, group_fields) ||
+      real_item->const_item())
+    return true;
+  if (real_item->type() != Item::FUNC_ITEM &&
+      real_item->type() != Item::COND_ITEM)
+    return false;
+
+  Item_func *func= static_cast<Item_func *>(real_item);
+  switch (func->functype())
+  {
+  case Item_func::EQ_FUNC:
+  case Item_func::EQUAL_FUNC:
+  case Item_func::NE_FUNC:
+  case Item_func::LT_FUNC:
+  case Item_func::LE_FUNC:
+  case Item_func::GE_FUNC:
+  case Item_func::GT_FUNC:
+  case Item_func::ISNULL_FUNC:
+  case Item_func::ISNOTNULL_FUNC:
+  case Item_func::COND_AND_FUNC:
+  case Item_func::COND_OR_FUNC:
+    break;
+  default:
+    return false;
+  }
+
+  Item **args= func->arguments();
+  for (uint i= 0; i < func->argument_count(); i++)
+  {
+    if (!pq_group_having_item_is_supported(thd, table, args[i], group_fields,
+                                           targets))
+      return false;
+  }
+  return true;
+}
+
+static bool pq_group_having_is_supported(
+            JOIN *join,
+            const std::vector<uint> &group_fields,
+            const std::vector<Pq_group_aggregate_target> &targets)
+{
+  Item *having= join->having ? join->having : join->tmp_having;
+  if (!having)
+    return !join->select_lex->having;
+
+  THD *thd= join->thd;
+  if ((having->with_subquery() &&
+       !pq_item_has_only_cacheable_scalar_subquery_consts(thd, having,
+                                                          true)) ||
+      pq_item_has_unsupported_function(having) ||
+      having->walk(&Item::is_expensive_processor, 0, 0))
+    return false;
+
+  TABLE *table= join->join_tab[0].table;
+  return pq_group_having_item_is_supported(thd, table, having, group_fields,
+                                           targets);
+}
+
+static bool pq_group_query_is_supported(JOIN *join);
+static bool pq_extract_group_aggregate_targets(
+            JOIN *join, std::vector<Pq_group_aggregate_target> *targets);
+
+static bool pq_group_explain_query_is_supported(JOIN *join)
+{
+  std::vector<uint> group_fields;
+  std::vector<Pq_group_aggregate_target> aggregate_targets;
+  return pq_group_query_is_supported(join) &&
+         pq_extract_group_fields(join, &group_fields) &&
+         pq_group_select_fields_match_group_order(join, group_fields) &&
+         pq_extract_group_aggregate_targets(join, &aggregate_targets) &&
+         pq_group_order_is_supported(join, group_fields, aggregate_targets) &&
+         pq_group_having_is_supported(join, group_fields, aggregate_targets);
+}
+
+static bool pq_extract_group_aggregate_targets(
+            JOIN *join, std::vector<Pq_group_aggregate_target> *targets)
+{
+  TABLE *table= join->join_tab[0].table;
+  targets->clear();
+
+  auto target_exists=
+    [](const std::vector<Pq_group_aggregate_target> &targets,
+       Item_sum *sum_item) -> bool
+    {
+      for (const Pq_group_aggregate_target &target : targets)
+      {
+        if (target.sum_item == sum_item)
+          return true;
+      }
+      return false;
+    };
+
+  auto having_references_sum=
+    [join](Item_sum *sum_item) -> bool
+    {
+      Item *having= join->having ? join->having : join->tmp_having;
+      if (!having)
+        return false;
+      return having->walk(&Item::find_item_processor, sum_item, 0);
+    };
+
+  auto order_references_sum=
+    [join](Item_sum *sum_item) -> bool
+    {
+      ORDER *order= join->select_lex->order_list.first ?
+                    join->select_lex->order_list.first : join->order;
+      for (; order; order= order->next)
+      {
+        if (order->item && *order->item &&
+            (*order->item)->walk(&Item::find_item_processor, sum_item, 0))
+          return true;
+      }
+      return false;
+    };
+
+  auto extract_target=
+    [join, table](Item_sum *sum_item, bool orderable,
+                  Pq_group_aggregate_target *target) -> bool
+    {
+      if (sum_item->get_arg_count() != 1)
+        return false;
+
+      target->sum_item= sum_item;
+      target->orderable= orderable;
+      target->has_field= false;
+      target->field_index= 0;
+      target->aggregate_arg_on_leader= false;
+      target->aggregate_arg_field_indices.clear();
+      target->sum_decimal_result= false;
+      target->worker_expr_kind= PQ_GROUP_WORKER_EXPR_NONE;
+      target->worker_expr_price_field_index= 0;
+      target->worker_expr_discount_field_index= 0;
+      target->worker_expr_tax_field_index= 0;
+
+      switch (sum_item->sum_func())
+      {
+      case Item_sum::COUNT_DISTINCT_FUNC:
+      {
+        if (!orderable ||
+            !sum_item->has_with_distinct() ||
+            !(join->thd->variables.pq_support_features_switch &
+              PQ_SUPPORT_FEATURES_SWITCH_COUNT_DISTINCT))
+          return false;
+        Item *arg= static_cast<Item_sum_count *>(sum_item)->get_arg(0);
+        target->aggregate_kind= Pq_count_target::PQ_AGGREGATE_COUNT_DISTINCT;
+        target->aggregate_arg_on_leader= true;
+        if (arg->type() != Item::FIELD_ITEM)
+        {
+          if (!pq_extract_leader_aggregate_arg(
+                table, arg, &target->aggregate_arg_field_indices) ||
+              !pq_count_distinct_expr_result_is_supported(arg) ||
+              !pq_count_distinct_expr_fields_are_supported(
+                table, target->aggregate_arg_field_indices))
+            return false;
+        }
+        else
+        {
+          Item_field *field_item= static_cast<Item_field *>(arg);
+          if (field_item->field->table != table ||
+              !pq_is_supported_count_distinct_field(field_item->field))
+            return false;
+          target->has_field= true;
+          target->field_index= field_item->field->field_index;
+          target->aggregate_arg_field_indices.push_back(target->field_index);
+        }
+        break;
+      }
+      case Item_sum::COUNT_FUNC:
+      {
+        if (sum_item->has_with_distinct())
+          return false;
+        Item *arg= static_cast<Item_sum_count *>(sum_item)->get_arg(0);
+        target->aggregate_kind= Pq_count_target::PQ_AGGREGATE_COUNT;
+        if (arg->type() == Item::FIELD_ITEM)
+        {
+          Item_field *field_item= static_cast<Item_field *>(arg);
+          if (field_item->field->table != table ||
+              field_item->field->vcol_info)
+            return false;
+          target->has_field= true;
+          target->field_index= field_item->field->field_index;
+        }
+        else
+        {
+          if (!orderable)
+          {
+            if (arg->type() != Item::CONST_ITEM ||
+                arg->result_type() != INT_RESULT ||
+                arg->used_tables() || arg->is_null())
+              return false;
+          }
+          else if (arg->used_tables())
+          {
+            if (!pq_extract_leader_aggregate_arg(
+                  table, arg, &target->aggregate_arg_field_indices))
+              return false;
+            target->aggregate_arg_on_leader= true;
+          }
+          else if (arg->is_null())
+            return false;
+        }
+        break;
+      }
+      case Item_sum::SUM_FUNC:
+      case Item_sum::AVG_FUNC:
+      {
+        if (sum_item->has_with_distinct())
+          return false;
+        Item *arg= static_cast<Item_sum_sum *>(sum_item)->get_arg(0);
+        if (arg->type() != Item::FIELD_ITEM)
+        {
+          Pq_group_worker_expr_kind worker_expr_kind;
+          uint price_field_index;
+          uint discount_field_index;
+          uint tax_field_index;
+          if (sum_item->sum_func() == Item_sum::SUM_FUNC &&
+              sum_item->result_type() == DECIMAL_RESULT &&
+              pq_extract_q1_worker_sum_expr(table, arg, &worker_expr_kind,
+                                            &price_field_index,
+                                            &discount_field_index,
+                                            &tax_field_index))
+          {
+            target->aggregate_kind= Pq_count_target::PQ_AGGREGATE_SUM;
+            target->has_field= false;
+            target->field_index= 0;
+            target->aggregate_arg_on_leader= false;
+            target->aggregate_arg_field_indices.clear();
+            target->aggregate_arg_field_indices.push_back(price_field_index);
+            target->aggregate_arg_field_indices.push_back(discount_field_index);
+            if (worker_expr_kind ==
+                PQ_GROUP_WORKER_EXPR_PRICE_DISCOUNT_TAX)
+              target->aggregate_arg_field_indices.push_back(tax_field_index);
+            target->sum_decimal_result= true;
+            target->worker_expr_kind= worker_expr_kind;
+            target->worker_expr_price_field_index= price_field_index;
+            target->worker_expr_discount_field_index= discount_field_index;
+            target->worker_expr_tax_field_index= tax_field_index;
+            break;
+          }
+          if (!orderable && sum_item->sum_func() != Item_sum::SUM_FUNC)
+            return false;
+          std::vector<uint> arg_fields;
+          if (!pq_extract_leader_aggregate_arg(
+                table, arg, &arg_fields))
+            return false;
+          if (sum_item->sum_func() == Item_sum::SUM_FUNC &&
+              sum_item->result_type() == DECIMAL_RESULT &&
+              pq_extract_q1_worker_sum_expr_by_fields(
+                table, arg_fields, &worker_expr_kind, &price_field_index,
+                &discount_field_index, &tax_field_index))
+          {
+            target->aggregate_kind= Pq_count_target::PQ_AGGREGATE_SUM;
+            target->has_field= false;
+            target->field_index= 0;
+            target->aggregate_arg_on_leader= false;
+            target->aggregate_arg_field_indices= arg_fields;
+            target->sum_decimal_result= true;
+            target->worker_expr_kind= worker_expr_kind;
+            target->worker_expr_price_field_index= price_field_index;
+            target->worker_expr_discount_field_index= discount_field_index;
+            target->worker_expr_tax_field_index= tax_field_index;
+            break;
+          }
+          target->aggregate_kind= sum_item->sum_func() == Item_sum::SUM_FUNC ?
+            Pq_count_target::PQ_AGGREGATE_SUM :
+            Pq_count_target::PQ_AGGREGATE_AVG;
+          target->aggregate_arg_on_leader= true;
+          target->aggregate_arg_field_indices= arg_fields;
+          target->sum_decimal_result= sum_item->result_type() == DECIMAL_RESULT;
+          break;
+        }
+        Item_field *field_item= static_cast<Item_field *>(arg);
+        if (field_item->field->table != table ||
+            !pq_is_supported_sum_field(field_item->field))
+          return false;
+        target->aggregate_kind= sum_item->sum_func() == Item_sum::SUM_FUNC ?
+          Pq_count_target::PQ_AGGREGATE_SUM :
+          Pq_count_target::PQ_AGGREGATE_AVG;
+        target->has_field= true;
+        target->field_index= field_item->field->field_index;
+        target->aggregate_arg_on_leader= false;
+        target->aggregate_arg_field_indices.clear();
+        target->sum_decimal_result= sum_item->result_type() == DECIMAL_RESULT;
+        break;
+      }
+      case Item_sum::MIN_FUNC:
+      case Item_sum::MAX_FUNC:
+      {
+        if (sum_item->has_with_distinct())
+          return false;
+        Item *arg= static_cast<Item_sum_min_max *>(sum_item)->get_arg(0);
+        if (arg->type() != Item::FIELD_ITEM)
+        {
+          if (!orderable)
+            return false;
+          if (!pq_extract_leader_aggregate_arg(
+                table, arg, &target->aggregate_arg_field_indices))
+            return false;
+          target->aggregate_kind= sum_item->sum_func() == Item_sum::MIN_FUNC ?
+            Pq_count_target::PQ_AGGREGATE_MIN :
+            Pq_count_target::PQ_AGGREGATE_MAX;
+          target->aggregate_arg_on_leader= true;
+          break;
+        }
+        Item_field *field_item= static_cast<Item_field *>(arg);
+        if (field_item->field->table != table ||
+            !pq_is_supported_minmax_field(field_item->field))
+          return false;
+        target->aggregate_kind= sum_item->sum_func() == Item_sum::MIN_FUNC ?
+          Pq_count_target::PQ_AGGREGATE_MIN :
+          Pq_count_target::PQ_AGGREGATE_MAX;
+        target->has_field= true;
+        target->field_index= field_item->field->field_index;
+        target->aggregate_arg_on_leader= false;
+        target->aggregate_arg_field_indices.clear();
+        target->sum_decimal_result= false;
+        break;
+      }
+      default:
+        return false;
+      }
+      return true;
+    };
+
+  List_iterator_fast<Item> it(join->fields_list);
+  Item *item;
+  while ((item= it++))
+  {
+    item= item->real_item();
+    if (item->type() != Item::SUM_FUNC_ITEM)
+      continue;
+
+    Item_sum *sum_item= static_cast<Item_sum *>(item);
+    Pq_group_aggregate_target target;
+    if (!extract_target(sum_item, true, &target))
+      return false;
+    targets->push_back(target);
+  }
+
+  List_iterator_fast<Item> all_it(join->all_fields);
+  while ((item= all_it++))
+  {
+    item= item->real_item();
+    if (item->type() != Item::SUM_FUNC_ITEM)
+      continue;
+
+    Item_sum *sum_item= static_cast<Item_sum *>(item);
+    bool orderable= order_references_sum(sum_item);
+    if (target_exists(*targets, sum_item) ||
+        (!orderable && !having_references_sum(sum_item)))
+      continue;
+
+    Pq_group_aggregate_target target;
+    if (extract_target(sum_item, orderable, &target))
+      targets->push_back(target);
+  }
+
+  return !targets->empty();
+}
+
+static bool pq_group_query_is_supported(JOIN *join)
+{
+  THD *thd= join->thd;
+
+  if (pq_query_block_is_nested(join))
+    return false;
+  if (pq_statement_is_prepare_sp_or_trigger(join))
+    return false;
+  if (pq_statement_is_write_select(join))
+    return false;
+  if (join->select_options & OPTION_BUFFER_RESULT)
+    return false;
+  if (pq_join_has_result_interceptor(join))
+    return false;
+
+  if (join->table_count != 1 ||
+      join->const_tables != 0 ||
+      (!join->group && !join->group_list &&
+       !join->select_lex->group_list.first) ||
+      join->procedure ||
+      join->select_distinct ||
+      join->select_lex->have_window_funcs() ||
+      join->select_lex->master_unit()->is_unit_op())
+    return false;
+  if (join->unit->lim.is_with_ties() &&
+      (join->unit->lim.get_offset_limit() != 0 ||
+       !pq_query_has_explicit_order_by(join)))
+    return false;
+  if (join->unit->lim.get_offset_limit() != 0 &&
+      (!pq_query_has_explicit_order_by(join) ||
+       join->unit->lim.get_offset_limit() >=
+       thd->variables.op_over_pq_offset_threshold))
+    return false;
+  if (join->select_lex->olap == ROLLUP_TYPE ||
+      join->rollup.state != ROLLUP::STATE_NONE)
+    return false;
+  if (!thd->variables.parallel_limit_no_order_by &&
+      join->unit->lim.get_select_limit() != HA_POS_ERROR &&
+      !pq_query_has_explicit_order_by(join))
+    return false;
+
+  if (!join->tables_list || !join->join_tab || !join->join_tab[0].table)
+    return false;
+
+  TABLE *table= join->join_tab[0].table;
+  if (!pq_table_is_supported_innodb(table) ||
+      !pq_partition_table_allowed_for_join(join, table))
+    return false;
+  if (pq_table_is_session_temporary(table))
+    return false;
+  if (!pq_table_has_supported_split_key(table))
+    return false;
+
+  if (join->select_lex->select_lock != st_select_lex::NONE ||
+      (thd->tx_isolation != ISO_REPEATABLE_READ &&
+       thd->tx_isolation != ISO_READ_COMMITTED))
+    return false;
+  if (pq_session_has_unsupported_sql_mode(thd))
+    return false;
+  if (pq_session_has_locked_tables(thd))
+    return false;
+  if (thd->in_multi_stmt_transaction_mode())
+    return false;
+
+  TABLE_LIST *table_list= table->pos_in_table_list;
+  if (!pq_master_enable)
+    return false;
+  if (!optimizer_flag(thd, OPTIMIZER_SWITCH_PARALLEL_QUERY))
+    return false;
+  if (!(thd->variables.pq_support_features_switch &
+        PQ_SUPPORT_FEATURES_SWITCH_SIMPLE_AGG))
+    return false;
+  if (thd->no_pq)
+    return false;
+
+  const hint_state pq_hint= hint_table_state(thd, table_list, PQ_HINT_ENUM);
+  if (pq_hint == hint_state::DISABLED)
+    return false;
+  if (!thd->variables.force_parallel_execute &&
+      pq_hint != hint_state::ENABLED &&
+      !pq_auto_rbo_admits(join))
+    return false;
+  if (pq_worker_dop(thd, table_list) < 2)
+    return false;
+
+  return true;
+}
+
+static bool pq_extract_field_const_predicate(
+            THD *thd, JOIN *join, Item *field_item_arg, Item *const_item_arg,
+            Item_func *func, Pq_count_predicate::Pq_predicate_op op,
+            Pq_count_predicate *predicate, bool evaluate_values= true)
+{
+  if (field_item_arg->type() != Item::FIELD_ITEM)
+    return false;
+
+  Item_field *field_item= static_cast<Item_field *>(field_item_arg);
+  Field *field= field_item->field;
+  if (field->table != join->join_tab[0].table || field->vcol_info)
+    return false;
+  predicate->predicate_op= op;
+  predicate->predicate_datetime_binary_valid= false;
+  predicate->predicate_datetime_binary_value.clear();
+  predicate->predicate_decimal_binary_valid= false;
+  predicate->predicate_decimal_binary_value.clear();
+
+  switch (field->real_type())
+  {
+  case MYSQL_TYPE_DATE:
+  case MYSQL_TYPE_NEWDATE:
+  case MYSQL_TYPE_DATETIME:
+  case MYSQL_TYPE_DATETIME2:
+    if (op == Pq_count_predicate::PQ_PREDICATE_LIKE)
+      return false;
+    if (op == Pq_count_predicate::PQ_PREDICATE_NOT_LIKE)
+      return false;
+    predicate->predicate_type= Pq_count_predicate::PQ_PREDICATE_DATETIME;
+    predicate->predicate_gt_value= evaluate_values ?
+      const_item_arg->val_datetime_packed(thd) : 0;
+    predicate->predicate_unsigned_value= 0;
+    predicate->predicate_real_value= 0.0;
+    if (evaluate_values &&
+        (field->real_type() == MYSQL_TYPE_DATE ||
+         field->real_type() == MYSQL_TYPE_NEWDATE))
+    {
+      MYSQL_TIME ltime;
+      unpack_time(predicate->predicate_gt_value, &ltime,
+                  MYSQL_TIMESTAMP_DATETIME);
+      if (!ltime.hour && !ltime.minute && !ltime.second &&
+          !ltime.second_part)
+      {
+        uint date_value= ltime.year * 16 * 32 + ltime.month * 32 + ltime.day;
+        predicate->predicate_datetime_binary_value.assign(4, 0);
+        int3store(predicate->predicate_datetime_binary_value.data(),
+                  date_value);
+        predicate->predicate_datetime_binary_valid= true;
+      }
+    }
+    break;
+  case MYSQL_TYPE_TIME:
+  case MYSQL_TYPE_TIME2:
+    if (op == Pq_count_predicate::PQ_PREDICATE_LIKE)
+      return false;
+    if (op == Pq_count_predicate::PQ_PREDICATE_NOT_LIKE)
+      return false;
+    predicate->predicate_type= Pq_count_predicate::PQ_PREDICATE_TIME;
+    predicate->predicate_gt_value= evaluate_values ?
+      const_item_arg->val_time_packed(thd) : 0;
+    predicate->predicate_unsigned_value= 0;
+    predicate->predicate_real_value= 0.0;
+    break;
+  case MYSQL_TYPE_TIMESTAMP:
+  case MYSQL_TYPE_TIMESTAMP2:
+    return false;
+  case MYSQL_TYPE_TINY:
+  case MYSQL_TYPE_SHORT:
+  case MYSQL_TYPE_INT24:
+  case MYSQL_TYPE_LONG:
+  case MYSQL_TYPE_LONGLONG:
+    if (op == Pq_count_predicate::PQ_PREDICATE_LIKE)
+      return false;
+    if (op == Pq_count_predicate::PQ_PREDICATE_NOT_LIKE)
+      return false;
+    if (field->is_unsigned())
+    {
+      longlong signed_value= evaluate_values ? const_item_arg->val_int() : 0;
+      if (evaluate_values && signed_value < 0 && !const_item_arg->unsigned_flag)
+        return false;
+      predicate->predicate_type= Pq_count_predicate::PQ_PREDICATE_UNSIGNED_INT;
+      predicate->predicate_gt_value= 0;
+      predicate->predicate_unsigned_value= evaluate_values ?
+        const_item_arg->val_uint() : 0;
+      predicate->predicate_real_value= 0.0;
+    }
+    else
+    {
+      predicate->predicate_type= Pq_count_predicate::PQ_PREDICATE_SIGNED_INT;
+      predicate->predicate_gt_value= evaluate_values ?
+        const_item_arg->val_int() : 0;
+      predicate->predicate_unsigned_value= 0;
+      predicate->predicate_real_value= 0.0;
+    }
+    break;
+  case MYSQL_TYPE_FLOAT:
+  case MYSQL_TYPE_DOUBLE:
+    if (op == Pq_count_predicate::PQ_PREDICATE_LIKE)
+      return false;
+    if (op == Pq_count_predicate::PQ_PREDICATE_NOT_LIKE)
+      return false;
+    predicate->predicate_type= Pq_count_predicate::PQ_PREDICATE_REAL;
+    predicate->predicate_gt_value= 0;
+    predicate->predicate_unsigned_value= 0;
+    predicate->predicate_real_value= evaluate_values ?
+      const_item_arg->val_real() : 0.0;
+    break;
+  case MYSQL_TYPE_NEWDECIMAL:
+  {
+    if (op == Pq_count_predicate::PQ_PREDICATE_LIKE)
+      return false;
+    if (op == Pq_count_predicate::PQ_PREDICATE_NOT_LIKE)
+      return false;
+    predicate->predicate_type= Pq_count_predicate::PQ_PREDICATE_DECIMAL;
+    predicate->predicate_gt_value= 0;
+    predicate->predicate_unsigned_value= 0;
+    predicate->predicate_real_value= 0.0;
+    my_decimal_set_zero(&predicate->predicate_decimal_value);
+    if (evaluate_values)
+    {
+      Item_result const_type= const_item_arg->cmp_type();
+      if (const_type != DECIMAL_RESULT && const_type != INT_RESULT)
+        return false;
+      my_decimal decimal_value;
+      my_decimal *const_value= const_item_arg->val_decimal(&decimal_value);
+      if (!const_value || const_item_arg->null_value)
+        return false;
+      my_decimal2decimal(const_value, &predicate->predicate_decimal_value);
+      Field_new_decimal *decimal_field=
+        static_cast<Field_new_decimal *>(field);
+      if (const_value->frac <= (int) decimal_field->decimals() &&
+          const_value->precision() <= decimal_field->precision)
+      {
+        predicate->predicate_decimal_binary_value.resize(
+          decimal_field->bin_size);
+        int native_error= predicate->predicate_decimal_value.to_binary(
+          predicate->predicate_decimal_binary_value.data(),
+          decimal_field->precision, decimal_field->decimals());
+        if (!native_error)
+          predicate->predicate_decimal_binary_valid= true;
+        else
+          predicate->predicate_decimal_binary_value.clear();
+      }
+    }
+    break;
+  }
+  case MYSQL_TYPE_VARCHAR:
+  case MYSQL_TYPE_VAR_STRING:
+  case MYSQL_TYPE_STRING:
+  {
+    if (func->functype() == Item_func::EQUAL_FUNC)
+      return false;
+    CHARSET_INFO *predicate_charset= field->charset();
+    int predicate_escape= '\\';
+    if (func->functype() == Item_func::LIKE_FUNC)
+    {
+      Item_func_like *like_func= static_cast<Item_func_like *>(func);
+      predicate_charset= like_func->compare_collation();
+      predicate_escape= like_func->escape;
+    }
+    String tmp;
+    String converted;
+    uint conversion_errors= 0;
+    predicate->predicate_type= Pq_count_predicate::PQ_PREDICATE_STRING;
+    predicate->predicate_gt_value= 0;
+    predicate->predicate_unsigned_value= 0;
+    predicate->predicate_real_value= 0.0;
+    predicate->predicate_escape= predicate_escape;
+    predicate->predicate_charset= predicate_charset;
+    predicate->predicate_string_value.clear();
+    if (evaluate_values)
+    {
+      String *const_value= const_item_arg->val_str(&tmp);
+      if (!const_value || const_item_arg->null_value ||
+          converted.copy(const_value, predicate_charset,
+                         &conversion_errors) ||
+          conversion_errors)
+        return false;
+      if (converted.length())
+        predicate->predicate_string_value.assign(converted.ptr(),
+                                                 converted.ptr() +
+                                                 converted.length());
+    }
+    break;
+  }
+  default:
+    return false;
+  }
+
+  predicate->field_index= field->field_index;
+  return !evaluate_values || (!thd->is_error() && !const_item_arg->null_value);
+}
+
+static bool pq_item_is_cacheable_scalar_subquery_const(THD *thd, Item *item,
+                                                       bool evaluate_values)
+{
+  if ((evaluate_values && thd->lex->describe) ||
+      thd->tx_isolation != ISO_REPEATABLE_READ)
+    return false;
+
+  item= item->real_item();
+  if (!item || item->type() != Item::SUBSELECT_ITEM)
+    return false;
+
+  Item_subselect *subselect= static_cast<Item_subselect *>(item);
+  st_select_lex *select_lex= subselect->get_select_lex();
+  st_select_lex_unit *unit= select_lex ? select_lex->master_unit() : NULL;
+  if (!unit)
+    return false;
+
+  if (subselect->substype() != Item_subselect::SINGLEROW_SUBS ||
+      subselect->cols() != 1 ||
+      subselect->with_recursive_reference ||
+      unit->is_unit_op() ||
+      unit->uncacheable != 0 ||
+      subselect->is_uncacheable() ||
+      !subselect->upper_refs.is_empty() ||
+      select_lex->is_correlated ||
+      subselect->is_correlated ||
+      (select_lex->uncacheable & UNCACHEABLE_DEPENDENT) ||
+      (unit->uncacheable & UNCACHEABLE_DEPENDENT))
+    return false;
+
+  if (!evaluate_values)
+    return true;
+
+  if (!subselect->is_evaluated() && subselect->exec())
+    return false;
+
+  return !thd->is_error() && subselect->assigned();
+}
+
+static bool pq_item_has_only_cacheable_scalar_subquery_consts(
+  THD *thd, Item *item, bool evaluate_values)
+{
+  if (!item)
+    return false;
+
+  Item *real_item= item->real_item();
+  if (!real_item)
+    return false;
+  if (!item->with_subquery() &&
+      real_item->type() != Item::SUBSELECT_ITEM &&
+      real_item->type() != Item::EXPR_CACHE_ITEM)
+    return true;
+
+  item= real_item;
+
+  if (item->type() == Item::SUBSELECT_ITEM)
+    return pq_item_is_cacheable_scalar_subquery_const(thd, item,
+                                                      evaluate_values);
+
+  if (item->type() == Item::EXPR_CACHE_ITEM)
+  {
+    Item_cache_wrapper *cache_wrapper= static_cast<Item_cache_wrapper *>(item);
+    return pq_item_has_only_cacheable_scalar_subquery_consts(
+      thd, cache_wrapper->get_orig_item(), evaluate_values);
+  }
+
+  if (item->type() != Item::FUNC_ITEM &&
+      item->type() != Item::COND_ITEM)
+    return !item->with_subquery();
+
+  Item_func *func= static_cast<Item_func *>(item);
+  Item **args= func->arguments();
+  for (uint i= 0; i < func->argument_count(); i++)
+  {
+    if (!pq_item_has_only_cacheable_scalar_subquery_consts(
+          thd, args[i], evaluate_values))
+      return false;
+  }
+  return true;
+}
+
+static bool pq_item_is_leader_const(THD *thd, Item *item,
+                                    bool evaluate_values)
+{
+  if (item->with_subquery())
+    return pq_item_is_cacheable_scalar_subquery_const(thd, item,
+                                                      evaluate_values);
+  return item->const_item();
+}
+
+static bool pq_extract_simple_predicate(THD *thd, JOIN *join, Item *condition,
+                                        Pq_count_predicate *predicate,
+                                        bool evaluate_values= true)
+{
+  if (!condition || condition->type() != Item::FUNC_ITEM)
+    return false;
+
+  Item_func *func= static_cast<Item_func *>(condition);
+  Pq_count_predicate::Pq_predicate_op op;
+  switch (func->functype())
+  {
+  case Item_func::EQ_FUNC:
+  case Item_func::EQUAL_FUNC:
+    op= Pq_count_predicate::PQ_PREDICATE_EQ;
+    break;
+  case Item_func::NE_FUNC:
+    op= Pq_count_predicate::PQ_PREDICATE_NE;
+    break;
+  case Item_func::LT_FUNC:
+    op= Pq_count_predicate::PQ_PREDICATE_LT;
+    break;
+  case Item_func::LE_FUNC:
+    op= Pq_count_predicate::PQ_PREDICATE_LE;
+    break;
+  case Item_func::GE_FUNC:
+    op= Pq_count_predicate::PQ_PREDICATE_GE;
+    break;
+  case Item_func::GT_FUNC:
+    op= Pq_count_predicate::PQ_PREDICATE_GT;
+    break;
+  case Item_func::LIKE_FUNC:
+    op= Pq_count_predicate::PQ_PREDICATE_LIKE;
+    break;
+  case Item_func::ISNULL_FUNC:
+    op= Pq_count_predicate::PQ_PREDICATE_IS_NULL;
+    break;
+  case Item_func::ISNOTNULL_FUNC:
+    op= Pq_count_predicate::PQ_PREDICATE_IS_NOT_NULL;
+    break;
+  default:
+    return false;
+  }
+
+  Item **args= func->arguments();
+  uint field_arg= 0;
+  uint const_arg= 1;
+  if (op == Pq_count_predicate::PQ_PREDICATE_IS_NULL ||
+      op == Pq_count_predicate::PQ_PREDICATE_IS_NOT_NULL)
+  {
+    if (args[0]->type() != Item::FIELD_ITEM)
+      return false;
+  }
+  else
+  {
+    if (func->functype() == Item_func::LIKE_FUNC)
+    {
+      Item_func_like *like_func= static_cast<Item_func_like *>(func);
+      if (args[0]->type() != Item::FIELD_ITEM ||
+          !pq_item_is_leader_const(thd, args[1], evaluate_values))
+        return false;
+      if (like_func->negated)
+        op= Pq_count_predicate::PQ_PREDICATE_NOT_LIKE;
+    }
+    if (args[0]->type() != Item::FIELD_ITEM)
+    {
+      if (args[1]->type() != Item::FIELD_ITEM ||
+          !pq_item_is_leader_const(thd, args[0], evaluate_values))
+        return false;
+      field_arg= 1;
+      const_arg= 0;
+      switch (op)
+      {
+      case Pq_count_predicate::PQ_PREDICATE_LT:
+        op= Pq_count_predicate::PQ_PREDICATE_GT;
+        break;
+      case Pq_count_predicate::PQ_PREDICATE_LE:
+        op= Pq_count_predicate::PQ_PREDICATE_GE;
+        break;
+      case Pq_count_predicate::PQ_PREDICATE_GE:
+        op= Pq_count_predicate::PQ_PREDICATE_LE;
+        break;
+      case Pq_count_predicate::PQ_PREDICATE_GT:
+        op= Pq_count_predicate::PQ_PREDICATE_LT;
+        break;
+      case Pq_count_predicate::PQ_PREDICATE_EQ:
+      case Pq_count_predicate::PQ_PREDICATE_NE:
+        break;
+      case Pq_count_predicate::PQ_PREDICATE_LIKE:
+      case Pq_count_predicate::PQ_PREDICATE_NOT_LIKE:
+      case Pq_count_predicate::PQ_PREDICATE_IS_NULL:
+      case Pq_count_predicate::PQ_PREDICATE_IS_NOT_NULL:
+        return false;
+      }
+    }
+    else if (!pq_item_is_leader_const(thd, args[1], evaluate_values))
+      return false;
+  }
+
+  Item_field *field_item= static_cast<Item_field *>(args[field_arg]);
+  Field *field= field_item->field;
+  if (field->table != join->join_tab[0].table || field->vcol_info)
+    return false;
+  predicate->predicate_op= op;
+  if (op == Pq_count_predicate::PQ_PREDICATE_IS_NULL ||
+      op == Pq_count_predicate::PQ_PREDICATE_IS_NOT_NULL)
+  {
+    predicate->predicate_type= Pq_count_predicate::PQ_PREDICATE_SIGNED_INT;
+    predicate->predicate_gt_value= 0;
+    predicate->predicate_datetime_binary_valid= false;
+    predicate->predicate_datetime_binary_value.clear();
+    predicate->predicate_unsigned_value= 0;
+    predicate->predicate_real_value= 0.0;
+    predicate->predicate_decimal_binary_valid= false;
+    predicate->predicate_decimal_binary_value.clear();
+    predicate->predicate_escape= '\\';
+    predicate->predicate_charset= field->charset();
+    predicate->predicate_string_value.clear();
+    predicate->field_index= field->field_index;
+    return true;
+  }
+
+  return pq_extract_field_const_predicate(thd, join, args[field_arg],
+                                          args[const_arg], func, op,
+                                          predicate, evaluate_values);
+}
+
+static bool pq_extract_between_predicates(THD *thd, JOIN *join,
+                                          Item_func_between *between_func,
+                                          std::vector<Pq_predicate_conjunction>
+                                          *disjuncts,
+                                          bool evaluate_values= true)
+{
+  Item **args= between_func->arguments();
+  if (args[0]->type() != Item::FIELD_ITEM ||
+      !pq_item_is_leader_const(thd, args[1], evaluate_values) ||
+      !pq_item_is_leader_const(thd, args[2], evaluate_values))
+    return false;
+
+  Pq_count_predicate lower;
+  Pq_count_predicate upper;
+  if (between_func->negated)
+  {
+    if (!pq_extract_field_const_predicate(
+            thd, join, args[0], args[1], between_func,
+            Pq_count_predicate::PQ_PREDICATE_LT, &lower, evaluate_values) ||
+        !pq_extract_field_const_predicate(
+            thd, join, args[0], args[2], between_func,
+            Pq_count_predicate::PQ_PREDICATE_GT, &upper, evaluate_values))
+      return false;
+
+    disjuncts->clear();
+    disjuncts->push_back(Pq_predicate_conjunction());
+    disjuncts->back().push_back(lower);
+    disjuncts->push_back(Pq_predicate_conjunction());
+    disjuncts->back().push_back(upper);
+    return true;
+  }
+
+  if (!pq_extract_field_const_predicate(
+          thd, join, args[0], args[1], between_func,
+          Pq_count_predicate::PQ_PREDICATE_GE, &lower, evaluate_values) ||
+      !pq_extract_field_const_predicate(
+          thd, join, args[0], args[2], between_func,
+          Pq_count_predicate::PQ_PREDICATE_LE, &upper, evaluate_values))
+    return false;
+
+  disjuncts->clear();
+  disjuncts->push_back(Pq_predicate_conjunction());
+  disjuncts->back().push_back(lower);
+  disjuncts->back().push_back(upper);
+  return true;
+}
+
+static bool pq_extract_in_predicates(THD *thd, JOIN *join,
+                                     Item_func_in *in_func,
+                                     std::vector<Pq_predicate_conjunction>
+                                     *disjuncts)
+{
+  if (in_func->argument_count() < 2 ||
+      in_func->argument_count() > PQ_MAX_PREDICATE_DISJUNCTS + 1)
+    return false;
+
+  Item **args= in_func->arguments();
+  if (args[0]->type() != Item::FIELD_ITEM)
+    return false;
+
+  disjuncts->clear();
+  if (in_func->negated)
+    disjuncts->push_back(Pq_predicate_conjunction());
+
+  for (uint i= 1; i < in_func->argument_count(); i++)
+  {
+    if (!pq_item_is_leader_const(thd, args[i], true))
+      return false;
+    if (args[i]->is_null() && !in_func->negated)
+      continue;
+    if (args[i]->is_null())
+      return false;
+    if (!in_func->negated && disjuncts->size() >= PQ_MAX_PREDICATE_DISJUNCTS)
+      return false;
+
+    Pq_count_predicate predicate;
+    if (!pq_extract_field_const_predicate(
+          thd, join, args[0], args[i], in_func,
+          in_func->negated ? Pq_count_predicate::PQ_PREDICATE_NE :
+                             Pq_count_predicate::PQ_PREDICATE_EQ,
+          &predicate))
+      return false;
+
+    if (!in_func->negated)
+      disjuncts->push_back(Pq_predicate_conjunction());
+    disjuncts->back().push_back(predicate);
+  }
+  return !disjuncts->empty() && !disjuncts->back().empty();
+}
+
+static bool pq_merge_predicate_disjuncts(
+            const std::vector<Pq_predicate_conjunction> &left,
+            const std::vector<Pq_predicate_conjunction> &right,
+            std::vector<Pq_predicate_conjunction> *merged)
+{
+  merged->clear();
+  for (const Pq_predicate_conjunction &left_predicates : left)
+  {
+    for (const Pq_predicate_conjunction &right_predicates : right)
+    {
+      if (merged->size() >= PQ_MAX_PREDICATE_DISJUNCTS)
+        return false;
+      merged->push_back(left_predicates);
+      merged->back().insert(merged->back().end(), right_predicates.begin(),
+                            right_predicates.end());
+    }
+  }
+  return !merged->empty();
+}
+
+static bool pq_extract_predicate_disjuncts(
+            THD *thd, JOIN *join, Item *condition,
+            std::vector<Pq_predicate_conjunction> *disjuncts,
+            bool evaluate_values= true)
+{
+  if (!condition)
+    return true;
+
+  if (condition->type() == Item::COND_ITEM)
+  {
+    Item_cond *cond= static_cast<Item_cond *>(condition);
+    if (cond->functype() == Item_func::COND_AND_FUNC)
+    {
+      std::vector<Pq_predicate_conjunction> current;
+      current.push_back(Pq_predicate_conjunction());
+      List_iterator_fast<Item> it(*cond->argument_list());
+      Item *item;
+      while ((item= it++))
+      {
+        std::vector<Pq_predicate_conjunction> child;
+        std::vector<Pq_predicate_conjunction> merged;
+        if (!pq_extract_predicate_disjuncts(thd, join, item, &child,
+                                            evaluate_values) ||
+            !pq_merge_predicate_disjuncts(current, child, &merged))
+          return false;
+        current.swap(merged);
+      }
+      disjuncts->swap(current);
+      return !disjuncts->empty();
+    }
+
+    if (cond->functype() != Item_func::COND_OR_FUNC)
+      return false;
+
+    List_iterator_fast<Item> it(*cond->argument_list());
+    Item *item;
+    while ((item= it++))
+    {
+      std::vector<Pq_predicate_conjunction> child;
+      if (!pq_extract_predicate_disjuncts(thd, join, item, &child,
+                                          evaluate_values))
+        return false;
+      for (const Pq_predicate_conjunction &predicates : child)
+      {
+        if (disjuncts->size() >= PQ_MAX_PREDICATE_DISJUNCTS)
+          return false;
+        disjuncts->push_back(predicates);
+      }
+    }
+    return !disjuncts->empty();
+  }
+
+  if (condition->type() == Item::FUNC_ITEM)
+  {
+    Item_func *func= static_cast<Item_func *>(condition);
+    if (func->functype() == Item_func::BETWEEN)
+      return pq_extract_between_predicates(
+               thd, join, static_cast<Item_func_between *>(func), disjuncts,
+               evaluate_values);
+    if (func->functype() == Item_func::IN_FUNC)
+      return pq_extract_in_predicates(
+               thd, join, static_cast<Item_func_in *>(func), disjuncts);
+  }
+
+  Pq_count_predicate predicate;
+  if (!pq_extract_simple_predicate(thd, join, condition, &predicate,
+                                   evaluate_values))
+    return false;
+  disjuncts->push_back(Pq_predicate_conjunction());
+  disjuncts->back().push_back(predicate);
+  return true;
+}
+
+static bool pq_extract_predicate_filter(THD *thd, JOIN *join, Item *condition,
+                                        Pq_predicate_filter *predicate_filter,
+                                        bool evaluate_values= true)
+{
+  predicate_filter->disjuncts.clear();
+  if (!condition)
+    return true;
+  return pq_extract_predicate_disjuncts(thd, join, condition,
+                                        &predicate_filter->disjuncts,
+                                        evaluate_values);
+}
+
+static bool pq_is_supported_projection_field(Field *field)
+{
+  if (field->pack_length() == 0 || field->vcol_info)
+    return false;
+
+  switch (field->real_type())
+  {
+  case MYSQL_TYPE_TINY:
+  case MYSQL_TYPE_SHORT:
+  case MYSQL_TYPE_INT24:
+  case MYSQL_TYPE_LONG:
+  case MYSQL_TYPE_LONGLONG:
+  case MYSQL_TYPE_DATE:
+  case MYSQL_TYPE_NEWDATE:
+  case MYSQL_TYPE_TIME:
+  case MYSQL_TYPE_TIME2:
+  case MYSQL_TYPE_DATETIME:
+  case MYSQL_TYPE_DATETIME2:
+  case MYSQL_TYPE_TIMESTAMP:
+  case MYSQL_TYPE_TIMESTAMP2:
+  case MYSQL_TYPE_FLOAT:
+  case MYSQL_TYPE_DOUBLE:
+  case MYSQL_TYPE_NEWDECIMAL:
+  case MYSQL_TYPE_VARCHAR:
+  case MYSQL_TYPE_VAR_STRING:
+  case MYSQL_TYPE_STRING:
+    return true;
+  case MYSQL_TYPE_BIT:
+    return true;
+  case MYSQL_TYPE_TINY_BLOB:
+  case MYSQL_TYPE_MEDIUM_BLOB:
+  case MYSQL_TYPE_LONG_BLOB:
+  case MYSQL_TYPE_BLOB:
+  case MYSQL_TYPE_BLOB_COMPRESSED:
+  case MYSQL_TYPE_GEOMETRY:
+  case MYSQL_TYPE_NULL:
+    return false;
+  default:
+    return false;
+  }
+}
+
+static bool pq_add_projection_field(TABLE *table, Field *field,
+                                    std::vector<uint> *fields)
+{
+  if (field->table != table || !pq_is_supported_projection_field(field))
+    return false;
+
+  uint field_index= field->field_index;
+  if (std::find(fields->begin(), fields->end(), field_index) == fields->end())
+    fields->push_back(field_index);
+  return true;
+}
+
+static bool pq_item_is_direct_cacheable_scalar_subquery(THD *thd, Item *item,
+                                                        bool evaluate_values)
+{
+  if (!item || !item->with_subquery())
+    return false;
+  item= item->real_item();
+  if (!item || item->type() != Item::SUBSELECT_ITEM)
+    return false;
+
+  return pq_item_is_cacheable_scalar_subquery_const(thd, item,
+                                                    evaluate_values);
+}
+
+static bool pq_extract_selected_projection_fields(JOIN *join,
+                                                  std::vector<uint> *fields,
+                                                  bool evaluate_scalar_subqueries=
+                                                    true)
+{
+  THD *thd= join->thd;
+  TABLE *table= join->join_tab[0].table;
+  table_map allowed_tables= table->map;
+  fields->clear();
+
+  if (!join->fields_list.elements)
+    return false;
+
+  List_iterator_fast<Item> it(join->fields_list);
+  Item *item;
+  while ((item= it++))
+  {
+    if (item->with_subquery())
+    {
+      if (!pq_item_is_direct_cacheable_scalar_subquery(
+              thd, item, evaluate_scalar_subqueries))
+        return false;
+      continue;
+    }
+
+    if (pq_item_has_unsupported_function(item) ||
+        (item->used_tables() & ~(allowed_tables | PARAM_TABLE_BIT)) ||
+        item->walk(&Item::is_expensive_processor, 0, 0))
+      return false;
+
+    if (item->type() == Item::SUM_FUNC_ITEM)
+      return false;
+
+    List<Item_field> item_fields;
+    if (item->walk(&Item::collect_item_field_processor, &item_fields, 0))
+      return false;
+
+    List_iterator_fast<Item_field> field_it(item_fields);
+    Item_field *field_item;
+    while ((field_item= field_it++))
+    {
+      if (!pq_add_projection_field(table, field_item->field, fields))
+        return false;
+    }
+  }
+
+  return !fields->empty();
+}
+
+static bool pq_split_key_kind(Field *field, Pq_range_key_kind *key_kind)
+{
+  switch (field->real_type())
+  {
+  case MYSQL_TYPE_TINY:
+  case MYSQL_TYPE_SHORT:
+  case MYSQL_TYPE_INT24:
+  case MYSQL_TYPE_LONG:
+  case MYSQL_TYPE_LONGLONG:
+    *key_kind= PQ_RANGE_KEY_INTEGER;
+    return true;
+  case MYSQL_TYPE_DATE:
+  case MYSQL_TYPE_NEWDATE:
+    *key_kind= PQ_RANGE_KEY_DATE;
+    return true;
+  case MYSQL_TYPE_DATETIME:
+  case MYSQL_TYPE_DATETIME2:
+    *key_kind= PQ_RANGE_KEY_DATETIME;
+    return true;
+  case MYSQL_TYPE_TIME:
+  case MYSQL_TYPE_TIME2:
+    *key_kind= PQ_RANGE_KEY_TIME;
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool pq_get_supported_primary_key(TABLE *table, uint *pk_field_index,
+                                         Pq_range_key_kind *key_kind)
+{
+  if (table->s->primary_key == MAX_KEY)
+    return false;
+
+  return pq_get_supported_split_key(table, table->s->primary_key,
+                                    pk_field_index, key_kind);
+}
+
+static bool pq_get_supported_split_key(TABLE *table, uint keyno,
+                                       uint *field_index,
+                                       Pq_range_key_kind *key_kind)
+{
+  if (!table || keyno == MAX_KEY || keyno >= table->s->keys)
+    return false;
+
+  KEY *key_info= table->key_info + keyno;
+  if (key_info->user_defined_key_parts < 1)
+    return false;
+
+  if (key_info->key_part[0].key_part_flag &
+      (HA_PART_KEY_SEG | HA_REVERSE_SORT))
+    return false;
+
+  Field *field= key_info->key_part[0].field;
+  if (!field || field->maybe_null())
+    return false;
+
+  if (!pq_split_key_kind(field, key_kind))
+    return false;
+
+  *field_index= field->field_index;
+  return true;
+}
+
+static const char *pq_secondary_split_key_rejected_reason(TABLE *table,
+                                                          uint keyno)
+{
+  if (!table || keyno == MAX_KEY || keyno >= table->s->keys)
+    return "secondary_unsupported_split_key";
+
+  KEY *key_info= table->key_info + keyno;
+  if (key_info->user_defined_key_parts < 1)
+    return "secondary_unsupported_split_key";
+
+  if (key_info->key_part[0].key_part_flag & HA_REVERSE_SORT)
+    return "secondary_reverse_scan";
+  if (key_info->key_part[0].key_part_flag & HA_PART_KEY_SEG)
+    return "secondary_prefix_key";
+
+  Field *field= key_info->key_part[0].field;
+  if (!field)
+    return "secondary_unsupported_split_key";
+  if (field->vcol_info)
+    return "secondary_generated_key";
+  if (field->maybe_null())
+    return "secondary_nullable_split_key";
+
+  Pq_range_key_kind key_kind;
+  if (!pq_split_key_kind(field, &key_kind))
+  {
+    switch (field->real_type())
+    {
+    case MYSQL_TYPE_STRING:
+    case MYSQL_TYPE_VAR_STRING:
+    case MYSQL_TYPE_VARCHAR:
+      return "secondary_string_split_key";
+    default:
+      break;
+    }
+    return "secondary_unsupported_split_key";
+  }
+  return "secondary_unsupported_split_key";
+}
+
+static bool pq_get_integer_primary_key(TABLE *table, uint *pk_field_index)
+{
+  Pq_range_key_kind key_kind;
+  if (!pq_get_supported_primary_key(table, pk_field_index, &key_kind))
+    return false;
+  return key_kind == PQ_RANGE_KEY_INTEGER;
+}
+
+static const char *pq_split_key_fallback_reason(TABLE *table)
+{
+  if (!table || table->s->primary_key == MAX_KEY)
+    return "unsupported_no_primary_key";
+
+  KEY *key_info= table->key_info + table->s->primary_key;
+  if (key_info->user_defined_key_parts < 1)
+    return "unsupported_range_split";
+
+  Field *field= key_info->key_part[0].field;
+  if (!field)
+    return "unsupported_range_split";
+  if (field->maybe_null())
+    return "unsupported_nullable_split_key";
+
+  Pq_range_key_kind key_kind;
+  if (pq_split_key_kind(field, &key_kind))
+    return 0;
+  return "unsupported_non_integer_split_key";
+}
+
+static bool pq_add_signed_key_step(longlong start, ulonglong step,
+                                   longlong *end)
+{
+  if (step > (ulonglong) LONGLONG_MAX)
+    return false;
+
+  longlong signed_step= (longlong) step;
+  if (start > 0 && signed_step > LONGLONG_MAX - start)
+    return false;
+
+  *end= start + signed_step;
+  return true;
+}
+
+static bool pq_add_unsigned_key_step(ulonglong start, ulonglong step,
+                                     ulonglong *end)
+{
+  if (step > ULONGLONG_MAX - start)
+    return false;
+
+  *end= start + step;
+  return true;
+}
+
+struct Pq_integer_scan_bounds
+{
+  bool has_lower;
+  bool has_upper;
+  ulonglong lower;
+  ulonglong upper;
+
+  Pq_integer_scan_bounds()
+    : has_lower(false), has_upper(false), lower(0), upper(0)
+  {}
+};
+
+static void pq_apply_lower_bound(Pq_integer_scan_bounds *bounds,
+                                 ulonglong value)
+{
+  if (!bounds->has_lower || value > bounds->lower)
+  {
+    bounds->has_lower= true;
+    bounds->lower= value;
+  }
+}
+
+static void pq_apply_upper_bound(Pq_integer_scan_bounds *bounds,
+                                 ulonglong value)
+{
+  if (!bounds->has_upper || value < bounds->upper)
+  {
+    bounds->has_upper= true;
+    bounds->upper= value;
+  }
+}
+
+static void pq_apply_signed_lower_bound(Pq_integer_scan_bounds *bounds,
+                                        longlong value)
+{
+  if (!bounds->has_lower || value > (longlong) bounds->lower)
+  {
+    bounds->has_lower= true;
+    bounds->lower= (ulonglong) value;
+  }
+}
+
+static void pq_apply_signed_upper_bound(Pq_integer_scan_bounds *bounds,
+                                        longlong value)
+{
+  if (!bounds->has_upper || value < (longlong) bounds->upper)
+  {
+    bounds->has_upper= true;
+    bounds->upper= (ulonglong) value;
+  }
+}
+
+static bool pq_predicate_integer_scan_bounds(
+    const Pq_count_predicate &predicate, bool unsigned_key,
+    Pq_integer_scan_bounds *bounds)
+{
+  if (unsigned_key)
+  {
+    if (predicate.predicate_type !=
+        Pq_count_predicate::PQ_PREDICATE_UNSIGNED_INT)
+      return false;
+    ulonglong value= predicate.predicate_unsigned_value;
+    switch (predicate.predicate_op)
+    {
+    case Pq_count_predicate::PQ_PREDICATE_EQ:
+      pq_apply_lower_bound(bounds, value);
+      if (value != ULONGLONG_MAX)
+        pq_apply_upper_bound(bounds, value + 1);
+      return true;
+    case Pq_count_predicate::PQ_PREDICATE_GT:
+      if (value == ULONGLONG_MAX)
+        return false;
+      pq_apply_lower_bound(bounds, value + 1);
+      return true;
+    case Pq_count_predicate::PQ_PREDICATE_GE:
+      pq_apply_lower_bound(bounds, value);
+      return true;
+    case Pq_count_predicate::PQ_PREDICATE_LT:
+      pq_apply_upper_bound(bounds, value);
+      return true;
+    case Pq_count_predicate::PQ_PREDICATE_LE:
+      if (value != ULONGLONG_MAX)
+        pq_apply_upper_bound(bounds, value + 1);
+      return true;
+    default:
+      return true;
+    }
+  }
+
+  if (predicate.predicate_type != Pq_count_predicate::PQ_PREDICATE_SIGNED_INT)
+    return false;
+
+  longlong signed_value= predicate.predicate_gt_value;
+  switch (predicate.predicate_op)
+  {
+  case Pq_count_predicate::PQ_PREDICATE_EQ:
+    pq_apply_signed_lower_bound(bounds, signed_value);
+    if (signed_value != LONGLONG_MAX)
+      pq_apply_signed_upper_bound(bounds, signed_value + 1);
+    return true;
+  case Pq_count_predicate::PQ_PREDICATE_GT:
+    if (signed_value == LONGLONG_MAX)
+      return false;
+    pq_apply_signed_lower_bound(bounds, signed_value + 1);
+    return true;
+  case Pq_count_predicate::PQ_PREDICATE_GE:
+    pq_apply_signed_lower_bound(bounds, signed_value);
+    return true;
+  case Pq_count_predicate::PQ_PREDICATE_LT:
+    pq_apply_signed_upper_bound(bounds, signed_value);
+    return true;
+  case Pq_count_predicate::PQ_PREDICATE_LE:
+    if (signed_value != LONGLONG_MAX)
+      pq_apply_signed_upper_bound(bounds, signed_value + 1);
+    return true;
+  default:
+    return true;
+  }
+}
+
+static bool pq_extract_integer_scan_bounds(
+    const Pq_predicate_filter *predicate_filter, uint pk_field_index,
+    bool unsigned_key, Pq_integer_scan_bounds *bounds)
+{
+  if (!predicate_filter || predicate_filter->disjuncts.size() != 1)
+    return false;
+
+  bool found= false;
+  for (const Pq_count_predicate &predicate :
+       predicate_filter->disjuncts[0])
+  {
+    if (predicate.field_index != pk_field_index)
+      continue;
+    if (!pq_predicate_integer_scan_bounds(predicate, unsigned_key, bounds))
+      return false;
+    found= true;
+  }
+  return found;
+}
+
+static ulonglong pq_time_fraction_scale(Field *field)
+{
+  static const ulonglong scale_by_decimals[7]=
+  {
+    1ULL,
+    10ULL,
+    100ULL,
+    1000ULL,
+    10000ULL,
+    100000ULL,
+    1000000ULL
+  };
+  uint decimals= field->decimals();
+  return scale_by_decimals[std::min<uint>(decimals, TIME_SECOND_PART_DIGITS)];
+}
+
+static bool pq_datetime_split_scalar(Field *field, ulonglong *value)
+{
+  MYSQL_TIME ltime;
+  if (field->get_date(&ltime, date_mode_t(0)))
+    return false;
+
+  ulong daynr= (ulong) calc_daynr(ltime.year, ltime.month, ltime.day);
+  if (daynr < 366)
+    return false;
+
+  ulonglong scale= pq_time_fraction_scale(field);
+  ulonglong seconds= ((ulonglong) ltime.hour * 60ULL + ltime.minute) *
+                     60ULL + ltime.second;
+  ulonglong fraction= ltime.second_part /
+                      (1000000ULL / scale);
+  *value= (((ulonglong) daynr * 86400ULL) + seconds) * scale + fraction;
+  return true;
+}
+
+static bool pq_time_split_scalar(Field *field, longlong *value)
+{
+  MYSQL_TIME ltime;
+  if (field->get_date(&ltime, date_mode_t(0)))
+    return false;
+
+  ulonglong scale= pq_time_fraction_scale(field);
+  ulonglong seconds= (((ulonglong) ltime.day * 24ULL + ltime.hour) * 60ULL +
+                      ltime.minute) * 60ULL + ltime.second;
+  ulonglong fraction= ltime.second_part / (1000000ULL / scale);
+  ulonglong units= seconds * scale + fraction;
+  if (units > (ulonglong) LONGLONG_MAX)
+    return false;
+
+  *value= ltime.neg ? -((longlong) units) : (longlong) units;
+  return true;
+}
+
+static int pq_store_range_key(Field *field, ulonglong value,
+                              bool unsigned_key,
+                              Pq_range_key_kind key_kind)
+{
+  if (key_kind == PQ_RANGE_KEY_DATE)
+  {
+    MYSQL_TIME ltime;
+    bzero(&ltime, sizeof(ltime));
+    if (get_date_from_daynr((long) value, &ltime.year, &ltime.month,
+                            &ltime.day))
+      return 1;
+    ltime.time_type= MYSQL_TIMESTAMP_DATE;
+    return field->store_time_dec(&ltime, field->decimals());
+  }
+
+  if (key_kind == PQ_RANGE_KEY_DATETIME)
+  {
+    MYSQL_TIME ltime;
+    bzero(&ltime, sizeof(ltime));
+    ulonglong scale= pq_time_fraction_scale(field);
+    ulonglong seconds_total= value / scale;
+    ulonglong fraction= value % scale;
+    ulonglong daynr= seconds_total / 86400ULL;
+    ulonglong seconds_in_day= seconds_total % 86400ULL;
+    if (daynr > (ulonglong) LONG_MAX ||
+        get_date_from_daynr((long) daynr, &ltime.year, &ltime.month,
+                            &ltime.day))
+      return 1;
+    ltime.hour= (uint) (seconds_in_day / 3600ULL);
+    seconds_in_day%= 3600ULL;
+    ltime.minute= (uint) (seconds_in_day / 60ULL);
+    ltime.second= (uint) (seconds_in_day % 60ULL);
+    ltime.second_part= fraction * (1000000ULL / scale);
+    ltime.time_type= MYSQL_TIMESTAMP_DATETIME;
+    return field->store_time_dec(&ltime, field->decimals());
+  }
+
+  if (key_kind == PQ_RANGE_KEY_TIME)
+  {
+    MYSQL_TIME ltime;
+    bzero(&ltime, sizeof(ltime));
+    longlong signed_value= (longlong) value;
+    ulonglong units= signed_value < 0 ? (ulonglong) -signed_value :
+                                        (ulonglong) signed_value;
+    ulonglong scale= pq_time_fraction_scale(field);
+    ulonglong seconds_total= units / scale;
+    ulonglong fraction= units % scale;
+    ulonglong total_hours= seconds_total / 3600ULL;
+    ulonglong seconds_in_hour= seconds_total % 3600ULL;
+    ltime.neg= signed_value < 0;
+    ltime.hour= (uint) total_hours;
+    ltime.minute= (uint) (seconds_in_hour / 60ULL);
+    ltime.second= (uint) (seconds_in_hour % 60ULL);
+    ltime.second_part= fraction * (1000000ULL / scale);
+    ltime.time_type= MYSQL_TIMESTAMP_TIME;
+    return field->store_time_dec(&ltime, field->decimals());
+  }
+
+  return field->store((longlong) value, unsigned_key);
+}
+
+static const char *pq_split_key_data_fallback_reason(TABLE *table)
+{
+  uint pk_field_index= 0;
+  if (!pq_get_integer_primary_key(table, &pk_field_index))
+    return 0;
+
+  Field *pk_field= table->field[pk_field_index];
+  if (!pk_field->is_unsigned())
+    return 0;
+
+  bitmap_set_bit(table->read_set, pk_field_index);
+
+  int error;
+  if ((error= table->file->ha_index_init(table->s->primary_key, true)))
+    return 0;
+
+  error= table->file->ha_index_first(table->record[0]);
+  if (error)
+  {
+    table->file->ha_index_end();
+    return 0;
+  }
+  ulonglong min_unsigned_key= pk_field->val_uint();
+
+  error= table->file->ha_index_last(table->record[0]);
+  if (error)
+  {
+    table->file->ha_index_end();
+    return 0;
+  }
+  ulonglong max_unsigned_key= pk_field->val_uint();
+
+  if ((error= table->file->ha_index_end()))
+    return 0;
+
+  if (min_unsigned_key <= max_unsigned_key &&
+      max_unsigned_key - min_unsigned_key + 1 == 0)
+    return "unsupported_unsigned_full_span_split_key";
+
+  return 0;
+}
+
+static int pq_prepare_handler_key_range(TABLE *table, uint keyno,
+                                        uint field_index, ulonglong value,
+                                        bool unsigned_key,
+                                        Pq_range_key_kind key_kind,
+                                        enum ha_rkey_function flag,
+                                        std::vector<uchar> *key_buffer,
+                                        key_range *range)
+{
+  int error;
+  if (keyno == MAX_KEY || keyno >= table->s->keys)
+    return HA_ERR_UNSUPPORTED;
+  KEY *key_info= table->key_info + keyno;
+  uint key_length= key_info->key_part[0].store_length;
+  Field *field= table->field[field_index];
+
+  key_buffer->resize(key_length);
+  if ((error= pq_store_range_key(field, value, unsigned_key, key_kind)))
+    return error;
+  key_copy(key_buffer->data(), table->record[0], key_info, key_length);
+
+  bzero(range, sizeof(*range));
+  range->key= key_buffer->data();
+  range->length= key_length;
+  range->keypart_map= (key_part_map) 1;
+  range->flag= flag;
+  return 0;
+}
+
+static bool pq_projection_order_expr_field_is_supported(TABLE *table,
+                                                        Field *field)
+{
+  if (field->table != table || !pq_is_supported_projection_field(field))
+    return false;
+
+  switch (field->real_type())
+  {
+  case MYSQL_TYPE_TINY:
+  case MYSQL_TYPE_SHORT:
+  case MYSQL_TYPE_INT24:
+  case MYSQL_TYPE_LONG:
+  case MYSQL_TYPE_LONGLONG:
+  case MYSQL_TYPE_FLOAT:
+  case MYSQL_TYPE_DOUBLE:
+  case MYSQL_TYPE_NEWDECIMAL:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool pq_projection_order_func_is_arithmetic(Item_func *func)
+{
+  if (func->functype() == Item_func::NEG_FUNC)
+    return func->argument_count() == 1;
+
+  LEX_CSTRING name= func->func_name_cstring();
+  if (func->argument_count() == 1)
+    return name.length == 3 && !my_strcasecmp_latin1(name.str, "abs");
+
+  if (func->argument_count() != 2)
+    return false;
+
+  if (name.length == 1 &&
+      (name.str[0] == '+' || name.str[0] == '-' ||
+       name.str[0] == '*' || name.str[0] == '/'))
+    return true;
+
+  return (name.length == 3 && !my_strcasecmp_latin1(name.str, "div")) ||
+         (name.length == 3 && !my_strcasecmp_latin1(name.str, "mod"));
+}
+
+static bool pq_projection_order_expr_is_supported(Item *item, TABLE *table,
+                                                  bool *has_field,
+                                                  std::vector<uint> *fields)
+{
+  if (!item)
+    return false;
+
+  Item *real_item= item->real_item();
+  bool evaluate_scalar_subqueries= !table->in_use->lex->describe;
+  if (!real_item ||
+      (real_item->with_subquery() &&
+       !pq_item_has_only_cacheable_scalar_subquery_consts(table->in_use,
+                                                          real_item,
+                                                          evaluate_scalar_subqueries)) ||
+      (real_item->used_tables() & ~(table->map | PARAM_TABLE_BIT)) ||
+      real_item->walk(&Item::is_expensive_processor, 0, 0))
+    return false;
+
+  switch (real_item->result_type())
+  {
+  case INT_RESULT:
+  case REAL_RESULT:
+  case DECIMAL_RESULT:
+    break;
+  default:
+    return false;
+  }
+
+  if (real_item->type() == Item::FIELD_ITEM)
+  {
+    Item_field *field_item= static_cast<Item_field *>(real_item);
+    if (!pq_projection_order_expr_field_is_supported(table, field_item->field))
+      return false;
+    *has_field= true;
+    if (fields &&
+        !pq_add_projection_field(table, field_item->field, fields))
+      return false;
+    return true;
+  }
+
+  if (real_item->type() != Item::FUNC_ITEM)
+    return (real_item->used_tables() & table->map) == 0;
+
+  Item_func *func= static_cast<Item_func *>(real_item);
+  if (!pq_projection_order_func_is_arithmetic(func))
+    return false;
+
+  Item **args= func->arguments();
+  for (uint i= 0; i < func->argument_count(); i++)
+  {
+    if (!pq_projection_order_expr_is_supported(args[i], table, has_field,
+                                               fields))
+      return false;
+  }
+  return true;
+}
+
+static bool pq_projection_order_is_supported(JOIN *join)
+{
+  if (!join->order)
+    return true;
+
+  TABLE *table= join->join_tab[0].table;
+  for (ORDER *order= join->order; order; order= order->next)
+  {
+    if ((order->direction != ORDER::ORDER_ASC &&
+         order->direction != ORDER::ORDER_DESC) ||
+        !order->item || !*order->item)
+      return false;
+
+    Item *item= (*order->item)->real_item();
+    if (item->type() != Item::FIELD_ITEM)
+    {
+      bool has_field= false;
+      if (!pq_projection_order_expr_is_supported(item, table, &has_field,
+                                                 NULL) ||
+          !has_field)
+        return false;
+      continue;
+    }
+
+    Item_field *field_item= static_cast<Item_field *>(item);
+    if (field_item->field->table != table ||
+        !pq_is_supported_projection_field(field_item->field))
+      return false;
+
+    switch (field_item->field->real_type())
+    {
+    case MYSQL_TYPE_TINY:
+    case MYSQL_TYPE_SHORT:
+    case MYSQL_TYPE_INT24:
+    case MYSQL_TYPE_LONG:
+    case MYSQL_TYPE_LONGLONG:
+    case MYSQL_TYPE_DATE:
+    case MYSQL_TYPE_NEWDATE:
+    case MYSQL_TYPE_TIME:
+    case MYSQL_TYPE_TIME2:
+    case MYSQL_TYPE_DATETIME:
+    case MYSQL_TYPE_DATETIME2:
+    case MYSQL_TYPE_NEWDECIMAL:
+      break;
+    case MYSQL_TYPE_VARCHAR:
+    case MYSQL_TYPE_VAR_STRING:
+    case MYSQL_TYPE_STRING:
+      if (!pq_group_field_has_safe_raw_order(field_item->field))
+        return false;
+      break;
+    default:
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool pq_item_references_timestamp_field(JOIN *join, Item *item);
+
+static bool pq_projection_order_references_timestamp_field(JOIN *join)
+{
+  if (!join->order)
+    return false;
+
+  for (ORDER *order= join->order; order; order= order->next)
+  {
+    if (order->item && *order->item &&
+        pq_item_references_timestamp_field(join, *order->item))
+      return true;
+  }
+  return false;
+}
+
+static bool pq_projection_order_keys(JOIN *join,
+                                     std::vector<Pq_projection_order_key>
+                                     *order_keys)
+{
+  order_keys->clear();
+  if (!join->order)
+    return false;
+
+  if (!pq_projection_order_is_supported(join))
+    return false;
+
+  size_t expression_order_values= 0;
+  for (ORDER *order= join->order; order; order= order->next)
+  {
+    Item *item= (*order->item)->real_item();
+    Pq_projection_order_key key;
+    key.desc= order->direction == ORDER::ORDER_DESC;
+    if (item->type() == Item::FIELD_ITEM)
+      key.field_index= static_cast<Item_field *>(item)->field->field_index;
+    else
+    {
+      key.expression= true;
+      key.expression_item= item;
+      key.expression_value_index= expression_order_values++;
+      key.expression_result_type= item->result_type();
+      key.expression_unsigned= item->unsigned_flag;
+
+      bool has_field= false;
+      if (!pq_projection_order_expr_is_supported(
+            item, join->join_tab[0].table, &has_field,
+            &key.expression_field_indices) ||
+          !has_field || key.expression_field_indices.empty())
+        return false;
+    }
+    order_keys->push_back(key);
+  }
+  return !order_keys->empty();
+}
+
+static bool pq_projection_order_is_single_pk_desc(
+    TABLE *table, const std::vector<Pq_projection_order_key> &order_keys)
+{
+  if (!table || order_keys.size() != 1 || table->s->primary_key == MAX_KEY)
+    return false;
+
+  const Pq_projection_order_key &order_key= order_keys[0];
+  if (!order_key.desc || order_key.expression)
+    return false;
+
+  KEY *key_info= table->key_info + table->s->primary_key;
+  return key_info->user_defined_key_parts == 1 &&
+         key_info->key_part[0].field &&
+         key_info->key_part[0].field->field_index == order_key.field_index;
+}
+
+static bool pq_projection_order_is_single_pk(
+    TABLE *table, const std::vector<Pq_projection_order_key> &order_keys,
+    bool *desc)
+{
+  if (desc)
+    *desc= false;
+  if (!table || order_keys.size() != 1 || table->s->primary_key == MAX_KEY)
+    return false;
+
+  const Pq_projection_order_key &order_key= order_keys[0];
+  if (order_key.expression)
+    return false;
+
+  KEY *key_info= table->key_info + table->s->primary_key;
+  if (key_info->user_defined_key_parts != 1 ||
+      !key_info->key_part[0].field ||
+      key_info->key_part[0].field->field_index != order_key.field_index)
+    return false;
+
+  if (desc)
+    *desc= order_key.desc;
+  return true;
+}
+
+static bool pq_projection_order_is_full_pk_asc(
+    TABLE *table, const std::vector<Pq_projection_order_key> &order_keys)
+{
+  if (!table || table->s->primary_key == MAX_KEY)
+    return false;
+
+  KEY *key_info= table->key_info + table->s->primary_key;
+  if (order_keys.size() != key_info->user_defined_key_parts)
+    return false;
+
+  for (uint i= 0; i < key_info->user_defined_key_parts; i++)
+  {
+    const Pq_projection_order_key &order_key= order_keys[i];
+    if (order_key.expression || order_key.desc ||
+        !key_info->key_part[i].field ||
+        key_info->key_part[i].field->field_index != order_key.field_index)
+      return false;
+  }
+  return true;
+}
+
+static bool pq_projection_order_is_secondary_full_pk_asc(
+    TABLE *table, const Pq_scan_provider &provider,
+    const std::vector<Pq_projection_order_key> &order_keys)
+{
+  if (!table || table->s->primary_key == MAX_KEY ||
+      provider.provider_kind != PQ_SCAN_PROVIDER_HANDLER_SECONDARY_RANGE ||
+      provider.secondary_requires_cluster_lookup ||
+      provider.scan_keyno == MAX_KEY || provider.scan_keyno >= table->s->keys)
+    return false;
+
+  KEY *secondary_key= table->key_info + provider.scan_keyno;
+  KEY *primary_key= table->key_info + table->s->primary_key;
+  if (secondary_key->user_defined_key_parts != 1 ||
+      !secondary_key->key_part[0].field ||
+      order_keys.size() != primary_key->user_defined_key_parts + 1)
+    return false;
+
+  const Pq_projection_order_key &secondary_order= order_keys[0];
+  if (secondary_order.expression || secondary_order.desc ||
+      secondary_order.field_index !=
+        secondary_key->key_part[0].field->field_index)
+    return false;
+
+  for (uint i= 0; i < primary_key->user_defined_key_parts; i++)
+  {
+    const Pq_projection_order_key &pk_order= order_keys[i + 1];
+    if (pk_order.expression || pk_order.desc ||
+        !primary_key->key_part[i].field ||
+        pk_order.field_index != primary_key->key_part[i].field->field_index)
+      return false;
+  }
+  return true;
+}
+
+static bool pq_projection_order_can_gather_merge(
+    TABLE *table, const Pq_scan_provider &provider,
+    const std::vector<Pq_projection_order_key> &order_keys)
+{
+  bool order_desc= false;
+  if (provider.provider_kind == PQ_SCAN_PROVIDER_HANDLER_PRIMARY &&
+      pq_projection_order_is_single_pk(table, order_keys, &order_desc))
+    return order_desc == provider.reverse;
+  if (provider.provider_kind == PQ_SCAN_PROVIDER_HANDLER_PRIMARY &&
+      !provider.reverse &&
+      pq_projection_order_is_full_pk_asc(table, order_keys))
+    return true;
+
+  return pq_projection_order_is_secondary_full_pk_asc(table, provider,
+                                                      order_keys);
+}
+
+static bool pq_predicate_filter_has_range_on_field(
+    const Pq_predicate_filter &predicate_filter, uint field_index)
+{
+  if (predicate_filter.disjuncts.size() != 1)
+    return false;
+
+  for (const Pq_count_predicate &predicate : predicate_filter.disjuncts[0])
+  {
+    if (predicate.field_index != field_index)
+      continue;
+    switch (predicate.predicate_op)
+    {
+    case Pq_count_predicate::PQ_PREDICATE_LT:
+    case Pq_count_predicate::PQ_PREDICATE_LE:
+    case Pq_count_predicate::PQ_PREDICATE_GT:
+    case Pq_count_predicate::PQ_PREDICATE_GE:
+      return true;
+    case Pq_count_predicate::PQ_PREDICATE_EQ:
+    case Pq_count_predicate::PQ_PREDICATE_NE:
+    case Pq_count_predicate::PQ_PREDICATE_LIKE:
+    case Pq_count_predicate::PQ_PREDICATE_NOT_LIKE:
+    case Pq_count_predicate::PQ_PREDICATE_IS_NULL:
+    case Pq_count_predicate::PQ_PREDICATE_IS_NOT_NULL:
+      break;
+    }
+  }
+  return false;
+}
+
+static bool pq_secondary_range_keyno(
+    JOIN *join, const Pq_predicate_filter &predicate_filter,
+    bool require_covering, uint *keyno, bool *requires_cluster_lookup,
+    const char **rejected_reason= NULL)
+{
+  if (keyno)
+    *keyno= MAX_KEY;
+  if (requires_cluster_lookup)
+    *requires_cluster_lookup= false;
+  if (rejected_reason)
+    *rejected_reason= NULL;
+  if (!join || join->table_count != 1 || !join->join_tab)
+  {
+    if (rejected_reason)
+      *rejected_reason= "secondary_not_single_table";
+    return false;
+  }
+
+  JOIN_TAB *tab= &join->join_tab[0];
+  TABLE *table= tab->table;
+  if (!table || !table->file || table->part_info ||
+      table->s->primary_key == MAX_KEY)
+  {
+    if (rejected_reason)
+      *rejected_reason= "secondary_partition_or_no_pk";
+    return false;
+  }
+
+  uint candidate_keyno= MAX_KEY;
+  if (tab->select && tab->select->quick)
+  {
+    QUICK_SELECT_I *quick= tab->select->quick;
+    if (quick->get_type() != QUICK_SELECT_I::QS_TYPE_RANGE ||
+        quick->reverse_sorted())
+    {
+      if (rejected_reason)
+        *rejected_reason= quick->reverse_sorted() ?
+                          "secondary_reverse_scan" :
+                          "secondary_not_range";
+      return false;
+    }
+    candidate_keyno= quick->index;
+  }
+  else if (table->force_index || table->force_index_join)
+  {
+    key_map keys= table->keys_in_use_for_query;
+    if (require_covering)
+      keys.intersect(table->covering_keys);
+    candidate_keyno= find_shortest_key(table, &keys);
+  }
+
+  if (candidate_keyno == MAX_KEY ||
+      candidate_keyno == table->s->primary_key ||
+      candidate_keyno >= table->s->keys)
+  {
+    if (rejected_reason)
+      *rejected_reason= "secondary_no_candidate";
+    return false;
+  }
+
+  if (tab->type == JT_REF || tab->type == JT_EQ_REF ||
+      tab->type == JT_REF_OR_NULL)
+  {
+    if (rejected_reason)
+      *rejected_reason= "secondary_ref_access";
+    return false;
+  }
+
+  bool covering_keyread=
+    table->covering_keys.is_set(candidate_keyno) && !table->no_keyread;
+  if (require_covering && !covering_keyread)
+  {
+    if (rejected_reason)
+      *rejected_reason= "secondary_not_covering";
+    return false;
+  }
+
+  KEY *key_info= table->key_info + candidate_keyno;
+  if (key_info->user_defined_key_parts != 1)
+  {
+    if (rejected_reason)
+      *rejected_reason= "secondary_composite_key";
+    return false;
+  }
+
+  if (table->file->pushed_idx_cond &&
+      table->file->pushed_idx_cond_keyno == candidate_keyno)
+  {
+    if (rejected_reason)
+      *rejected_reason= "secondary_icp";
+    return false;
+  }
+
+  uint field_index;
+  Pq_range_key_kind key_kind;
+  if (!pq_get_supported_split_key(table, candidate_keyno, &field_index,
+                                  &key_kind))
+  {
+    if (rejected_reason)
+      *rejected_reason=
+        pq_secondary_split_key_rejected_reason(table, candidate_keyno);
+    return false;
+  }
+  if (!pq_predicate_filter_has_range_on_field(predicate_filter, field_index))
+  {
+    if (rejected_reason)
+      *rejected_reason= "secondary_no_range_predicate";
+    return false;
+  }
+
+  if (keyno)
+    *keyno= candidate_keyno;
+  if (requires_cluster_lookup)
+    *requires_cluster_lookup= !covering_keyread;
+  return true;
+}
+
+static bool pq_covering_secondary_range_keyno(
+    JOIN *join, const Pq_predicate_filter &predicate_filter, uint *keyno,
+    const char **rejected_reason= NULL)
+{
+  return pq_secondary_range_keyno(join, predicate_filter, true, keyno, NULL,
+                                  rejected_reason);
+}
+
+static int pq_compare_field_row_pk(const Pq_field_row &left,
+                                   const Pq_field_row &right)
+{
+  if (left.order_key_is_unsigned || right.order_key_is_unsigned)
+  {
+    if (left.unsigned_order_key == right.unsigned_order_key)
+      return 0;
+    return left.unsigned_order_key < right.unsigned_order_key ? -1 : 1;
+  }
+  if (left.order_key == right.order_key)
+    return 0;
+  return left.order_key < right.order_key ? -1 : 1;
+}
+
+static int pq_compare_field_row_at(TABLE *table,
+                                   const std::vector<uint> &selected_fields,
+                                   size_t order_field_pos,
+                                   const Pq_field_row &left,
+                                   const Pq_field_row &right)
+{
+  if (order_field_pos >= selected_fields.size() ||
+      order_field_pos >= left.values.size() ||
+      order_field_pos >= right.values.size() ||
+      order_field_pos >= left.null_values.size() ||
+      order_field_pos >= right.null_values.size())
+    return 0;
+
+  if (left.null_values[order_field_pos] != right.null_values[order_field_pos])
+    return left.null_values[order_field_pos] ? -1 : 1;
+  if (left.null_values[order_field_pos])
+    return 0;
+
+  Field *field= table->field[selected_fields[order_field_pos]];
+  return field->cmp(left.values[order_field_pos].data(),
+                    right.values[order_field_pos].data());
+}
+
+static int pq_compare_projection_order(
+  TABLE *table, const std::vector<uint> &selected_fields,
+  const std::vector<Pq_projection_order_key> &order_keys,
+  const Pq_field_row &left, const Pq_field_row &right)
+{
+  for (const Pq_projection_order_key &order_key : order_keys)
+  {
+    int cmp= 0;
+    if (order_key.expression)
+    {
+      size_t pos= order_key.expression_value_index;
+      if (pos >= left.expression_order_int_values.size() ||
+          pos >= right.expression_order_int_values.size() ||
+          pos >= left.expression_order_uint_values.size() ||
+          pos >= right.expression_order_uint_values.size() ||
+          pos >= left.expression_order_decimal_values.size() ||
+          pos >= right.expression_order_decimal_values.size() ||
+          pos >= left.expression_order_real_values.size() ||
+          pos >= right.expression_order_real_values.size() ||
+          pos >= left.expression_order_nulls.size() ||
+          pos >= right.expression_order_nulls.size())
+        return pq_compare_field_row_pk(left, right);
+
+      bool left_null= left.expression_order_nulls[pos];
+      bool right_null= right.expression_order_nulls[pos];
+      if (left_null != right_null)
+        cmp= left_null ? -1 : 1;
+      else if (!left_null)
+      {
+        switch (order_key.expression_result_type)
+        {
+        case INT_RESULT:
+          if (order_key.expression_unsigned)
+          {
+            if (left.expression_order_uint_values[pos] <
+                right.expression_order_uint_values[pos])
+              cmp= -1;
+            else if (left.expression_order_uint_values[pos] >
+                     right.expression_order_uint_values[pos])
+              cmp= 1;
+          }
+          else
+          {
+            if (left.expression_order_int_values[pos] <
+                right.expression_order_int_values[pos])
+              cmp= -1;
+            else if (left.expression_order_int_values[pos] >
+                     right.expression_order_int_values[pos])
+              cmp= 1;
+          }
+          break;
+        case DECIMAL_RESULT:
+          cmp= my_decimal_cmp(&left.expression_order_decimal_values[pos],
+                              &right.expression_order_decimal_values[pos]);
+          break;
+        case REAL_RESULT:
+          if (left.expression_order_real_values[pos] <
+              right.expression_order_real_values[pos])
+            cmp= -1;
+          else if (left.expression_order_real_values[pos] >
+                   right.expression_order_real_values[pos])
+            cmp= 1;
+          break;
+        default:
+          return pq_compare_field_row_pk(left, right);
+        }
+      }
+    }
+    else
+    {
+      std::vector<uint>::const_iterator it=
+        std::find(selected_fields.begin(), selected_fields.end(),
+                  order_key.field_index);
+      if (it == selected_fields.end())
+        return pq_compare_field_row_pk(left, right);
+
+      cmp= pq_compare_field_row_at(table, selected_fields,
+                                   it - selected_fields.begin(), left, right);
+    }
+
+    if (cmp)
+      return order_key.desc ? -cmp : cmp;
+  }
+  return pq_compare_field_row_pk(left, right);
+}
+
+static int pq_compare_projection_order_ties(
+  TABLE *table, const std::vector<uint> &selected_fields,
+  const std::vector<Pq_projection_order_key> &order_keys,
+  const Pq_field_row &left, const Pq_field_row &right)
+{
+  for (const Pq_projection_order_key &order_key : order_keys)
+  {
+    int cmp= 0;
+    if (order_key.expression)
+    {
+      size_t pos= order_key.expression_value_index;
+      if (pos >= left.expression_order_int_values.size() ||
+          pos >= right.expression_order_int_values.size() ||
+          pos >= left.expression_order_uint_values.size() ||
+          pos >= right.expression_order_uint_values.size() ||
+          pos >= left.expression_order_decimal_values.size() ||
+          pos >= right.expression_order_decimal_values.size() ||
+          pos >= left.expression_order_real_values.size() ||
+          pos >= right.expression_order_real_values.size() ||
+          pos >= left.expression_order_nulls.size() ||
+          pos >= right.expression_order_nulls.size())
+        return 1;
+
+      bool left_null= left.expression_order_nulls[pos];
+      bool right_null= right.expression_order_nulls[pos];
+      if (left_null != right_null)
+        cmp= left_null ? -1 : 1;
+      else if (!left_null)
+      {
+        switch (order_key.expression_result_type)
+        {
+        case INT_RESULT:
+          if (order_key.expression_unsigned)
+          {
+            if (left.expression_order_uint_values[pos] <
+                right.expression_order_uint_values[pos])
+              cmp= -1;
+            else if (left.expression_order_uint_values[pos] >
+                     right.expression_order_uint_values[pos])
+              cmp= 1;
+          }
+          else
+          {
+            if (left.expression_order_int_values[pos] <
+                right.expression_order_int_values[pos])
+              cmp= -1;
+            else if (left.expression_order_int_values[pos] >
+                     right.expression_order_int_values[pos])
+              cmp= 1;
+          }
+          break;
+        case DECIMAL_RESULT:
+          cmp= my_decimal_cmp(&left.expression_order_decimal_values[pos],
+                              &right.expression_order_decimal_values[pos]);
+          break;
+        case REAL_RESULT:
+          if (left.expression_order_real_values[pos] <
+              right.expression_order_real_values[pos])
+            cmp= -1;
+          else if (left.expression_order_real_values[pos] >
+                   right.expression_order_real_values[pos])
+            cmp= 1;
+          break;
+        default:
+          return 1;
+        }
+      }
+    }
+    else
+    {
+      std::vector<uint>::const_iterator it=
+        std::find(selected_fields.begin(), selected_fields.end(),
+                  order_key.field_index);
+      if (it == selected_fields.end())
+        return 1;
+
+      cmp= pq_compare_field_row_at(table, selected_fields,
+                                   it - selected_fields.begin(), left, right);
+    }
+
+    if (cmp)
+      return order_key.desc ? -cmp : cmp;
+  }
+  return 0;
+}
+
+static bool pq_materialize_projection_order_expressions(
+  THD *thd, TABLE *table, const std::vector<uint> &selected_fields,
+  const std::vector<Pq_projection_order_key> &order_keys,
+  std::vector<Pq_field_row> *rows)
+{
+  size_t expression_count= 0;
+  for (const Pq_projection_order_key &order_key : order_keys)
+  {
+    if (order_key.expression)
+      expression_count++;
+  }
+  if (!expression_count)
+    return true;
+
+  for (Pq_field_row &row : *rows)
+  {
+    if (!pq_restore_field_row(table, selected_fields, row))
+      return false;
+
+    row.expression_order_nulls.assign(expression_count, false);
+    row.expression_order_int_values.assign(expression_count, 0);
+    row.expression_order_uint_values.assign(expression_count, 0);
+    row.expression_order_decimal_values.resize(expression_count);
+    row.expression_order_real_values.assign(expression_count, 0.0);
+    for (const Pq_projection_order_key &order_key : order_keys)
+    {
+      if (!order_key.expression)
+        continue;
+
+      size_t pos= order_key.expression_value_index;
+      switch (order_key.expression_result_type)
+      {
+      case INT_RESULT:
+      {
+        longlong value= order_key.expression_item->val_int();
+        if (thd->is_error())
+          return false;
+        row.expression_order_nulls[pos]= order_key.expression_item->null_value;
+        if (!order_key.expression_item->null_value)
+        {
+          if (order_key.expression_unsigned)
+            row.expression_order_uint_values[pos]= static_cast<ulonglong>(value);
+          else
+            row.expression_order_int_values[pos]= value;
+        }
+        break;
+      }
+      case DECIMAL_RESULT:
+      {
+        my_decimal value;
+        my_decimal *decimal_value= order_key.expression_item->val_decimal(&value);
+        if (thd->is_error())
+          return false;
+        row.expression_order_nulls[pos]=
+          order_key.expression_item->null_value || !decimal_value;
+        if (!row.expression_order_nulls[pos])
+          my_decimal2decimal(decimal_value,
+                             &row.expression_order_decimal_values[pos]);
+        break;
+      }
+      case REAL_RESULT:
+      {
+        double value= order_key.expression_item->val_real();
+        if (thd->is_error())
+          return false;
+        row.expression_order_nulls[pos]= order_key.expression_item->null_value;
+        if (!order_key.expression_item->null_value)
+          row.expression_order_real_values[pos]= value;
+        break;
+      }
+      default:
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+static bool pq_build_split_key_ranges(TABLE *table, uint keyno, size_t dop,
+                                      const Pq_predicate_filter
+                                      *predicate_filter,
+                                      uint *field_index,
+                                      std::vector<Pq_scan_range> *ranges)
+{
+  int error;
+  longlong min_key;
+  longlong max_key;
+  Pq_range_key_kind key_kind;
+
+  if (!pq_get_supported_split_key(table, keyno, field_index, &key_kind) ||
+      dop < 2)
+    return false;
+
+  bitmap_set_bit(table->read_set, *field_index);
+  bitmap_set_bit(table->write_set, *field_index);
+
+  if ((error= table->file->ha_index_init(keyno, true)))
+    return false;
+
+  error= table->file->ha_index_first(table->record[0]);
+  if (error)
+  {
+    table->file->ha_index_end();
+    return false;
+  }
+  Field *split_field= table->field[*field_index];
+  bool split_key_is_unsigned= split_field->is_unsigned();
+  MYSQL_TIME min_time;
+  MYSQL_TIME max_time;
+  ulong min_daynr= 0;
+  ulong max_daynr= 0;
+  ulonglong min_temporal_key= 0;
+  ulonglong max_temporal_key= 0;
+  if (key_kind == PQ_RANGE_KEY_DATE)
+  {
+    if (split_field->get_date(&min_time, date_mode_t(0)))
+    {
+      table->file->ha_index_end();
+      return false;
+    }
+    min_daynr= (ulong) calc_daynr(min_time.year, min_time.month,
+                                  min_time.day);
+    if (min_daynr < 366)
+    {
+      table->file->ha_index_end();
+      return false;
+    }
+    min_temporal_key= min_daynr;
+  }
+  else if (key_kind == PQ_RANGE_KEY_DATETIME)
+  {
+    if (!pq_datetime_split_scalar(split_field, &min_temporal_key))
+    {
+      table->file->ha_index_end();
+      return false;
+    }
+  }
+  if (key_kind == PQ_RANGE_KEY_TIME)
+  {
+    if (!pq_time_split_scalar(split_field, &min_key))
+    {
+      table->file->ha_index_end();
+      return false;
+    }
+  }
+  else
+    min_key= split_field->val_int();
+  ulonglong min_unsigned_key= split_field->val_uint();
+
+  error= table->file->ha_index_last(table->record[0]);
+  if (error)
+  {
+    table->file->ha_index_end();
+    return false;
+  }
+  if (key_kind == PQ_RANGE_KEY_DATE)
+  {
+    if (split_field->get_date(&max_time, date_mode_t(0)))
+    {
+      table->file->ha_index_end();
+      return false;
+    }
+    max_daynr= (ulong) calc_daynr(max_time.year, max_time.month,
+                                  max_time.day);
+    if (max_daynr < 366)
+    {
+      table->file->ha_index_end();
+      return false;
+    }
+    max_temporal_key= max_daynr;
+  }
+  else if (key_kind == PQ_RANGE_KEY_DATETIME)
+  {
+    if (!pq_datetime_split_scalar(split_field, &max_temporal_key))
+    {
+      table->file->ha_index_end();
+      return false;
+    }
+  }
+  if (key_kind == PQ_RANGE_KEY_TIME)
+  {
+    if (!pq_time_split_scalar(split_field, &max_key))
+    {
+      table->file->ha_index_end();
+      return false;
+    }
+  }
+  else
+    max_key= split_field->val_int();
+  ulonglong max_unsigned_key= split_field->val_uint();
+
+  if ((error= table->file->ha_index_end()))
+    return false;
+
+  bool integer_scan_has_upper= false;
+  ulonglong integer_scan_upper= 0;
+  if (key_kind == PQ_RANGE_KEY_INTEGER)
+  {
+    Pq_integer_scan_bounds scan_bounds;
+    if (pq_extract_integer_scan_bounds(predicate_filter, *field_index,
+                                       split_key_is_unsigned, &scan_bounds))
+    {
+      if (split_key_is_unsigned)
+      {
+        if (scan_bounds.has_lower && scan_bounds.lower > min_unsigned_key)
+          min_unsigned_key= scan_bounds.lower;
+        if (scan_bounds.has_upper)
+        {
+          if (scan_bounds.upper == 0)
+            return false;
+          integer_scan_has_upper= true;
+          integer_scan_upper= scan_bounds.upper;
+          if (scan_bounds.upper - 1 < max_unsigned_key)
+            max_unsigned_key= scan_bounds.upper - 1;
+        }
+      }
+      else
+      {
+        if (scan_bounds.has_lower &&
+            (longlong) scan_bounds.lower > min_key)
+          min_key= (longlong) scan_bounds.lower;
+        if (scan_bounds.has_upper)
+        {
+          longlong signed_upper= (longlong) scan_bounds.upper;
+          if (signed_upper == LONGLONG_MIN)
+            return false;
+          integer_scan_has_upper= true;
+          integer_scan_upper= scan_bounds.upper;
+          if (signed_upper - 1 < max_key)
+            max_key= signed_upper - 1;
+        }
+      }
+    }
+  }
+
+  ranges->clear();
+  if (key_kind == PQ_RANGE_KEY_DATE ||
+      key_kind == PQ_RANGE_KEY_DATETIME)
+  {
+    if (min_temporal_key > max_temporal_key)
+      return false;
+
+    ulonglong span= max_temporal_key - min_temporal_key + 1;
+    if (span == 0)
+      return false;
+    ulonglong step= (span + dop - 1) / dop;
+    if (step == 0)
+      step= 1;
+
+    ulonglong start= min_temporal_key;
+    for (size_t i= 0; i < dop && start <= max_temporal_key; i++)
+    {
+      Pq_scan_range range;
+      ulonglong remaining= max_temporal_key - start + 1;
+      range.start= start;
+      range.key_is_unsigned= false;
+      range.key_kind= key_kind;
+      if (i + 1 == dop || remaining <= step)
+      {
+        range.has_end= false;
+        range.end= 0;
+        ranges->push_back(range);
+        break;
+      }
+      range.has_end= true;
+      if (!pq_add_unsigned_key_step(start, step, &range.end))
+        return false;
+      ranges->push_back(range);
+      start= range.end;
+    }
+
+    return !ranges->empty();
+  }
+
+  if (split_key_is_unsigned)
+  {
+    if (min_unsigned_key > max_unsigned_key)
+      return false;
+
+    ulonglong span= max_unsigned_key - min_unsigned_key + 1;
+    if (span == 0)
+      return false;
+    ulonglong step= span / dop + (span % dop != 0);
+    if (step == 0)
+      step= 1;
+
+    ulonglong start= min_unsigned_key;
+    for (size_t i= 0; i < dop && start <= max_unsigned_key; i++)
+    {
+      Pq_scan_range range;
+      ulonglong remaining= max_unsigned_key - start + 1;
+      range.start= start;
+      range.key_is_unsigned= true;
+      range.key_kind= key_kind;
+      if ((i + 1 == dop || remaining <= step) && !integer_scan_has_upper)
+      {
+        range.has_end= false;
+        range.end= 0;
+        ranges->push_back(range);
+        break;
+      }
+      range.has_end= true;
+      if (i + 1 == dop || remaining <= step)
+        range.end= integer_scan_upper;
+      else if (!pq_add_unsigned_key_step(start, step, &range.end))
+        return false;
+      ranges->push_back(range);
+      start= range.end;
+    }
+
+    return !ranges->empty();
+  }
+
+  if (min_key > max_key)
+    return false;
+
+  ulonglong span= (ulonglong) max_key - (ulonglong) min_key + 1;
+  if (span == 0 || span > (ulonglong) LONGLONG_MAX)
+    return false;
+  ulonglong step= (span + dop - 1) / dop;
+  if (step == 0)
+    step= 1;
+
+  longlong start= min_key;
+  for (size_t i= 0; i < dop && start <= max_key; i++)
+  {
+    Pq_scan_range range;
+    ulonglong remaining= (ulonglong) max_key - (ulonglong) start + 1;
+    range.start= (ulonglong) start;
+    range.key_is_unsigned= false;
+    range.key_kind= key_kind;
+    if ((i + 1 == dop || remaining <= step) && !integer_scan_has_upper)
+    {
+      range.has_end= false;
+      range.end= 0;
+      ranges->push_back(range);
+      break;
+    }
+    range.has_end= true;
+    longlong signed_end;
+    if (i + 1 == dop || remaining <= step)
+      signed_end= (longlong) integer_scan_upper;
+    else if (!pq_add_signed_key_step(start, step, &signed_end))
+      return false;
+    range.end= (ulonglong) signed_end;
+    ranges->push_back(range);
+    start= signed_end;
+  }
+
+  return !ranges->empty();
+}
+
+static bool pq_build_primary_key_ranges(TABLE *table, size_t dop,
+                                        const Pq_predicate_filter
+                                        *predicate_filter,
+                                        uint *pk_field_index,
+                                        std::vector<Pq_scan_range> *ranges)
+{
+  if (table->s->primary_key == MAX_KEY)
+    return false;
+  return pq_build_split_key_ranges(table, table->s->primary_key, dop,
+                                   predicate_filter, pk_field_index, ranges);
+}
+
+static bool pq_build_primary_key_scan_provider(
+    TABLE *table, size_t dop, const Pq_predicate_filter *predicate_filter,
+    bool reverse, uint secondary_keyno,
+    bool secondary_requires_cluster_lookup,
+    const char *secondary_rejected_reason, Pq_scan_provider *provider)
+{
+  provider->provider_kind= PQ_SCAN_PROVIDER_SQL_PRIMARY_KEY_RANGE;
+  provider->ranges.clear();
+  provider->pk_field_index= 0;
+  provider->scan_keyno= table ? table->s->primary_key : MAX_KEY;
+  provider->scan_field_index= 0;
+  provider->secondary_requires_cluster_lookup= false;
+  provider->reverse= reverse;
+  provider->handler_scan_ctx= NULL;
+  provider->handler_scan_available= false;
+  provider->handler_scan_rejected_reason= NULL;
+  if (!pq_build_primary_key_ranges(table, dop, predicate_filter,
+                                   &provider->pk_field_index,
+                                   &provider->ranges))
+    return false;
+  provider->scan_field_index= provider->pk_field_index;
+
+  if (table && table->file && table->file->ha_pq_scan_supported())
+  {
+    bool try_secondary= secondary_keyno != MAX_KEY;
+    uint handler_keyno= table->s->primary_key;
+    uint handler_field_index= provider->pk_field_index;
+    std::vector<Pq_scan_range> handler_ranges;
+    if (try_secondary)
+    {
+      if (reverse)
+      {
+        provider->handler_scan_rejected_reason= "secondary_reverse_scan";
+        try_secondary= false;
+      }
+      else if (!pq_build_split_key_ranges(table, secondary_keyno, dop,
+                                          predicate_filter,
+                                          &handler_field_index,
+                                          &handler_ranges))
+      {
+        provider->handler_scan_rejected_reason= "secondary_range_split_failed";
+        try_secondary= false;
+      }
+      else
+        handler_keyno= secondary_keyno;
+    }
+
+    if (table->part_info)
+      provider->handler_scan_rejected_reason= "partitioned_table";
+    else if (!try_secondary &&
+             (table->force_index || table->force_index_join ||
+              table->force_index_order || table->force_index_group))
+    {
+      if (!provider->handler_scan_rejected_reason)
+        provider->handler_scan_rejected_reason=
+          secondary_rejected_reason ? secondary_rejected_reason :
+                                      "forced_or_secondary_index";
+    }
+    else if (table->s->primary_key == MAX_KEY)
+      provider->handler_scan_rejected_reason= "no_primary_key";
+    else if (dop > UINT_MAX)
+      provider->handler_scan_rejected_reason= "dop_overflow";
+    else
+    {
+      HA_pq_scan_init_param param;
+      key_range scan_start_range;
+      key_range scan_end_range;
+      std::vector<uchar> scan_start_key;
+      std::vector<uchar> scan_end_key;
+      bzero(&param, sizeof(param));
+      bzero(&scan_start_range, sizeof(scan_start_range));
+      bzero(&scan_end_range, sizeof(scan_end_range));
+      const std::vector<Pq_scan_range> &scan_ranges=
+        try_secondary ? handler_ranges : provider->ranges;
+      param.keyno= handler_keyno;
+      param.dop= (uint) dop;
+      param.reverse= reverse;
+      if (!scan_ranges.empty() &&
+          !pq_prepare_handler_key_range(table, handler_keyno,
+                                        handler_field_index,
+                                        scan_ranges.front().start,
+                                        scan_ranges.front().key_is_unsigned,
+                                        scan_ranges.front().key_kind,
+                                        HA_READ_KEY_OR_NEXT,
+                                        &scan_start_key, &scan_start_range))
+        param.scan_start_key= &scan_start_range;
+      if (!scan_ranges.empty() && scan_ranges.back().has_end &&
+          !pq_prepare_handler_key_range(table, handler_keyno,
+                                        handler_field_index,
+                                        scan_ranges.back().end,
+                                        scan_ranges.back().key_is_unsigned,
+                                        scan_ranges.back().key_kind,
+                                        HA_READ_BEFORE_KEY,
+                                        &scan_end_key, &scan_end_range))
+        param.scan_end_key= &scan_end_range;
+
+      void *handler_scan_ctx= NULL;
+      if (!table->file->ha_pq_leader_scan_init(current_thd, &param,
+                                               &handler_scan_ctx))
+      {
+        provider->provider_kind=
+          try_secondary ? PQ_SCAN_PROVIDER_HANDLER_SECONDARY_RANGE :
+                          PQ_SCAN_PROVIDER_HANDLER_PRIMARY;
+        provider->handler_scan_ctx= handler_scan_ctx;
+        provider->handler_scan_available= true;
+        provider->scan_keyno= handler_keyno;
+        provider->scan_field_index= handler_field_index;
+        provider->secondary_requires_cluster_lookup=
+          try_secondary && secondary_requires_cluster_lookup;
+        if (try_secondary)
+          provider->ranges.swap(handler_ranges);
+      }
+      else
+        provider->handler_scan_rejected_reason=
+          try_secondary ? "secondary_handler_leader_scan_init_failed" :
+                          "handler_leader_scan_init_failed";
+    }
+  }
+
+  return true;
+}
+
+static const char *pq_scan_provider_name(const Pq_scan_provider &provider)
+{
+  switch (provider.provider_kind)
+  {
+  case PQ_SCAN_PROVIDER_SQL_PRIMARY_KEY_RANGE:
+    return "sql_primary_key_range";
+  case PQ_SCAN_PROVIDER_HANDLER_PRIMARY:
+    return provider.reverse ?
+           "innodb_clustered_primary_reverse" :
+           "innodb_clustered_primary";
+  case PQ_SCAN_PROVIDER_HANDLER_SECONDARY_RANGE:
+    return "innodb_secondary_range";
+  }
+  return "unknown";
+}
+
+static void pq_end_scan_provider(TABLE *table, Pq_scan_provider *provider)
+{
+  if (!provider || !provider->uses_handler() || !provider->handler_scan_ctx)
+    return;
+  if (table && table->file)
+    table->file->ha_pq_leader_scan_end(provider->handler_scan_ctx);
+  provider->handler_scan_ctx= NULL;
+}
+
+class Pq_scan_provider_guard
+{
+public:
+  Pq_scan_provider_guard(TABLE *table, Pq_scan_provider *provider)
+    : m_table(table), m_provider(provider)
+  {}
+
+  ~Pq_scan_provider_guard()
+  {
+    pq_end_scan_provider(m_table, m_provider);
+  }
+
+private:
+  TABLE *m_table;
+  Pq_scan_provider *m_provider;
+};
+
+static void pq_cancel_and_awake_workers(
+    Pq_worker_cancel_state *cancel_state,
+    std::vector<std::unique_ptr<Pq_worker_control> > &controls,
+    size_t launched)
+{
+  pq_request_worker_cancel(cancel_state);
+  pq_awake_launched_workers(controls, launched);
+}
+
+template <typename Worker_arg>
+static bool pq_join_worker_and_collect_error(
+    pthread_t thread,
+    Worker_arg *arg,
+    Pq_worker_cancel_state *cancel_state,
+    std::vector<std::unique_ptr<Pq_worker_control> > &controls,
+    size_t launched,
+    bool cancel_on_worker_error,
+    Pq_worker_error *worker_error)
+{
+  pthread_join(thread, 0);
+  if (!arg->worker_error.error)
+    return false;
+
+  pq_remember_worker_error(worker_error, arg->worker_error);
+  if (cancel_on_worker_error)
+    pq_cancel_and_awake_workers(cancel_state, controls, launched);
+  return true;
+}
+
+static void pq_trace_scan_provider(THD *thd, TABLE *table,
+                                   const Pq_scan_provider &provider,
+                                   const char *query_shape,
+                                   const char *projection_order_strategy= NULL,
+                                   bool projection_order_natural= false)
+{
+  if (!thd->trace_started())
+    return;
+
+  Json_writer_object trace_wrapper(thd);
+  Json_writer_object trace_provider(thd, "parallel_query_scan_provider");
+  trace_provider.add("chosen", true);
+  trace_provider.add("query_shape", query_shape);
+  trace_provider.add("scan_provider", pq_scan_provider_name(provider));
+  trace_provider.add("handler_scan_available",
+                     provider.handler_scan_available);
+  bool record_buffer_available= false;
+  const char *worker_scan_api= "read_range_next";
+  if (provider.uses_handler() && provider.handler_scan_ctx
+      && table && table->file)
+  {
+    record_buffer_available=
+      table->file->ha_pq_scan_record_buffer_available(
+        provider.handler_scan_ctx);
+    worker_scan_api=
+      table->file->ha_pq_scan_worker_scan_api(provider.handler_scan_ctx);
+  }
+  trace_provider.add("record_buffer_available", record_buffer_available);
+  trace_provider.add("worker_scan_api", worker_scan_api);
+  if (provider.uses_handler() && provider.handler_scan_ctx
+      && table && table->file)
+  {
+    trace_provider.add("mysql_row_len",
+                       table->file->ha_pq_scan_mysql_row_len(
+                         provider.handler_scan_ctx));
+    trace_provider.add("mysql_prefix_len",
+                       table->file->ha_pq_scan_mysql_prefix_len(
+                         provider.handler_scan_ctx));
+    trace_provider.add("mysql_template_cols",
+                       table->file->ha_pq_scan_mysql_template_cols(
+                         provider.handler_scan_ctx));
+  }
+  trace_provider.add("vfd_used", false);
+  if (provider.provider_kind == PQ_SCAN_PROVIDER_HANDLER_SECONDARY_RANGE)
+  {
+    trace_provider.add("secondary_requires_cluster_lookup",
+                       provider.secondary_requires_cluster_lookup);
+    trace_provider.add("secondary_keyread_used",
+                       !provider.secondary_requires_cluster_lookup);
+  }
+  if (projection_order_strategy)
+  {
+    trace_provider.add("projection_order_strategy",
+                       projection_order_strategy);
+    trace_provider.add("projection_order_natural",
+                       projection_order_natural);
+  }
+  if (provider.uses_handler() && provider.handler_scan_ctx
+      && table && table->file)
+  {
+    trace_provider.add("btree_descriptor_available",
+                       table->file->ha_pq_scan_btree_descriptor_available(
+                         provider.handler_scan_ctx));
+    trace_provider.add("btree_descriptor_count",
+                       table->file->ha_pq_scan_btree_descriptor_count(
+                         provider.handler_scan_ctx));
+    trace_provider.add("btree_descriptor_boundary_available",
+                       table->file->ha_pq_scan_btree_boundary_available(
+                         provider.handler_scan_ctx));
+    trace_provider.add("btree_descriptor_scan_start_available",
+                       table->file->ha_pq_scan_btree_scan_start_available(
+                         provider.handler_scan_ctx));
+    trace_provider.add("btree_descriptor_scan_end_available",
+                       table->file->ha_pq_scan_btree_scan_end_available(
+                         provider.handler_scan_ctx));
+    trace_provider.add("btree_descriptor_split_used",
+                       table->file->ha_pq_scan_btree_descriptor_split_used(
+                         provider.handler_scan_ctx));
+    trace_provider.add("btree_descriptor_execution_used",
+                       table->file->ha_pq_scan_btree_descriptor_split_used(
+                         provider.handler_scan_ctx));
+    const char *btree_rejected_reason=
+      table->file->ha_pq_scan_btree_descriptor_rejected_reason(
+        provider.handler_scan_ctx);
+    if (btree_rejected_reason)
+      trace_provider.add("btree_descriptor_rejected_reason",
+                         btree_rejected_reason);
+  }
+  if (provider.handler_scan_rejected_reason)
+    trace_provider.add("handler_scan_rejected_reason",
+                       provider.handler_scan_rejected_reason);
+  trace_provider.add("range_count", (ulonglong) provider.ranges.size());
+}
+
+static void pq_trace_scalar_worker_stats(
+    THD *thd, const std::vector<Pq_count_worker_arg> &args, size_t launched)
+{
+  if (!thd->trace_started())
+    return;
+
+  Json_writer_object trace_wrapper(thd);
+  Json_writer_array trace_workers(thd, "parallel_query_worker_stats");
+  for (size_t i= 0; i < launched; i++)
+  {
+    Json_writer_object trace_worker(thd);
+    trace_worker.add("worker_id", (ulonglong) args[i].worker_id);
+    trace_worker.add("scanned_rows", args[i].scanned_rows);
+    trace_worker.add("qualified_rows", args[i].qualified_rows);
+    trace_worker.add("matched_rows", args[i].count);
+    trace_worker.add("elapsed_us", args[i].elapsed_us);
+  }
+}
+
+static void *pq_field_worker(void *arg)
+{
+  Pq_field_worker_arg *worker= static_cast<Pq_field_worker_arg *>(arg);
+  THD *thd= 0;
+  TABLE_LIST table_list;
+  List<String> worker_partition_list;
+  std::vector<String> worker_partition_strings;
+  TABLE *table= 0;
+  int error= 0;
+
+  worker->rows.clear();
+  worker->worker_error.clear();
+
+  if (my_thread_init())
+  {
+    pq_note_worker_startup_error(worker->cancel_state, &worker->worker_error);
+    return 0;
+  }
+
+  if (unlikely(worker->fail_thd_init))
+  {
+    pq_note_worker_startup_error(worker->cancel_state, &worker->worker_error);
+    my_thread_end();
+    return 0;
+  }
+
+  if (!(thd= new THD(next_thread_id())))
+  {
+    pq_note_worker_startup_error(worker->cancel_state, &worker->worker_error);
+    my_thread_end();
+    return 0;
+  }
+
+  server_threads.insert(thd);
+  set_current_thd(thd);
+  pq_prepare_worker_thd(thd);
+  pq_publish_worker_thd(worker->worker_control, thd);
+
+  if (pq_init_worker_table_list(thd, &table_list, worker->db,
+                                worker->table_name,
+                                worker->partition_names,
+                                &worker_partition_strings,
+                                &worker_partition_list))
+  {
+    worker->worker_error.error= 1;
+    goto end;
+  }
+  if (!(table= open_n_lock_single_table(thd, &table_list, TL_READ, 0)))
+  {
+    worker->worker_error.error= 1;
+    goto end;
+  }
+
+  if (worker->pk_field_index >= table->s->fields)
+  {
+    worker->worker_error.error= 1;
+    goto end;
+  }
+  table->clear_column_bitmaps();
+  bitmap_set_bit(table->read_set, worker->pk_field_index);
+  bitmap_set_bit(table->write_set, worker->pk_field_index);
+  if (worker->scan_field_index >= table->s->fields)
+  {
+    worker->worker_error.error= 1;
+    goto end;
+  }
+  bitmap_set_bit(table->read_set, worker->scan_field_index);
+  bitmap_set_bit(table->write_set, worker->scan_field_index);
+  if (!pq_mark_predicate_filter_read_set(table, worker->predicate_filter))
+  {
+    worker->worker_error.error= 1;
+    goto end;
+  }
+  for (uint field_index : worker->selected_field_indices)
+  {
+    if (field_index >= table->s->fields ||
+        !pq_is_supported_projection_field(table->field[field_index]))
+    {
+      worker->worker_error.error= 1;
+      goto end;
+    }
+    bitmap_set_bit(table->read_set, field_index);
+  }
+
+  if ((error= table->file->ha_pq_clone_snapshot(thd, worker->leader_thd)))
+  {
+    worker->worker_error.error= error;
+    goto end;
+  }
+
+  {
+    Pq_worker_scan_cursor cursor;
+    Field *pk_field= table->field[worker->pk_field_index];
+    error= cursor.init(table, worker->provider_kind,
+                       worker->handler_scan_ctx,
+                       worker->handler_scan_reverse,
+                       worker->secondary_requires_cluster_lookup,
+                       worker->worker_id,
+                       worker->worker_count, worker->scan_keyno,
+                       worker->scan_field_index,
+                       worker->range);
+    for (; !error; error= cursor.next())
+    {
+      if (unlikely(pq_worker_should_stop(worker->cancel_state,
+                                         worker->leader_thd, thd)))
+      {
+        if (pq_leader_killed(worker->leader_thd) || thd->killed)
+          error= worker->worker_error.error= HA_ERR_QUERY_INTERRUPTED;
+        else
+          error= HA_ERR_END_OF_FILE;
+        break;
+      }
+      if (unlikely(worker->fail_mid_scan))
+      {
+        error= worker->worker_error.error= 1;
+        break;
+      }
+      if (!pq_predicate_filter_matches(thd, table, worker->predicate_filter))
+        continue;
+
+      Pq_field_row row;
+      row.order_key_is_unsigned= pk_field->is_unsigned();
+      if (row.order_key_is_unsigned)
+      {
+        row.unsigned_order_key= pk_field->val_uint();
+        row.order_key= 0;
+      }
+      else
+      {
+        row.order_key= pk_field->val_int();
+        row.unsigned_order_key= 0;
+      }
+      row.null_values.reserve(worker->selected_field_indices.size());
+      row.values.reserve(worker->selected_field_indices.size());
+      for (uint field_index : worker->selected_field_indices)
+      {
+        Field *field= table->field[field_index];
+        if (field->is_null())
+        {
+          row.null_values.push_back(true);
+          row.values.emplace_back();
+          continue;
+        }
+        row.null_values.push_back(false);
+        row.values.emplace_back();
+        if (!pq_save_field_payload(field, &row.values.back()))
+        {
+          worker->worker_error.error= 1;
+          break;
+        }
+      }
+      if (worker->worker_error.error)
+        break;
+      if (!pq_store_projection_worker_row(table, worker->selected_field_indices,
+                                          worker->memory_reservation, &row,
+                                          &worker->rows))
+      {
+        worker->worker_error.error= HA_ERR_OUT_OF_MEM;
+        break;
+      }
+    }
+
+    int scan_error= error;
+    if (scan_error != HA_ERR_END_OF_FILE && !worker->worker_error.error)
+      worker->worker_error.error= scan_error;
+    if ((error= cursor.end()) && !worker->worker_error.error)
+      worker->worker_error.error= error;
+  }
+
+end:
+  if (worker->worker_error.error)
+  {
+    pq_request_worker_cancel(worker->cancel_state);
+    pq_capture_worker_error(thd, table, &worker->worker_error);
+    trans_rollback_stmt(thd);
+  }
+  else if (trans_commit_stmt(thd))
+  {
+    worker->worker_error.error= 1;
+    pq_request_worker_cancel(worker->cancel_state);
+    pq_capture_worker_error(thd, table, &worker->worker_error);
+  }
+  close_thread_tables(thd);
+  thd->clear_error();
+  thd->catalog= 0;
+  thd->reset_query();
+  thd->reset_db(&null_clex_str);
+  pq_clear_worker_thd(worker->worker_control, thd);
+  server_threads.erase(thd);
+  delete thd;
+  set_current_thd(0);
+  my_thread_end();
+  return 0;
+}
+
+static bool pq_update_group_partial(TABLE *table,
+                                    const std::vector<Pq_group_aggregate_target>
+                                    &targets,
+                                    Pq_memory_reservation *memory_reservation,
+                                    Pq_group_partial *partial)
+{
+  if (partial->aggregates.empty())
+    partial->aggregates.resize(targets.size());
+  if (partial->aggregates.size() != targets.size())
+    return false;
+
+  for (size_t i= 0; i < targets.size(); i++)
+  {
+    const Pq_group_aggregate_target &target= targets[i];
+    Pq_group_aggregate_value &value= partial->aggregates[i];
+    switch (target.aggregate_kind)
+    {
+    case Pq_count_target::PQ_AGGREGATE_COUNT_DISTINCT:
+    {
+      Pq_field_row row;
+      row.null_values.reserve(target.aggregate_arg_field_indices.size());
+      row.values.reserve(target.aggregate_arg_field_indices.size());
+      for (uint field_index : target.aggregate_arg_field_indices)
+      {
+        Field *field= table->field[field_index];
+        if (field->is_null())
+        {
+          row.null_values.push_back(true);
+          row.values.emplace_back();
+          continue;
+        }
+        row.null_values.push_back(false);
+        row.values.emplace_back();
+        if (!pq_save_field_payload(field, &row.values.back()))
+          return false;
+      }
+      if (memory_reservation &&
+          !memory_reservation->consume_materialized(
+              pq_estimate_field_row_memory(
+                  table, target.aggregate_arg_field_indices)))
+        return false;
+      value.aggregate_arg_rows.push_back(std::move(row));
+      break;
+    }
+    case Pq_count_target::PQ_AGGREGATE_COUNT:
+      if (target.aggregate_arg_on_leader)
+      {
+        Pq_field_row row;
+        row.null_values.reserve(target.aggregate_arg_field_indices.size());
+        row.values.reserve(target.aggregate_arg_field_indices.size());
+        for (uint field_index : target.aggregate_arg_field_indices)
+        {
+          Field *field= table->field[field_index];
+          if (field->is_null())
+          {
+            row.null_values.push_back(true);
+            row.values.emplace_back();
+            continue;
+          }
+          row.null_values.push_back(false);
+          row.values.emplace_back();
+          if (!pq_save_field_payload(field, &row.values.back()))
+            return false;
+        }
+        if (memory_reservation &&
+            !memory_reservation->consume_materialized(
+                pq_estimate_field_row_memory(
+                    table, target.aggregate_arg_field_indices)))
+          return false;
+        value.aggregate_arg_rows.push_back(std::move(row));
+      }
+      else if (!target.has_field || !table->field[target.field_index]->is_null())
+        value.count++;
+      break;
+    case Pq_count_target::PQ_AGGREGATE_SUM:
+    case Pq_count_target::PQ_AGGREGATE_AVG:
+    {
+      if (target.worker_expr_kind != PQ_GROUP_WORKER_EXPR_NONE)
+      {
+        my_decimal expr_value;
+        my_decimal result;
+        bool expr_is_null;
+        if (!pq_eval_q1_worker_sum_expr(table, target, &expr_value,
+                                        &expr_is_null))
+          return false;
+        if (expr_is_null)
+          break;
+        value.has_sum_value= true;
+        value.count++;
+        if (!pq_decimal_add(table->in_use, &result, &value.sum_decimal,
+                            &expr_value))
+          return false;
+        value.sum_decimal= result;
+        break;
+      }
+      if (target.aggregate_arg_on_leader)
+      {
+        Pq_field_row row;
+        row.null_values.reserve(target.aggregate_arg_field_indices.size());
+        row.values.reserve(target.aggregate_arg_field_indices.size());
+        for (uint field_index : target.aggregate_arg_field_indices)
+        {
+          Field *field= table->field[field_index];
+          if (field->is_null())
+          {
+            row.null_values.push_back(true);
+            row.values.emplace_back();
+            continue;
+          }
+          row.null_values.push_back(false);
+          row.values.emplace_back();
+          if (!pq_save_field_payload(field, &row.values.back()))
+            return false;
+        }
+        if (memory_reservation &&
+            !memory_reservation->consume_materialized(
+                pq_estimate_field_row_memory(
+                    table, target.aggregate_arg_field_indices)))
+          return false;
+        value.aggregate_arg_rows.push_back(std::move(row));
+        break;
+      }
+      Field *field= table->field[target.field_index];
+      if (field->is_null())
+        break;
+      value.has_sum_value= true;
+      value.count++;
+      if (target.sum_decimal_result)
+      {
+        my_decimal field_decimal;
+        my_decimal result;
+        my_decimal *field_value= field->val_decimal(&field_decimal);
+        if (!field_value)
+          return false;
+        if (!pq_decimal_add(table->in_use, &result, &value.sum_decimal,
+                            field_value))
+          return false;
+        value.sum_decimal= result;
+      }
+      else
+        value.sum_real+= field->val_real();
+      break;
+    }
+    case Pq_count_target::PQ_AGGREGATE_MIN:
+    case Pq_count_target::PQ_AGGREGATE_MAX:
+    {
+      if (target.aggregate_arg_on_leader)
+      {
+        Pq_field_row row;
+        row.null_values.reserve(target.aggregate_arg_field_indices.size());
+        row.values.reserve(target.aggregate_arg_field_indices.size());
+        for (uint field_index : target.aggregate_arg_field_indices)
+        {
+          Field *field= table->field[field_index];
+          if (field->is_null())
+          {
+            row.null_values.push_back(true);
+            row.values.emplace_back();
+            continue;
+          }
+          row.null_values.push_back(false);
+          row.values.emplace_back();
+          if (!pq_save_field_payload(field, &row.values.back()))
+            return false;
+        }
+        if (memory_reservation &&
+            !memory_reservation->consume_materialized(
+                pq_estimate_field_row_memory(
+                    table, target.aggregate_arg_field_indices)))
+          return false;
+        value.aggregate_arg_rows.push_back(std::move(row));
+        break;
+      }
+      Field *field= table->field[target.field_index];
+      if (field->is_null())
+        break;
+      if (!value.has_minmax_value)
+      {
+        value.has_minmax_value= true;
+        if (!pq_save_field_payload(field, &value.minmax_value))
+          return false;
+        break;
+      }
+      std::vector<uchar> current_minmax_value;
+      if (!pq_save_field_payload(field, &current_minmax_value))
+        return false;
+      int cmp= pq_compare_minmax_field(field, current_minmax_value.data(),
+                                       value.minmax_value.data());
+      if ((target.aggregate_kind == Pq_count_target::PQ_AGGREGATE_MIN &&
+           cmp < 0) ||
+          (target.aggregate_kind == Pq_count_target::PQ_AGGREGATE_MAX &&
+           cmp > 0))
+        value.minmax_value= current_minmax_value;
+      break;
+    }
+    default:
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool pq_merge_group_partials(THD *thd,
+                                    const std::vector<Pq_group_aggregate_target>
+                                    &targets,
+                                    const Pq_group_partial &source,
+                                    Pq_group_partial *destination)
+{
+  if (destination->aggregates.empty())
+    destination->aggregates.resize(targets.size());
+
+  for (size_t i= 0; i < targets.size(); i++)
+  {
+    Pq_group_aggregate_value &dst= destination->aggregates[i];
+    const Pq_group_aggregate_value &src= source.aggregates[i];
+    if (targets[i].aggregate_kind == Pq_count_target::PQ_AGGREGATE_COUNT_DISTINCT)
+    {
+      dst.aggregate_arg_rows.insert(
+        dst.aggregate_arg_rows.end(),
+        src.aggregate_arg_rows.begin(), src.aggregate_arg_rows.end());
+      continue;
+    }
+    dst.count+= src.count;
+    if (targets[i].aggregate_kind == Pq_count_target::PQ_AGGREGATE_SUM ||
+        targets[i].aggregate_kind == Pq_count_target::PQ_AGGREGATE_AVG)
+    {
+      if (!src.has_sum_value)
+      {
+        dst.aggregate_arg_rows.insert(
+          dst.aggregate_arg_rows.end(),
+          src.aggregate_arg_rows.begin(), src.aggregate_arg_rows.end());
+        continue;
+      }
+      dst.has_sum_value= true;
+      if (targets[i].sum_decimal_result)
+      {
+        my_decimal result;
+        if (!pq_decimal_add(thd, &result, &dst.sum_decimal,
+                            &src.sum_decimal))
+          return false;
+        dst.sum_decimal= result;
+      }
+      else
+        dst.sum_real+= src.sum_real;
+    }
+    else if (targets[i].aggregate_kind == Pq_count_target::PQ_AGGREGATE_COUNT)
+    {
+      dst.aggregate_arg_rows.insert(
+        dst.aggregate_arg_rows.end(),
+        src.aggregate_arg_rows.begin(), src.aggregate_arg_rows.end());
+    }
+    else if (targets[i].aggregate_kind == Pq_count_target::PQ_AGGREGATE_MIN ||
+             targets[i].aggregate_kind == Pq_count_target::PQ_AGGREGATE_MAX)
+    {
+      if (targets[i].aggregate_arg_on_leader)
+      {
+        dst.aggregate_arg_rows.insert(
+          dst.aggregate_arg_rows.end(),
+          src.aggregate_arg_rows.begin(), src.aggregate_arg_rows.end());
+        continue;
+      }
+      if (!src.has_minmax_value)
+        continue;
+      if (!dst.has_minmax_value)
+      {
+        dst.has_minmax_value= true;
+        dst.minmax_value= src.minmax_value;
+        continue;
+      }
+
+      Field *field= targets[i].sum_item->get_arg(0)->type() == Item::FIELD_ITEM ?
+        static_cast<Item_field *>(targets[i].sum_item->get_arg(0))->field : 0;
+      if (!field)
+        return false;
+      int cmp= pq_compare_minmax_field(field, src.minmax_value.data(),
+                                       dst.minmax_value.data());
+      if ((targets[i].aggregate_kind == Pq_count_target::PQ_AGGREGATE_MIN &&
+           cmp < 0) ||
+          (targets[i].aggregate_kind == Pq_count_target::PQ_AGGREGATE_MAX &&
+           cmp > 0))
+        dst.minmax_value= src.minmax_value;
+    }
+  }
+  return true;
+}
+
+class Pq_group_aggregate_transport
+{
+public:
+  explicit Pq_group_aggregate_transport(Pq_group_map *groups)
+    : m_groups(groups)
+  {}
+
+  void clear()
+  {
+    m_groups->clear();
+  }
+
+  bool append_worker_partials(
+      THD *thd,
+      const std::vector<Pq_group_aggregate_target> &aggregate_targets,
+      const Pq_group_map &worker_groups)
+  {
+    for (const auto &entry : worker_groups)
+    {
+      if (!pq_merge_group_partials(thd, aggregate_targets, entry.second,
+                                   &(*m_groups)[entry.first]))
+        return false;
+    }
+    return true;
+  }
+
+private:
+  Pq_group_map *m_groups;
+};
+
+static void *pq_group_worker(void *arg)
+{
+  Pq_group_worker_arg *worker= static_cast<Pq_group_worker_arg *>(arg);
+  THD *thd= 0;
+  TABLE_LIST table_list;
+  List<String> worker_partition_list;
+  std::vector<String> worker_partition_strings;
+  TABLE *table= 0;
+  int error= 0;
+
+  worker->groups.clear();
+  worker->worker_error.clear();
+
+  if (my_thread_init())
+  {
+    pq_note_worker_startup_error(worker->cancel_state, &worker->worker_error);
+    return 0;
+  }
+
+  if (unlikely(worker->fail_thd_init))
+  {
+    pq_note_worker_startup_error(worker->cancel_state, &worker->worker_error);
+    my_thread_end();
+    return 0;
+  }
+
+  if (!(thd= new THD(next_thread_id())))
+  {
+    pq_note_worker_startup_error(worker->cancel_state, &worker->worker_error);
+    my_thread_end();
+    return 0;
+  }
+
+  server_threads.insert(thd);
+  set_current_thd(thd);
+  pq_prepare_worker_thd(thd);
+  pq_publish_worker_thd(worker->worker_control, thd);
+
+  if (pq_init_worker_table_list(thd, &table_list, worker->db,
+                                worker->table_name,
+                                worker->partition_names,
+                                &worker_partition_strings,
+                                &worker_partition_list))
+  {
+    worker->worker_error.error= 1;
+    goto end;
+  }
+  if (!(table= open_n_lock_single_table(thd, &table_list, TL_READ, 0)))
+  {
+    worker->worker_error.error= 1;
+    goto end;
+  }
+
+  if (worker->pk_field_index >= table->s->fields)
+  {
+    worker->worker_error.error= 1;
+    goto end;
+  }
+  table->clear_column_bitmaps();
+  if (worker->scan_field_index >= table->s->fields)
+  {
+    worker->worker_error.error= 1;
+    goto end;
+  }
+  if (worker->provider_kind == PQ_SCAN_PROVIDER_SQL_PRIMARY_KEY_RANGE)
+  {
+    bitmap_set_bit(table->read_set, worker->scan_field_index);
+    bitmap_set_bit(table->write_set, worker->scan_field_index);
+  }
+  if (!pq_mark_predicate_filter_read_set(table, worker->predicate_filter))
+  {
+    worker->worker_error.error= 1;
+    goto end;
+  }
+  for (uint field_index : worker->group_field_indices)
+  {
+    if (field_index >= table->s->fields ||
+        !pq_is_supported_projection_field(table->field[field_index]))
+    {
+      worker->worker_error.error= 1;
+      goto end;
+    }
+    bitmap_set_bit(table->read_set, field_index);
+  }
+  for (const Pq_group_aggregate_target &target :
+       worker->aggregate_targets)
+  {
+    if (target.has_field)
+    {
+      if (target.field_index >= table->s->fields)
+      {
+        worker->worker_error.error= 1;
+        goto end;
+      }
+      bitmap_set_bit(table->read_set, target.field_index);
+    }
+    for (uint field_index : target.aggregate_arg_field_indices)
+    {
+      if (field_index >= table->s->fields ||
+          !pq_is_supported_projection_field(table->field[field_index]))
+      {
+        worker->worker_error.error= 1;
+        goto end;
+      }
+      bitmap_set_bit(table->read_set, field_index);
+    }
+  }
+
+  if ((error= table->file->ha_pq_clone_snapshot(thd, worker->leader_thd)))
+  {
+    worker->worker_error.error= error;
+    goto end;
+  }
+
+  {
+    Pq_worker_scan_cursor cursor;
+    error= cursor.init(table, worker->provider_kind,
+                       worker->handler_scan_ctx,
+                       worker->handler_scan_reverse,
+                       worker->secondary_requires_cluster_lookup,
+                       worker->worker_id,
+                       worker->worker_count, worker->scan_keyno,
+                       worker->scan_field_index,
+                       worker->range);
+    for (; !error; error= cursor.next())
+    {
+      if (unlikely(pq_worker_should_stop(worker->cancel_state,
+                                         worker->leader_thd, thd)))
+      {
+        if (pq_leader_killed(worker->leader_thd) || thd->killed)
+          error= worker->worker_error.error= HA_ERR_QUERY_INTERRUPTED;
+        else
+          error= HA_ERR_END_OF_FILE;
+        break;
+      }
+      if (unlikely(worker->fail_mid_scan))
+      {
+        error= worker->worker_error.error= 1;
+        break;
+      }
+      if (!pq_predicate_filter_matches(thd, table, worker->predicate_filter))
+        continue;
+
+      Pq_group_key key;
+      if (!pq_make_group_key(table, worker->group_field_indices, &key))
+      {
+        worker->worker_error.error= 1;
+        break;
+      }
+      auto group_pos= worker->groups.find(key);
+      if (group_pos == worker->groups.end())
+      {
+        if (worker->memory_reservation &&
+            !worker->memory_reservation->consume_materialized(
+                pq_estimate_field_row_memory(table,
+                                             worker->group_field_indices)))
+        {
+          worker->worker_error.error= HA_ERR_OUT_OF_MEM;
+          break;
+        }
+        group_pos= worker->groups.emplace(std::move(key),
+                                          Pq_group_partial()).first;
+      }
+      if (!pq_update_group_partial(table, worker->aggregate_targets,
+                                   worker->memory_reservation,
+                                   &group_pos->second))
+      {
+        worker->worker_error.error= 1;
+        break;
+      }
+    }
+
+    int scan_error= error;
+    if (scan_error != HA_ERR_END_OF_FILE && !worker->worker_error.error)
+      worker->worker_error.error= scan_error;
+    if ((error= cursor.end()) && !worker->worker_error.error)
+      worker->worker_error.error= error;
+  }
+
+end:
+  if (worker->worker_error.error)
+  {
+    pq_request_worker_cancel(worker->cancel_state);
+    pq_capture_worker_error(thd, table, &worker->worker_error);
+    trans_rollback_stmt(thd);
+  }
+  else if (trans_commit_stmt(thd))
+  {
+    worker->worker_error.error= 1;
+    pq_request_worker_cancel(worker->cancel_state);
+    pq_capture_worker_error(thd, table, &worker->worker_error);
+  }
+  close_thread_tables(thd);
+  thd->clear_error();
+  thd->catalog= 0;
+  thd->reset_query();
+  thd->reset_db(&null_clex_str);
+  pq_clear_worker_thd(worker->worker_control, thd);
+  server_threads.erase(thd);
+  delete thd;
+  set_current_thd(0);
+  my_thread_end();
+  return 0;
+}
+
+enum Pq_execution_result
+{
+  PQ_EXEC_NOT_APPLIED,
+  PQ_EXEC_OK,
+  PQ_EXEC_ERROR
+};
+
+enum Pq_not_applied_reason
+{
+  PQ_NOT_APPLIED_NONE,
+  PQ_NOT_APPLIED_DOP,
+  PQ_NOT_APPLIED_SNAPSHOT,
+  PQ_NOT_APPLIED_RANGE_SPLIT,
+  PQ_NOT_APPLIED_MEMORY,
+  PQ_NOT_APPLIED_THREADS,
+  PQ_NOT_APPLIED_WORKER_CONTROL
+};
+
+static const char *pq_not_applied_reason_name(Pq_not_applied_reason reason)
+{
+  switch (reason)
+  {
+  case PQ_NOT_APPLIED_DOP:
+    return "dop_less_than_two";
+  case PQ_NOT_APPLIED_SNAPSHOT:
+    return "parallel_snapshot_failed";
+  case PQ_NOT_APPLIED_RANGE_SPLIT:
+    return "parallel_range_split_failed";
+  case PQ_NOT_APPLIED_MEMORY:
+    return "parallel_memory_exhausted";
+  case PQ_NOT_APPLIED_THREADS:
+    return "parallel_threads_exhausted";
+  case PQ_NOT_APPLIED_WORKER_CONTROL:
+    return "parallel_worker_control_failed";
+  case PQ_NOT_APPLIED_NONE:
+    return "parallel_setup_failed";
+  }
+  return "parallel_setup_failed";
+}
+
+static Pq_execution_result pq_exec_not_applied(
+    Pq_not_applied_reason reason, Pq_not_applied_reason *out_reason)
+{
+  if (out_reason)
+    *out_reason= reason;
+  return PQ_EXEC_NOT_APPLIED;
+}
+
+static Pq_execution_result pq_exec_not_applied_after_snapshot(
+    THD *thd, TABLE *table, Pq_not_applied_reason reason,
+    Pq_not_applied_reason *out_reason)
+{
+  if (table && table->file)
+    table->file->ha_pq_refresh_snapshot_for_retry(thd);
+  return pq_exec_not_applied(reason, out_reason);
+}
+
+static void pq_raise_worker_error(THD *thd, TABLE *table,
+                                  const Pq_worker_error &worker_error)
+{
+  if (thd->killed)
+  {
+    thd->send_kill_message();
+    return;
+  }
+  if (!thd->is_error())
+  {
+    if (worker_error.sql_errno)
+      thd->get_stmt_da()->set_error_status(worker_error.sql_errno,
+                                           worker_error.message,
+                                           worker_error.sqlstate,
+                                           NULL);
+    else if (worker_error.error == HA_ERR_QUERY_INTERRUPTED)
+      my_error(ER_QUERY_INTERRUPTED, MYF(0));
+    else if (worker_error.error > 1 && table && table->file)
+      table->file->print_error(worker_error.error, MYF(0));
+    else
+      my_printf_error(ER_UNKNOWN_ERROR, "Parallel Query worker failed",
+                      MYF(0));
+  }
+}
+
+static Pq_execution_result
+pq_parallel_count_table(THD *thd, TABLE *table,
+                        const Pq_predicate_filter &predicate_filter,
+                        const Pq_count_target &target,
+                        uint secondary_keyno,
+                        const char *secondary_rejected_reason,
+                        Pq_scalar_aggregate_result *result,
+                        Pq_not_applied_reason *not_applied_reason)
+{
+  if (not_applied_reason)
+    *not_applied_reason= PQ_NOT_APPLIED_NONE;
+
+  size_t dop= pq_worker_dop(thd, table->pos_in_table_list);
+  if (dop < 2)
+    return pq_exec_not_applied(PQ_NOT_APPLIED_DOP, not_applied_reason);
+
+  Pq_memory_reservation memory_reservation;
+  if (table->file->ha_pq_create_snapshot(thd))
+    return pq_exec_not_applied(PQ_NOT_APPLIED_SNAPSHOT, not_applied_reason);
+  DEBUG_SYNC(thd, "after_pq_create_snapshot");
+
+  Pq_scan_provider scan_provider;
+  if (!pq_build_primary_key_scan_provider(table, dop, &predicate_filter,
+                                          false, secondary_keyno, false,
+                                          secondary_rejected_reason,
+                                          &scan_provider))
+    return pq_exec_not_applied_after_snapshot(thd, table,
+                                              PQ_NOT_APPLIED_RANGE_SPLIT,
+                                              not_applied_reason);
+  Pq_scan_provider_guard scan_provider_guard(table, &scan_provider);
+  const size_t worker_count= scan_provider.ranges.size();
+
+  if (!memory_reservation.reserve(pq_estimated_memory(worker_count)))
+    return pq_exec_not_applied_after_snapshot(thd, table,
+                                              PQ_NOT_APPLIED_MEMORY,
+                                              not_applied_reason);
+
+  Pq_thread_reservation reservation;
+  if (!reservation.reserve(thd, worker_count))
+  {
+    if (thd->killed)
+    {
+      thd->send_kill_message();
+      return PQ_EXEC_ERROR;
+    }
+    return pq_exec_not_applied_after_snapshot(thd, table,
+                                              PQ_NOT_APPLIED_THREADS,
+                                              not_applied_reason);
+  }
+  DEBUG_SYNC(thd, "after_pq_thread_reserve");
+
+  std::vector<std::unique_ptr<Pq_worker_control> > controls;
+  if (!pq_init_worker_controls(scan_provider.ranges.size(), &controls))
+    return pq_exec_not_applied_after_snapshot(thd, table,
+                                              PQ_NOT_APPLIED_WORKER_CONTROL,
+                                              not_applied_reason);
+  std::vector<pthread_t> threads(scan_provider.ranges.size());
+  std::vector<Pq_count_worker_arg> args(scan_provider.ranges.size());
+  Pq_worker_cancel_state cancel_state;
+  size_t launched= 0;
+  bool launch_interrupted= false;
+  int launch_error= 0;
+  for (size_t i= 0; i < scan_provider.ranges.size(); i++)
+  {
+    if (unlikely(thd->check_killed(true)))
+    {
+      launch_interrupted= true;
+      break;
+    }
+    args[i].leader_thd= thd;
+    args[i].worker_control= controls[i].get();
+    args[i].cancel_state= &cancel_state;
+    args[i].db= &table->s->db;
+    args[i].table_name= &table->s->table_name;
+    pq_copy_partition_names(table, &args[i].partition_names);
+    args[i].provider_kind= scan_provider.provider_kind;
+    args[i].handler_scan_ctx= scan_provider.handler_scan_ctx;
+    args[i].handler_scan_reverse= scan_provider.reverse;
+    args[i].secondary_requires_cluster_lookup=
+      scan_provider.secondary_requires_cluster_lookup;
+    args[i].scan_keyno= scan_provider.scan_keyno;
+    args[i].scan_field_index= scan_provider.scan_field_index;
+    args[i].worker_id= (uint) i;
+    args[i].worker_count= (uint) scan_provider.ranges.size();
+    args[i].range= scan_provider.ranges[i];
+    args[i].pk_field_index= scan_provider.pk_field_index;
+    args[i].fail_thd_init= false;
+    DBUG_EXECUTE_IF("pq_fail_worker_thd_init",
+                    if (i == 0) args[i].fail_thd_init= true;);
+    args[i].fail_mid_scan= false;
+    DBUG_EXECUTE_IF("pq_fail_worker_mid_scan",
+                    if (i == 0) args[i].fail_mid_scan= true;);
+    DBUG_EXECUTE_IF("pq_fail_last_worker_mid_scan",
+                    if (i + 1 == scan_provider.ranges.size())
+                      args[i].fail_mid_scan= true;);
+    args[i].has_count_field=
+      target.aggregate_kind == Pq_count_target::PQ_AGGREGATE_COUNT &&
+      target.has_field;
+    args[i].count_field_index= target.field_index;
+    args[i].has_sum_field=
+      !target.has_sum_product_fields &&
+      (target.aggregate_kind == Pq_count_target::PQ_AGGREGATE_SUM ||
+       target.aggregate_kind == Pq_count_target::PQ_AGGREGATE_AVG);
+    args[i].sum_field_index= target.field_index;
+    args[i].has_sum_product_fields= target.has_sum_product_fields;
+    args[i].sum_product_left_field_index=
+      target.sum_product_left_field_index;
+    args[i].sum_product_right_field_index=
+      target.sum_product_right_field_index;
+    args[i].sum_decimal_result= target.sum_decimal_result;
+    args[i].sum_count_nonnull=
+      target.aggregate_kind == Pq_count_target::PQ_AGGREGATE_AVG;
+    args[i].has_minmax_field=
+      target.aggregate_kind == Pq_count_target::PQ_AGGREGATE_MIN ||
+      target.aggregate_kind == Pq_count_target::PQ_AGGREGATE_MAX;
+    args[i].minmax_field_index= target.field_index;
+    args[i].minmax_is_min=
+      target.aggregate_kind == Pq_count_target::PQ_AGGREGATE_MIN;
+    args[i].predicate_filter= predicate_filter;
+    args[i].count= 0;
+    args[i].has_sum_value= false;
+    my_decimal_set_zero(&args[i].sum_decimal);
+    args[i].sum_real= 0.0;
+    args[i].has_minmax_value= false;
+    args[i].minmax_value.clear();
+    args[i].worker_error.clear();
+    if ((launch_error= pq_create_worker_thread(&threads[i], pq_count_worker,
+                                               &args[i], i)))
+      break;
+    launched++;
+  }
+
+  if (launched != scan_provider.ranges.size())
+  {
+    bool failed= false;
+    Pq_worker_error worker_error;
+    worker_error.clear();
+    if (launched && (launch_interrupted || thd->killed || launch_error))
+      pq_cancel_and_awake_workers(&cancel_state, controls, launched);
+    for (size_t i= 0; i < launched; i++)
+    {
+      if (pq_join_worker_and_collect_error(threads[i], &args[i],
+                                           &cancel_state, controls, launched,
+                                           false, &worker_error))
+        failed= true;
+    }
+    if (launch_interrupted)
+    {
+      failed= true;
+      worker_error.error= HA_ERR_QUERY_INTERRUPTED;
+    }
+    if (failed)
+    {
+      pq_raise_worker_error(thd, table, worker_error);
+      return PQ_EXEC_ERROR;
+    }
+    if (launched)
+    {
+      my_error(ER_CANT_CREATE_THREAD, MYF(ME_FATAL), launch_error);
+      return PQ_EXEC_ERROR;
+    }
+    return pq_exec_not_applied_after_snapshot(thd, table,
+                                              PQ_NOT_APPLIED_THREADS,
+                                              not_applied_reason);
+  }
+  pq_trace_scan_provider(thd, table, scan_provider, "scalar_aggregate");
+  DEBUG_SYNC(thd, "after_pq_workers_launched");
+
+  Pq_scalar_aggregate_transport aggregate_transport(result);
+  aggregate_transport.clear();
+  bool failed= thd->killed;
+  Pq_worker_error worker_error;
+  worker_error.clear();
+  if (thd->killed)
+  {
+    worker_error.error= HA_ERR_QUERY_INTERRUPTED;
+    pq_cancel_and_awake_workers(&cancel_state, controls, launched);
+  }
+  for (size_t i= 0; i < launched; i++)
+  {
+    if (pq_join_worker_and_collect_error(threads[i], &args[i], &cancel_state,
+                                         controls, launched, true,
+                                         &worker_error))
+      failed= true;
+    if (!aggregate_transport.append_worker_partial(thd, table, target,
+                                                   args[i]))
+      failed= true;
+  }
+  pq_trace_scalar_worker_stats(thd, args, launched);
+  if (!failed &&
+      !aggregate_transport.finalize_worker_item(thd, table, target))
+    failed= true;
+  if (failed)
+  {
+    pq_raise_worker_error(thd, table, worker_error);
+    return PQ_EXEC_ERROR;
+  }
+  return PQ_EXEC_OK;
+}
+
+struct Pq_projection_merge_cursor
+{
+  size_t worker_index;
+  size_t row_index;
+};
+
+static void pq_gather_merge_projection_rows(
+    TABLE *table, const std::vector<uint> &selected_fields,
+    const std::vector<Pq_projection_order_key> &order_keys,
+    std::vector<Pq_field_worker_arg> *args, size_t launched,
+    std::vector<Pq_field_row> *rows)
+{
+  size_t total_rows= 0;
+  for (size_t i= 0; i < launched; i++)
+    total_rows+= (*args)[i].rows.size();
+
+  rows->clear();
+  rows->reserve(total_rows);
+
+  std::vector<Pq_projection_merge_cursor> heap;
+  heap.reserve(launched);
+
+  auto cursor_less=
+    [table, &selected_fields, &order_keys, args]
+    (const Pq_projection_merge_cursor &left,
+     const Pq_projection_merge_cursor &right)
+    {
+      const Pq_field_row &left_row=
+        (*args)[left.worker_index].rows[left.row_index];
+      const Pq_field_row &right_row=
+        (*args)[right.worker_index].rows[right.row_index];
+      int cmp= pq_compare_projection_order(table, selected_fields,
+                                           order_keys, left_row, right_row);
+      if (cmp)
+        return cmp > 0;
+      if (left.worker_index != right.worker_index)
+        return left.worker_index > right.worker_index;
+      return left.row_index > right.row_index;
+    };
+
+  for (size_t i= 0; i < launched; i++)
+  {
+    if ((*args)[i].rows.empty())
+      continue;
+    Pq_projection_merge_cursor cursor;
+    cursor.worker_index= i;
+    cursor.row_index= 0;
+    heap.push_back(cursor);
+    std::push_heap(heap.begin(), heap.end(), cursor_less);
+  }
+
+  while (!heap.empty())
+  {
+    std::pop_heap(heap.begin(), heap.end(), cursor_less);
+    Pq_projection_merge_cursor cursor= heap.back();
+    heap.pop_back();
+
+    std::vector<Pq_field_row> &worker_rows= (*args)[cursor.worker_index].rows;
+    rows->push_back(std::move(worker_rows[cursor.row_index]));
+
+    cursor.row_index++;
+    if (cursor.row_index < worker_rows.size())
+    {
+      heap.push_back(cursor);
+      std::push_heap(heap.begin(), heap.end(), cursor_less);
+    }
+  }
+}
+
+static Pq_execution_result
+pq_parallel_read_fields(THD *thd, TABLE *table,
+                        const Pq_predicate_filter &predicate_filter,
+                        const std::vector<uint> &selected_fields,
+                        const std::vector<Pq_projection_order_key>
+                        &order_keys,
+                        uint secondary_keyno,
+                        bool secondary_requires_cluster_lookup,
+                        const char *secondary_rejected_reason,
+                        Pq_memory_reservation *memory_reservation,
+                        std::vector<Pq_field_row> *rows,
+                        Pq_not_applied_reason *not_applied_reason)
+{
+  if (not_applied_reason)
+    *not_applied_reason= PQ_NOT_APPLIED_NONE;
+
+  size_t dop= pq_worker_dop(thd, table->pos_in_table_list);
+  if (dop < 2)
+    return pq_exec_not_applied(PQ_NOT_APPLIED_DOP, not_applied_reason);
+
+  if (table->file->ha_pq_create_snapshot(thd))
+    return pq_exec_not_applied(PQ_NOT_APPLIED_SNAPSHOT, not_applied_reason);
+  DEBUG_SYNC(thd, "after_pq_create_snapshot");
+
+  Pq_scan_provider scan_provider;
+  bool handler_reverse=
+    pq_projection_order_is_single_pk_desc(table, order_keys);
+  if (!pq_build_primary_key_scan_provider(table, dop, &predicate_filter,
+                                          handler_reverse, secondary_keyno,
+                                          secondary_requires_cluster_lookup,
+                                          secondary_rejected_reason,
+                                          &scan_provider))
+    return pq_exec_not_applied_after_snapshot(thd, table,
+                                              PQ_NOT_APPLIED_RANGE_SPLIT,
+                                              not_applied_reason);
+  Pq_scan_provider_guard scan_provider_guard(table, &scan_provider);
+  const size_t worker_count= scan_provider.ranges.size();
+
+  if (!memory_reservation->reserve(pq_estimated_memory(worker_count)))
+    return pq_exec_not_applied_after_snapshot(thd, table,
+                                              PQ_NOT_APPLIED_MEMORY,
+                                              not_applied_reason);
+  if (!memory_reservation->prepay_materialized(
+          pq_estimate_materialized_peak_memory(table, selected_fields)))
+    return pq_exec_not_applied_after_snapshot(thd, table,
+                                              PQ_NOT_APPLIED_MEMORY,
+                                              not_applied_reason);
+
+  Pq_thread_reservation reservation;
+  if (!reservation.reserve(thd, worker_count))
+  {
+    if (thd->killed)
+    {
+      thd->send_kill_message();
+      return PQ_EXEC_ERROR;
+    }
+    return pq_exec_not_applied_after_snapshot(thd, table,
+                                              PQ_NOT_APPLIED_THREADS,
+                                              not_applied_reason);
+  }
+  DEBUG_SYNC(thd, "after_pq_thread_reserve");
+
+  std::vector<std::unique_ptr<Pq_worker_control> > controls;
+  if (!pq_init_worker_controls(scan_provider.ranges.size(), &controls))
+    return pq_exec_not_applied_after_snapshot(thd, table,
+                                              PQ_NOT_APPLIED_WORKER_CONTROL,
+                                              not_applied_reason);
+  std::vector<pthread_t> threads(scan_provider.ranges.size());
+  std::vector<Pq_field_worker_arg> args(scan_provider.ranges.size());
+  Pq_worker_cancel_state cancel_state;
+  size_t launched= 0;
+  bool launch_interrupted= false;
+  int launch_error= 0;
+  for (size_t i= 0; i < scan_provider.ranges.size(); i++)
+  {
+    if (unlikely(thd->check_killed(true)))
+    {
+      launch_interrupted= true;
+      break;
+    }
+    args[i].leader_thd= thd;
+    args[i].worker_control= controls[i].get();
+    args[i].cancel_state= &cancel_state;
+    args[i].db= &table->s->db;
+    args[i].table_name= &table->s->table_name;
+    pq_copy_partition_names(table, &args[i].partition_names);
+    args[i].provider_kind= scan_provider.provider_kind;
+    args[i].handler_scan_ctx= scan_provider.handler_scan_ctx;
+    args[i].handler_scan_reverse= scan_provider.reverse;
+    args[i].secondary_requires_cluster_lookup=
+      scan_provider.secondary_requires_cluster_lookup;
+    args[i].scan_keyno= scan_provider.scan_keyno;
+    args[i].scan_field_index= scan_provider.scan_field_index;
+    args[i].worker_id= (uint) i;
+    args[i].worker_count= (uint) scan_provider.ranges.size();
+    args[i].range= scan_provider.ranges[i];
+    args[i].pk_field_index= scan_provider.pk_field_index;
+    args[i].fail_thd_init= false;
+    DBUG_EXECUTE_IF("pq_fail_worker_thd_init",
+                    if (i == 0) args[i].fail_thd_init= true;);
+    args[i].fail_mid_scan= false;
+    DBUG_EXECUTE_IF("pq_fail_worker_mid_scan",
+                    if (i == 0) args[i].fail_mid_scan= true;);
+    DBUG_EXECUTE_IF("pq_fail_last_worker_mid_scan",
+                    if (i + 1 == scan_provider.ranges.size())
+                      args[i].fail_mid_scan= true;);
+    args[i].predicate_filter= predicate_filter;
+    args[i].selected_field_indices= selected_fields;
+    args[i].memory_reservation= memory_reservation;
+    args[i].worker_error.clear();
+    if ((launch_error= pq_create_worker_thread(&threads[i], pq_field_worker,
+                                               &args[i], i)))
+      break;
+    launched++;
+  }
+
+  if (launched != scan_provider.ranges.size())
+  {
+    bool failed= false;
+    Pq_worker_error worker_error;
+    worker_error.clear();
+    if (launched && (launch_interrupted || thd->killed || launch_error))
+      pq_cancel_and_awake_workers(&cancel_state, controls, launched);
+    for (size_t i= 0; i < launched; i++)
+    {
+      if (pq_join_worker_and_collect_error(threads[i], &args[i],
+                                           &cancel_state, controls, launched,
+                                           false, &worker_error))
+        failed= true;
+    }
+    if (launch_interrupted)
+    {
+      failed= true;
+      worker_error.error= HA_ERR_QUERY_INTERRUPTED;
+    }
+    if (failed)
+    {
+      pq_raise_worker_error(thd, table, worker_error);
+      return PQ_EXEC_ERROR;
+    }
+    if (launched)
+    {
+      my_error(ER_CANT_CREATE_THREAD, MYF(ME_FATAL), launch_error);
+      return PQ_EXEC_ERROR;
+    }
+    return pq_exec_not_applied_after_snapshot(thd, table,
+                                              PQ_NOT_APPLIED_THREADS,
+                                              not_applied_reason);
+  }
+  bool projection_gather_merge=
+    pq_projection_order_can_gather_merge(table, scan_provider, order_keys);
+  pq_trace_scan_provider(thd, table, scan_provider, "projection",
+                         projection_gather_merge ? "gather_merge" :
+                                                   "leader_sort",
+                         projection_gather_merge);
+  DEBUG_SYNC(thd, "after_pq_workers_launched");
+
+  Pq_projection_row_transport row_transport(rows);
+  row_transport.clear();
+  bool failed= thd->killed;
+  Pq_worker_error worker_error;
+  worker_error.clear();
+  if (thd->killed)
+  {
+    worker_error.error= HA_ERR_QUERY_INTERRUPTED;
+    pq_cancel_and_awake_workers(&cancel_state, controls, launched);
+  }
+  for (size_t i= 0; i < launched; i++)
+  {
+    if (pq_join_worker_and_collect_error(threads[i], &args[i], &cancel_state,
+                                         controls, launched, true,
+                                         &worker_error))
+      failed= true;
+  }
+  if (failed)
+  {
+    pq_raise_worker_error(thd, table, worker_error);
+    return PQ_EXEC_ERROR;
+  }
+
+  if (projection_gather_merge)
+    pq_gather_merge_projection_rows(table, selected_fields, order_keys, &args,
+                                    launched, rows);
+  else
+  {
+    for (size_t i= 0; i < launched; i++)
+      row_transport.append_worker_rows(&args[i].rows);
+
+    if (!pq_materialize_projection_order_expressions(thd, table,
+                                                     selected_fields,
+                                                     order_keys, rows))
+      return PQ_EXEC_ERROR;
+
+    std::sort(rows->begin(), rows->end(),
+              [table, &selected_fields, &order_keys]
+              (const Pq_field_row &a, const Pq_field_row &b)
+              {
+                int cmp= !order_keys.empty() ?
+                         pq_compare_projection_order(table, selected_fields,
+                                                     order_keys, a, b) :
+                         pq_compare_field_row_pk(a, b);
+                return cmp < 0;
+              });
+  }
+  return PQ_EXEC_OK;
+}
+
+static Pq_execution_result pq_parallel_group_aggregate(
+            THD *thd, TABLE *table,
+            const Pq_predicate_filter &predicate_filter,
+            const std::vector<uint> &group_fields,
+            const std::vector<Pq_group_aggregate_target> &aggregate_targets,
+            uint secondary_keyno,
+            bool secondary_requires_cluster_lookup,
+            const char *secondary_rejected_reason,
+            Pq_memory_reservation *memory_reservation,
+            Pq_group_map *groups,
+            Pq_not_applied_reason *not_applied_reason)
+{
+  if (not_applied_reason)
+    *not_applied_reason= PQ_NOT_APPLIED_NONE;
+
+  size_t dop= pq_worker_dop(thd, table->pos_in_table_list);
+  if (dop < 2)
+    return pq_exec_not_applied(PQ_NOT_APPLIED_DOP, not_applied_reason);
+
+  if (table->file->ha_pq_create_snapshot(thd))
+    return pq_exec_not_applied(PQ_NOT_APPLIED_SNAPSHOT, not_applied_reason);
+  DEBUG_SYNC(thd, "after_pq_create_snapshot");
+
+  Pq_scan_provider scan_provider;
+  if (!pq_build_primary_key_scan_provider(table, dop, &predicate_filter,
+                                          false, secondary_keyno,
+                                          secondary_requires_cluster_lookup,
+                                          secondary_rejected_reason,
+                                          &scan_provider))
+    return pq_exec_not_applied_after_snapshot(thd, table,
+                                              PQ_NOT_APPLIED_RANGE_SPLIT,
+                                              not_applied_reason);
+  Pq_scan_provider_guard scan_provider_guard(table, &scan_provider);
+  const size_t worker_count= scan_provider.ranges.size();
+
+  if (!memory_reservation->reserve(pq_estimated_memory(worker_count)))
+    return pq_exec_not_applied_after_snapshot(thd, table,
+                                              PQ_NOT_APPLIED_MEMORY,
+                                              not_applied_reason);
+  if (!memory_reservation->prepay_materialized(
+          pq_estimate_group_materialized_peak_memory(
+              table, group_fields, aggregate_targets)))
+    return pq_exec_not_applied_after_snapshot(thd, table,
+                                              PQ_NOT_APPLIED_MEMORY,
+                                              not_applied_reason);
+
+  Pq_thread_reservation reservation;
+  if (!reservation.reserve(thd, worker_count))
+  {
+    if (thd->killed)
+    {
+      thd->send_kill_message();
+      return PQ_EXEC_ERROR;
+    }
+    return pq_exec_not_applied_after_snapshot(thd, table,
+                                              PQ_NOT_APPLIED_THREADS,
+                                              not_applied_reason);
+  }
+  DEBUG_SYNC(thd, "after_pq_thread_reserve");
+
+  std::vector<std::unique_ptr<Pq_worker_control> > controls;
+  if (!pq_init_worker_controls(scan_provider.ranges.size(), &controls))
+    return pq_exec_not_applied_after_snapshot(thd, table,
+                                              PQ_NOT_APPLIED_WORKER_CONTROL,
+                                              not_applied_reason);
+  std::vector<pthread_t> threads(scan_provider.ranges.size());
+  std::vector<Pq_group_worker_arg> args(scan_provider.ranges.size());
+  Pq_worker_cancel_state cancel_state;
+  size_t launched= 0;
+  bool launch_interrupted= false;
+  int launch_error= 0;
+  for (size_t i= 0; i < scan_provider.ranges.size(); i++)
+  {
+    if (unlikely(thd->check_killed(true)))
+    {
+      launch_interrupted= true;
+      break;
+    }
+    args[i].leader_thd= thd;
+    args[i].worker_control= controls[i].get();
+    args[i].cancel_state= &cancel_state;
+    args[i].db= &table->s->db;
+    args[i].table_name= &table->s->table_name;
+    pq_copy_partition_names(table, &args[i].partition_names);
+    args[i].provider_kind= scan_provider.provider_kind;
+    args[i].handler_scan_ctx= scan_provider.handler_scan_ctx;
+    args[i].handler_scan_reverse= scan_provider.reverse;
+    args[i].secondary_requires_cluster_lookup=
+      scan_provider.secondary_requires_cluster_lookup;
+    args[i].scan_keyno= scan_provider.scan_keyno;
+    args[i].scan_field_index= scan_provider.scan_field_index;
+    args[i].worker_id= (uint) i;
+    args[i].worker_count= (uint) scan_provider.ranges.size();
+    args[i].range= scan_provider.ranges[i];
+    args[i].pk_field_index= scan_provider.pk_field_index;
+    args[i].fail_thd_init= false;
+    DBUG_EXECUTE_IF("pq_fail_worker_thd_init",
+                    if (i == 0) args[i].fail_thd_init= true;);
+    args[i].fail_mid_scan= false;
+    DBUG_EXECUTE_IF("pq_fail_worker_mid_scan",
+                    if (i == 0) args[i].fail_mid_scan= true;);
+    DBUG_EXECUTE_IF("pq_fail_last_worker_mid_scan",
+                    if (i + 1 == scan_provider.ranges.size())
+                      args[i].fail_mid_scan= true;);
+    args[i].predicate_filter= predicate_filter;
+    args[i].group_field_indices= group_fields;
+    args[i].aggregate_targets= aggregate_targets;
+    args[i].memory_reservation= memory_reservation;
+    args[i].groups.clear();
+    args[i].worker_error.clear();
+    if ((launch_error= pq_create_worker_thread(&threads[i], pq_group_worker,
+                                               &args[i], i)))
+      break;
+    launched++;
+  }
+
+  if (launched != scan_provider.ranges.size())
+  {
+    bool failed= false;
+    Pq_worker_error worker_error;
+    worker_error.clear();
+    if (launched && (launch_interrupted || thd->killed || launch_error))
+      pq_cancel_and_awake_workers(&cancel_state, controls, launched);
+    for (size_t i= 0; i < launched; i++)
+    {
+      if (pq_join_worker_and_collect_error(threads[i], &args[i],
+                                           &cancel_state, controls, launched,
+                                           false, &worker_error))
+        failed= true;
+    }
+    if (launch_interrupted)
+    {
+      failed= true;
+      worker_error.error= HA_ERR_QUERY_INTERRUPTED;
+    }
+    if (failed)
+    {
+      pq_raise_worker_error(thd, table, worker_error);
+      return PQ_EXEC_ERROR;
+    }
+    if (launched)
+    {
+      my_error(ER_CANT_CREATE_THREAD, MYF(ME_FATAL), launch_error);
+      return PQ_EXEC_ERROR;
+    }
+    return pq_exec_not_applied_after_snapshot(thd, table,
+                                              PQ_NOT_APPLIED_THREADS,
+                                              not_applied_reason);
+  }
+  pq_trace_scan_provider(thd, table, scan_provider, "grouped_aggregate");
+  DEBUG_SYNC(thd, "after_pq_workers_launched");
+
+  Pq_group_aggregate_transport group_transport(groups);
+  group_transport.clear();
+  bool failed= thd->killed;
+  Pq_worker_error worker_error;
+  worker_error.clear();
+  if (thd->killed)
+  {
+    worker_error.error= HA_ERR_QUERY_INTERRUPTED;
+    pq_cancel_and_awake_workers(&cancel_state, controls, launched);
+  }
+  for (size_t i= 0; i < launched; i++)
+  {
+    if (pq_join_worker_and_collect_error(threads[i], &args[i], &cancel_state,
+                                         controls, launched, true,
+                                         &worker_error))
+    {
+      failed= true;
+      continue;
+    }
+    if (!group_transport.append_worker_partials(thd, aggregate_targets,
+                                                args[i].groups))
+      failed= true;
+  }
+  if (failed)
+  {
+    pq_raise_worker_error(thd, table, worker_error);
+    return PQ_EXEC_ERROR;
+  }
+  return PQ_EXEC_OK;
+}
+
+static bool pq_evaluate_group_leader_aggregate(
+            TABLE *table,
+            const Pq_group_aggregate_target &target,
+            const Pq_group_aggregate_value &source,
+            Pq_group_aggregate_value *evaluated)
+{
+  *evaluated= Pq_group_aggregate_value();
+  if (!target.aggregate_arg_on_leader)
+  {
+    *evaluated= source;
+    return true;
+  }
+
+  THD *thd= table->in_use;
+  switch (target.aggregate_kind)
+  {
+  case Pq_count_target::PQ_AGGREGATE_COUNT_DISTINCT:
+  {
+    *evaluated= source;
+    evaluated->distinct_values.clear();
+    evaluated->count= 0;
+    Item *distinct_arg=
+      static_cast<Item_sum_count *>(target.sum_item)->get_arg(0);
+    for (const Pq_field_row &row : source.aggregate_arg_rows)
+    {
+      Pq_distinct_field_key key;
+      bool is_null= false;
+      if (target.has_field)
+      {
+        if (row.null_values.empty() || row.values.empty())
+          return false;
+        if (row.null_values[0])
+          continue;
+        Field *field= table->field[target.field_index];
+        if (pq_count_distinct_field_uses_string_key(field))
+        {
+          if (!pq_restore_field_row(table, target.aggregate_arg_field_indices,
+                                    row) ||
+              !pq_make_distinct_item_key(thd, distinct_arg, &key, &is_null))
+            return false;
+          if (is_null)
+            continue;
+        }
+        else
+          key.value= row.values[0];
+      }
+      else
+      {
+        if (!pq_restore_field_row(table, target.aggregate_arg_field_indices,
+                                  row))
+          return false;
+        if (!pq_make_distinct_item_key(thd, distinct_arg, &key, &is_null))
+          return false;
+        if (is_null)
+          continue;
+      }
+      evaluated->distinct_values.insert(key);
+    }
+    evaluated->count= evaluated->distinct_values.size();
+    return true;
+  }
+  case Pq_count_target::PQ_AGGREGATE_COUNT:
+  {
+    Item *count_arg= static_cast<Item_sum_count *>(target.sum_item)->get_arg(0);
+    for (const Pq_field_row &row : source.aggregate_arg_rows)
+    {
+      if (!pq_restore_field_row(table, target.aggregate_arg_field_indices, row))
+        return false;
+      if (!count_arg->is_null())
+        evaluated->count++;
+      if (thd->is_error())
+        return false;
+    }
+    return true;
+  }
+  case Pq_count_target::PQ_AGGREGATE_SUM:
+  case Pq_count_target::PQ_AGGREGATE_AVG:
+  {
+    Item_sum_sum *sum_item= static_cast<Item_sum_sum *>(target.sum_item);
+    Item *sum_arg= sum_item->get_arg(0);
+    for (const Pq_field_row &row : source.aggregate_arg_rows)
+    {
+      if (!pq_restore_field_row(table, target.aggregate_arg_field_indices, row))
+        return false;
+      if (target.sum_decimal_result)
+      {
+        my_decimal value;
+        my_decimal result;
+        my_decimal *arg_value= sum_arg->val_decimal(&value);
+        if (thd->is_error())
+          return false;
+        if (!sum_arg->null_value && arg_value)
+        {
+          evaluated->has_sum_value= true;
+          evaluated->count++;
+          if (!pq_decimal_add(thd, &result, &evaluated->sum_decimal,
+                              arg_value))
+            return false;
+          evaluated->sum_decimal= result;
+        }
+      }
+      else
+      {
+        double arg_value= sum_arg->val_real();
+        if (thd->is_error())
+          return false;
+        if (!sum_arg->null_value)
+        {
+          evaluated->has_sum_value= true;
+          evaluated->count++;
+          evaluated->sum_real+= arg_value;
+        }
+      }
+    }
+    return true;
+  }
+  case Pq_count_target::PQ_AGGREGATE_MIN:
+  case Pq_count_target::PQ_AGGREGATE_MAX:
+    *evaluated= source;
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool pq_inject_group_aggregate_value(
+            TABLE *table,
+            const Pq_group_aggregate_target &target,
+            const Pq_group_aggregate_value &value)
+{
+  Pq_group_aggregate_value evaluated;
+  if (!pq_evaluate_group_leader_aggregate(table, target, value, &evaluated))
+    return false;
+
+  switch (target.aggregate_kind)
+  {
+  case Pq_count_target::PQ_AGGREGATE_COUNT_DISTINCT:
+    if (target.sum_item->set_aggregator(table->in_use,
+                                        Aggregator::SIMPLE_AGGREGATOR))
+      return false;
+    static_cast<Item_sum_count *>(target.sum_item)->
+      make_const((longlong) evaluated.count);
+    return true;
+  case Pq_count_target::PQ_AGGREGATE_COUNT:
+    static_cast<Item_sum_count *>(target.sum_item)->
+      make_const((longlong) evaluated.count);
+    return true;
+  case Pq_count_target::PQ_AGGREGATE_SUM:
+  {
+    Item_sum_sum *sum_item= static_cast<Item_sum_sum *>(target.sum_item);
+    sum_item->clear();
+    if (target.sum_decimal_result)
+      sum_item->direct_add(evaluated.has_sum_value ?
+                           &evaluated.sum_decimal : 0);
+    else
+      sum_item->direct_add(evaluated.sum_real, !evaluated.has_sum_value);
+    if (sum_item->add())
+      return false;
+    sum_item->make_const();
+    return true;
+  }
+  case Pq_count_target::PQ_AGGREGATE_AVG:
+  {
+    Item_sum_avg *avg_item= static_cast<Item_sum_avg *>(target.sum_item);
+    avg_item->clear();
+    if (target.sum_decimal_result)
+      avg_item->direct_add(evaluated.has_sum_value ?
+                           &evaluated.sum_decimal : 0);
+    else
+      avg_item->direct_add(evaluated.sum_real, !evaluated.has_sum_value);
+    if (avg_item->Item_sum_sum::add())
+      return false;
+    avg_item->count= evaluated.count;
+    avg_item->make_const();
+    return true;
+  }
+  case Pq_count_target::PQ_AGGREGATE_MIN:
+  case Pq_count_target::PQ_AGGREGATE_MAX:
+  {
+    Item_sum_min_max *minmax_item=
+      static_cast<Item_sum_min_max *>(target.sum_item);
+    if (target.aggregate_arg_on_leader)
+    {
+      Item *minmax_arg= minmax_item->get_arg(0);
+      minmax_item->clear();
+      for (const Pq_field_row &row : evaluated.aggregate_arg_rows)
+      {
+        if (!pq_restore_field_row(table, target.aggregate_arg_field_indices,
+                                  row))
+          return false;
+        minmax_item->direct_add(minmax_arg);
+        if (minmax_item->add())
+          return false;
+        if (table->in_use->is_error())
+          return false;
+      }
+      return true;
+    }
+    Field *field= table->field[target.field_index];
+    minmax_item->clear();
+    if (evaluated.has_minmax_value)
+    {
+      field->set_notnull();
+      if (!pq_restore_field_payload(field, evaluated.minmax_value))
+        return false;
+      minmax_item->direct_add(minmax_item->get_arg(0));
+      if (minmax_item->add())
+        return false;
+    }
+    return true;
+  }
+  default:
+    return false;
+  }
+}
+
+static int pq_abort_after_execution(JOIN *join)
+{
+  join->join_free();
+  return -1;
+}
+
+static bool pq_leader_killed_before_send(THD *thd)
+{
+  if (!thd->killed)
+    return false;
+  thd->send_kill_message();
+  return true;
+}
+
+static bool pq_user_requested_execution(JOIN *join);
+
+static void pq_trace_not_applied_reason(JOIN *join,
+                                        Pq_not_applied_reason reason)
+{
+  THD *thd= join->thd;
+  Json_writer_object trace_wrapper(thd);
+  Json_writer_object trace_exec(thd, "not_apply_pq_plan");
+  trace_exec.add_select_number(join->select_lex->select_number);
+  trace_exec.add("chosen", false);
+  trace_exec.add("reason", pq_not_applied_reason_name(reason));
+  trace_exec.add("execution_reason", pq_not_applied_reason_name(reason));
+}
+
+static int pq_handle_not_applied_after_attempt(
+    JOIN *join, Pq_not_applied_reason not_applied_reason)
+{
+  join->pq_execution_not_applied_reason=
+    pq_not_applied_reason_name(not_applied_reason);
+  if (pq_user_requested_execution(join) &&
+      (!join->thd->variables.parallel_graceful_fallback ||
+       !join->thd->variables.parallel_fail_retry))
+  {
+    pq_trace_not_applied_reason(join, not_applied_reason);
+    my_printf_error(ER_UNKNOWN_ERROR,
+                    "Parallel Query setup failed (%s) and retry/fallback is "
+                    "disabled",
+                    MYF(0),
+                    pq_not_applied_reason_name(not_applied_reason));
+    return pq_abort_after_execution(join);
+  }
+  return 0;
+}
+
+static int try_parallel_group_aggregate_select(JOIN *join)
+{
+  if (!pq_group_query_is_supported(join))
+    return 0;
+
+  THD *thd= join->thd;
+  TABLE *table= join->join_tab[0].table;
+  Pq_predicate_filter predicate_filter;
+  std::vector<uint> group_fields;
+  std::vector<Pq_group_order_key> group_order_keys;
+  std::vector<Pq_group_aggregate_target> aggregate_targets;
+  Pq_memory_reservation memory_reservation;
+  Pq_group_map groups;
+
+  if (!pq_extract_group_fields(join, &group_fields))
+    return 0;
+  if (!pq_group_select_fields_match_group_order(join, group_fields))
+    return 0;
+  if (!pq_extract_group_aggregate_targets(join, &aggregate_targets))
+    return 0;
+  if (!pq_group_order_keys(join, group_fields, aggregate_targets,
+                           &group_order_keys))
+    return 0;
+  if (!pq_group_having_is_supported(join, group_fields, aggregate_targets))
+    return 0;
+  if (!pq_extract_predicate_filter(thd, join, join->conds, &predicate_filter))
+    return thd->is_error() ? pq_abort_after_execution(join) : 0;
+  Pq_not_applied_reason not_applied_reason= PQ_NOT_APPLIED_NONE;
+  uint secondary_keyno= MAX_KEY;
+  const char *secondary_rejected_reason= NULL;
+  bool secondary_requires_cluster_lookup= false;
+  pq_secondary_range_keyno(join, predicate_filter, false, &secondary_keyno,
+                           &secondary_requires_cluster_lookup,
+                           &secondary_rejected_reason);
+  Pq_execution_result pq_result=
+    pq_parallel_group_aggregate(thd, table, predicate_filter, group_fields,
+                                aggregate_targets, secondary_keyno,
+                                secondary_requires_cluster_lookup,
+                                secondary_rejected_reason,
+                                &memory_reservation, &groups,
+                                &not_applied_reason);
+  if (pq_result == PQ_EXEC_NOT_APPLIED)
+    return pq_handle_not_applied_after_attempt(join, not_applied_reason);
+  if (pq_result == PQ_EXEC_ERROR)
+    return pq_abort_after_execution(join);
+  DEBUG_SYNC(thd, "after_pq_materialized_result_ready");
+  if (pq_leader_killed_before_send(thd))
+    return pq_abort_after_execution(join);
+
+  for (uint field_index : group_fields)
+    bitmap_set_bit(table->write_set, field_index);
+
+  std::vector<Pq_ordered_group> ordered_groups;
+  std::vector<bool> order_aggregate_needed(aggregate_targets.size(), false);
+  for (const Pq_group_order_key &key : group_order_keys)
+  {
+    if (key.kind == Pq_group_order_key::AGGREGATE &&
+        key.index < order_aggregate_needed.size())
+      order_aggregate_needed[key.index]= true;
+  }
+  ordered_groups.reserve(groups.size());
+  for (const auto &entry : groups)
+  {
+    Pq_ordered_group ordered_group;
+    ordered_group.entry= &entry;
+    ordered_group.evaluated_aggregates.resize(aggregate_targets.size());
+    for (size_t i= 0; i < aggregate_targets.size(); i++)
+    {
+      if (!order_aggregate_needed[i])
+        continue;
+      Pq_group_aggregate_value evaluated;
+      if (!pq_evaluate_group_leader_aggregate(table, aggregate_targets[i],
+                                              entry.second.aggregates[i],
+                                              &evaluated))
+        return pq_abort_after_execution(join);
+      ordered_group.evaluated_aggregates[i]= evaluated;
+    }
+    ordered_groups.push_back(ordered_group);
+  }
+  std::sort(ordered_groups.begin(), ordered_groups.end(),
+            [table, &group_fields, &aggregate_targets, &group_order_keys](
+                                    const Pq_ordered_group &left,
+                                    const Pq_ordered_group &right)
+            {
+              return pq_compare_ordered_group(table, group_fields,
+                                              aggregate_targets,
+                                              group_order_keys,
+                                              left, right) < 0;
+            });
+
+  ha_rows found_rows= 0;
+  const bool with_ties= join->unit->lim.is_with_ties();
+  const Pq_ordered_group *tie_group= NULL;
+  for (const Pq_ordered_group &ordered_group : ordered_groups)
+  {
+    const Pq_group_map::value_type *entry= ordered_group.entry;
+    if (!(join->select_options & OPTION_FOUND_ROWS) &&
+        join->send_records >= join->unit->lim.get_select_limit())
+    {
+      if (!with_ties || !tie_group ||
+          pq_compare_ordered_group_ties(table, group_fields, aggregate_targets,
+                                        group_order_keys, *tie_group,
+                                        ordered_group) != 0)
+        break;
+    }
+    if (!pq_restore_group_key(table, group_fields, entry->first))
+      return pq_abort_after_execution(join);
+    for (size_t i= 0; i < aggregate_targets.size(); i++)
+    {
+      if (!pq_inject_group_aggregate_value(table, aggregate_targets[i],
+                                           entry->second.aggregates[i]))
+        return pq_abort_after_execution(join);
+    }
+    if (!pq_restore_group_key(table, group_fields, entry->first))
+      return pq_abort_after_execution(join);
+    if (!pq_restore_group_output_fields(join, group_fields, entry->first))
+      return pq_abort_after_execution(join);
+    bool send_row= true;
+    Item *having= join->having ? join->having : join->tmp_having;
+    if (having)
+    {
+      send_row= having->val_bool();
+      if (thd->is_error())
+        return pq_abort_after_execution(join);
+    }
+    if (!send_row)
+      continue;
+    found_rows++;
+    bool send_group= join->send_records < join->unit->lim.get_select_limit();
+    if (!send_group && with_ties && tie_group &&
+        pq_compare_ordered_group_ties(table, group_fields, aggregate_targets,
+                                      group_order_keys, *tie_group,
+                                      ordered_group) == 0)
+      send_group= true;
+    if (send_group)
+    {
+      if (join->result->send_data_with_check(join->fields_list, join->unit,
+                                             join->send_records) > 0)
+        return pq_abort_after_execution(join);
+      join->send_records++;
+      if (with_ties &&
+          join->send_records == join->unit->lim.get_select_limit())
+        tie_group= &ordered_group;
+    }
+  }
+
+  thd->status_var.parallel_query_count++;
+  thd->statement_pq_executed= true;
+  __sync_fetch_and_add(&pq_stmt_executed, 1);
+  thd->limit_found_rows= (join->select_options & OPTION_FOUND_ROWS) ?
+                         found_rows : join->send_records;
+  join->join_free();
+  if (join->result->send_eof())
+    return -1;
+
+  return 1;
+}
+
+static bool pq_user_requested_execution(JOIN *join)
+{
+  THD *thd= join->thd;
+  if (thd->variables.force_parallel_execute || thd->no_pq)
+    return true;
+
+  TABLE_LIST *table_list= NULL;
+  if (join->join_tab && join->join_tab[0].table)
+    table_list= join->join_tab[0].table->pos_in_table_list;
+  else
+    table_list= join->tables_list;
+
+  if (!table_list)
+    return false;
+
+  for (TABLE_LIST *table= join->tables_list; table; table= table->next_local)
+  {
+    if (hint_table_state(thd, table, PQ_HINT_ENUM) == hint_state::ENABLED)
+      return true;
+  }
+
+  return hint_table_state(thd, table_list, PQ_HINT_ENUM) == hint_state::ENABLED;
+}
+
+static bool pq_sum_item_is_distinct(Item_sum *sum_item)
+{
+  switch (sum_item->sum_func())
+  {
+  case Item_sum::COUNT_DISTINCT_FUNC:
+  case Item_sum::SUM_DISTINCT_FUNC:
+  case Item_sum::AVG_DISTINCT_FUNC:
+    return true;
+  default:
+    return sum_item->has_with_distinct();
+  }
+}
+
+static bool pq_item_list_has_distinct_aggregate(List<Item> &items)
+{
+  List_iterator_fast<Item> it(items);
+  Item *item;
+  while ((item= it++))
+  {
+    Item *real_item= item->real_item();
+    if (real_item->type() != Item::SUM_FUNC_ITEM)
+      continue;
+    if (pq_sum_item_is_distinct(static_cast<Item_sum *>(real_item)))
+      return true;
+  }
+  return false;
+}
+
+static bool pq_has_distinct_aggregate(JOIN *join)
+{
+  if (join->sum_funcs)
+  {
+    for (Item_sum **sum_item= join->sum_funcs; *sum_item; sum_item++)
+    {
+      if (pq_sum_item_is_distinct(*sum_item))
+        return true;
+    }
+  }
+
+  return pq_item_list_has_distinct_aggregate(join->fields_list) ||
+         pq_item_list_has_distinct_aggregate(join->all_fields);
+}
+
+static bool pq_group_has_unsupported_collation(JOIN *join)
+{
+  ORDER *group_list= join->group_list ? join->group_list :
+                     join->select_lex->group_list.first;
+  if (!group_list)
+    return false;
+
+  for (ORDER *group= group_list; group; group= group->next)
+  {
+    if (!group->item || !*group->item)
+      continue;
+    Item *item= (*group->item)->real_item();
+    if (item->type() != Item::FIELD_ITEM)
+      continue;
+    Field *field= static_cast<Item_field *>(item)->field;
+    if (!pq_group_field_is_supported(field))
+      return true;
+  }
+  return false;
+}
+
+static bool pq_group_has_timestamp_key(JOIN *join)
+{
+  ORDER *group_list= join->group_list ? join->group_list :
+                     join->select_lex->group_list.first;
+  if (!group_list)
+    return false;
+
+  for (ORDER *group= group_list; group; group= group->next)
+  {
+    if (!group->item || !*group->item)
+      continue;
+    Item *item= (*group->item)->real_item();
+    if (item->type() != Item::FIELD_ITEM)
+      continue;
+    Field *field= static_cast<Item_field *>(item)->field;
+    if (field->real_type() == MYSQL_TYPE_TIMESTAMP ||
+        field->real_type() == MYSQL_TYPE_TIMESTAMP2)
+      return true;
+  }
+  return false;
+}
+
+static bool pq_group_references_generated_column(JOIN *join)
+{
+  ORDER *group_list= join->group_list ? join->group_list :
+                     join->select_lex->group_list.first;
+  if (!group_list)
+    return false;
+
+  for (ORDER *group= group_list; group; group= group->next)
+  {
+    if (!group->item || !*group->item)
+      continue;
+    Item *item= (*group->item)->real_item();
+    if (item->type() != Item::FIELD_ITEM)
+      continue;
+    if (static_cast<Item_field *>(item)->field->vcol_info)
+      return true;
+  }
+  return false;
+}
+
+static bool pq_item_references_timestamp_field(JOIN *join, Item *item)
+{
+  if (!item || !join->join_tab || !join->join_tab[0].table)
+    return false;
+
+  TABLE *table= join->join_tab[0].table;
+  List<Item_field> item_fields;
+  if (item->walk(&Item::collect_item_field_processor, &item_fields, 0))
+    return false;
+
+  List_iterator_fast<Item_field> field_it(item_fields);
+  Item_field *field_item;
+  while ((field_item= field_it++))
+  {
+    Field *field= field_item->field;
+    if (field->table != table)
+      continue;
+    if (field->real_type() == MYSQL_TYPE_TIMESTAMP ||
+        field->real_type() == MYSQL_TYPE_TIMESTAMP2)
+      return true;
+  }
+  return false;
+}
+
+static bool pq_select_has_sum_func_item(JOIN *join)
+{
+  if (pq_get_single_sum_item_from_select(join))
+    return true;
+
+  if (!join->fields_list.elements)
+    return false;
+
+  List_iterator_fast<Item> it(join->fields_list);
+  Item *item;
+  while ((item= it++))
+  {
+    if (item->type() == Item::SUM_FUNC_ITEM)
+      return true;
+  }
+  return false;
+}
+
+static bool pq_projection_query_shape(JOIN *join)
+{
+  if (!join->fields_list.elements ||
+      pq_select_has_sum_func_item(join) ||
+      join->group || join->group_list || join->select_lex->group_list.first)
+    return false;
+
+  return true;
+}
+
+static bool pq_scalar_aggregate_query_shape(JOIN *join)
+{
+  return !join->group && !join->group_list &&
+         !join->select_lex->group_list.first &&
+         pq_select_has_sum_func_item(join);
+}
+
+static bool pq_predicate_has_too_many_or_disjuncts(Item *condition,
+                                                   size_t *disjuncts)
+{
+  if (!condition)
+    return false;
+
+  if (condition->type() != Item::COND_ITEM)
+    return false;
+
+  Item_cond *cond= static_cast<Item_cond *>(condition);
+  if (cond->functype() == Item_func::COND_AND_FUNC)
+  {
+    List_iterator_fast<Item> it(*cond->argument_list());
+    Item *item;
+    while ((item= it++))
+    {
+      if (pq_predicate_has_too_many_or_disjuncts(item, disjuncts))
+        return true;
+    }
+    return false;
+  }
+
+  if (cond->functype() != Item_func::COND_OR_FUNC)
+    return false;
+
+  List_iterator_fast<Item> it(*cond->argument_list());
+  Item *item;
+  while ((item= it++))
+  {
+    if (++(*disjuncts) > PQ_MAX_PREDICATE_DISJUNCTS)
+      return true;
+    if (pq_predicate_has_too_many_or_disjuncts(item, disjuncts))
+      return true;
+  }
+  return false;
+}
+
+static const char *pq_direct_scalar_subquery_predicate_reason(THD *thd,
+                                                              Item *item)
+{
+  if (!item || !item->with_subquery())
+    return 0;
+
+  item= item->real_item();
+  if (!item || item->type() != Item::SUBSELECT_ITEM)
+    return 0;
+
+  Item_subselect *subselect= static_cast<Item_subselect *>(item);
+  if (subselect->substype() != Item_subselect::SINGLEROW_SUBS ||
+      subselect->cols() != 1)
+    return "unsupported_scalar_predicate_subquery";
+
+  st_select_lex *select_lex= subselect->get_select_lex();
+  st_select_lex_unit *unit= select_lex ? select_lex->master_unit() : NULL;
+  if (!unit)
+    return "unsupported_scalar_predicate_subquery";
+
+  if (!subselect->upper_refs.is_empty() ||
+      select_lex->is_correlated ||
+      subselect->is_correlated ||
+      (select_lex->uncacheable & UNCACHEABLE_DEPENDENT) ||
+      (unit->uncacheable & UNCACHEABLE_DEPENDENT))
+    return "unsupported_scalar_predicate_dependent";
+
+  if (subselect->with_recursive_reference ||
+      unit->is_unit_op())
+    return "unsupported_scalar_predicate_subquery";
+
+  if (unit->uncacheable != 0 ||
+      subselect->is_uncacheable())
+    return "unsupported_scalar_predicate_uncacheable";
+
+  if (thd->tx_isolation != ISO_REPEATABLE_READ)
+    return "unsupported_scalar_predicate_isolation";
+
+  if (subselect->is_evaluated() && subselect->null_value)
+    return "unsupported_scalar_predicate_null";
+
+  return 0;
+}
+
+static const char *pq_scalar_subquery_predicate_reason(THD *thd, Item *item)
+{
+  if (!item || !item->with_subquery())
+    return 0;
+
+  if (const char *reason= pq_direct_scalar_subquery_predicate_reason(thd, item))
+    return reason;
+
+  item= item->real_item();
+  if (item && item->type() == Item::EXPR_CACHE_ITEM)
+  {
+    Item_cache_wrapper *cache_wrapper= static_cast<Item_cache_wrapper *>(item);
+    if (const char *reason= pq_scalar_subquery_predicate_reason(
+          thd, cache_wrapper->get_orig_item()))
+      return reason;
+  }
+
+  if (item && item->type() == Item::FUNC_ITEM)
+  {
+    Item_func *func= static_cast<Item_func *>(item);
+
+    if (func->functype() == Item_func::IN_OPTIMIZER_FUNC)
+    {
+      Item_in_optimizer *in_optimizer=
+        static_cast<Item_in_optimizer *>(func);
+      if (const char *reason= pq_scalar_subquery_predicate_reason(
+            thd, in_optimizer->get_wrapped_in_subselect_item()))
+        return reason;
+    }
+
+    Item **args= func->arguments();
+    for (uint i= 0; i < func->argument_count(); i++)
+    {
+      if (const char *reason= pq_scalar_subquery_predicate_reason(thd, args[i]))
+        return reason;
+    }
+  }
+
+  return "unsupported_scalar_predicate_expression";
+}
+
+static const char *pq_predicate_fallback_reason(THD *thd, Item *condition)
+{
+  if (!condition)
+    return 0;
+
+  if (condition->type() == Item::COND_ITEM)
+  {
+    Item_cond *cond= static_cast<Item_cond *>(condition);
+    List_iterator_fast<Item> it(*cond->argument_list());
+    Item *item;
+    while ((item= it++))
+    {
+      const char *reason= pq_predicate_fallback_reason(thd, item);
+      if (reason)
+        return reason;
+    }
+    return 0;
+  }
+
+  if (condition->type() != Item::FUNC_ITEM)
+    return 0;
+
+  Item_func *func= static_cast<Item_func *>(condition);
+  if (func->functype() == Item_func::BETWEEN)
+  {
+    Item **args= func->arguments();
+    if (const char *reason= pq_scalar_subquery_predicate_reason(thd, args[1]))
+      return reason;
+    if (const char *reason= pq_scalar_subquery_predicate_reason(thd, args[2]))
+      return reason;
+  }
+  else if (func->functype() == Item_func::LIKE_FUNC)
+  {
+    Item **args= func->arguments();
+    if (const char *reason= pq_scalar_subquery_predicate_reason(thd, args[1]))
+      return reason;
+  }
+  else if (func->argument_count() == 2)
+  {
+    Item **args= func->arguments();
+    if (const char *reason= pq_scalar_subquery_predicate_reason(thd, args[0]))
+      return reason;
+    if (const char *reason= pq_scalar_subquery_predicate_reason(thd, args[1]))
+      return reason;
+  }
+
+  if (pq_item_has_sequence_function(condition))
+    return "unsupported_sequence_function";
+  if (const char *reason= pq_item_unsupported_function_reason(condition))
+    return reason;
+  if (pq_item_has_unsupported_function(condition))
+    return "unsupported_predicate_or_expression";
+
+  if (func->functype() == Item_func::IN_FUNC)
+  {
+    Item_func_in *in_func= static_cast<Item_func_in *>(func);
+    if (in_func->argument_count() > PQ_MAX_PREDICATE_DISJUNCTS + 1)
+      return "unsupported_predicate_too_many_disjuncts";
+    if (in_func->negated)
+    {
+      Item **args= in_func->arguments();
+      for (uint i= 1; i < in_func->argument_count(); i++)
+      {
+        if (args[i]->is_null())
+          return "unsupported_predicate_not_in";
+      }
+    }
+  }
+
+  return 0;
+}
+
+static bool pq_join_uses_hash_join(JOIN *join)
+{
+  if (!join->join_tab)
+    return false;
+
+  JOIN_TAB *end= join->join_tab + join->table_count;
+  for (JOIN_TAB *tab= join->join_tab + join->const_tables; tab < end; tab++)
+  {
+    if (tab->type == JT_HASH || tab->type == JT_HASH_RANGE ||
+        tab->type == JT_HASH_NEXT || tab->type == JT_HASH_INDEX_MERGE)
+      return true;
+    if (tab->cache &&
+        (tab->cache->get_join_alg() == JOIN_CACHE::BNLH_JOIN_ALG ||
+         tab->cache->get_join_alg() == JOIN_CACHE::BKAH_JOIN_ALG))
+      return true;
+  }
+
+  return false;
+}
+
+static const char *pq_fallback_reason(JOIN *join)
+{
+  THD *thd= join->thd;
+
+  if (thd->no_pq)
+    return "no_pq_hint";
+  if (!pq_master_enable)
+    return "pq_master_disabled";
+  if (!optimizer_flag(thd, OPTIMIZER_SWITCH_PARALLEL_QUERY))
+    return "optimizer_switch_disabled";
+  if (join->zero_result_cause ||
+      (join->table_count > 0 && join->const_tables == join->table_count))
+    return "zero_result_or_const_table";
+  if (join->select_lex->have_window_funcs())
+    return "unsupported_window_function";
+  if (pq_statement_is_write_select(join))
+    return "unsupported_insert_select";
+  if (join->select_options & OPTION_BUFFER_RESULT)
+    return "unsupported_buffer_result";
+  if (join->select_options & SELECT_DISTINCT)
+    return "unsupported_distinct_select";
+  if (!(thd->variables.pq_support_features_switch &
+        PQ_SUPPORT_FEATURES_SWITCH_SIMPLE_AGG) &&
+      (join->sum_funcs ||
+       join->group || join->group_list || join->select_lex->group_list.first))
+    return "disabled_in_pq_support_features";
+  if (join->select_lex->master_unit()->is_unit_op())
+    return "unsupported_union_or_unit_op";
+  if (const char *nested_reason= pq_nested_query_block_reason(join))
+    return nested_reason;
+  if (pq_statement_is_prepare_sp_or_trigger(join))
+    return "unsupported_prepare_sp_trigger";
+  if (pq_item_list_has_sequence_function(join->fields_list) ||
+      pq_item_has_sequence_function(join->conds) ||
+      pq_item_has_sequence_function(join->having) ||
+      pq_item_has_sequence_function(join->tmp_having) ||
+      pq_item_has_sequence_function(join->select_lex->having))
+    return "unsupported_sequence_function";
+  if (pq_join_has_result_interceptor(join))
+    return "unsupported_result_interceptor";
+  if (pq_join_has_outer_join(join))
+    return "unsupported_outer_join";
+  if (pq_join_has_semijoin(join))
+    return "unsupported_semijoin";
+  if (pq_join_uses_hash_join(join))
+    return "unsupported_hash_join";
+  if (join->table_count != 1 || join->const_tables != 0)
+    return "unsupported_join_or_multi_table";
+  if (!join->tables_list || !join->join_tab || !join->join_tab[0].table)
+    return "unsupported_select_shape";
+
+  TABLE *table= join->join_tab[0].table;
+  if (table->part_info && !pq_partition_table_allowed_for_join(join, table))
+    return "unsupported_partition_table";
+  if (!pq_table_is_supported_innodb(table))
+    return "unsupported_storage_engine";
+  if (pq_table_is_session_temporary(table))
+    return "unsupported_temporary_table";
+  if (const char *split_reason= pq_split_key_fallback_reason(table))
+    return split_reason;
+
+  if (join->select_lex->select_lock != st_select_lex::NONE ||
+      (thd->tx_isolation != ISO_REPEATABLE_READ &&
+       thd->tx_isolation != ISO_READ_COMMITTED))
+    return "unsupported_isolation_or_locking";
+  if (pq_session_has_unsupported_sql_mode(thd))
+    return "unsupported_sql_mode";
+  if (pq_session_has_locked_tables(thd))
+    return "unsupported_isolation_or_locking";
+  if (thd->in_multi_stmt_transaction_mode())
+    return "unsupported_transaction";
+  if (const char *split_data_reason= pq_split_key_data_fallback_reason(table))
+    return split_data_reason;
+
+  ulong dop= pq_worker_dop(thd, join->tables_list);
+  if (dop < 2)
+    return "dop_less_than_two";
+  if (pq_thread_admission_would_fail(dop))
+    return "parallel_threads_exhausted";
+  ulonglong worker_memory= pq_estimated_memory(dop);
+  if (pq_memory_admission_would_fail(worker_memory))
+    return "parallel_memory_exhausted";
+  if (pq_projection_query_shape(join))
+  {
+    std::vector<uint> fields;
+    if (pq_extract_selected_projection_fields(join, &fields) &&
+        pq_memory_admission_would_fail(
+            pq_add_memory_estimate(
+                worker_memory,
+                pq_estimate_materialized_peak_memory(table, fields))))
+      return "parallel_memory_exhausted";
+  }
+  if (join->group || join->group_list || join->select_lex->group_list.first)
+  {
+    std::vector<uint> group_fields;
+    std::vector<Pq_group_aggregate_target> aggregate_targets;
+    if (pq_extract_group_fields(join, &group_fields) &&
+        pq_extract_group_aggregate_targets(join, &aggregate_targets) &&
+        pq_memory_admission_would_fail(
+            pq_add_memory_estimate(
+                worker_memory,
+                pq_estimate_group_materialized_peak_memory(
+                    table, group_fields, aggregate_targets))))
+      return "parallel_memory_exhausted";
+  }
+  if ((join->select_options & OPTION_FOUND_ROWS) &&
+      !pq_projection_query_shape(join) &&
+      !pq_scalar_aggregate_query_shape(join) &&
+      !(join->group || join->group_list || join->select_lex->group_list.first))
+    return "unsupported_found_rows";
+  if (join->unit->lim.get_offset_limit() != 0 &&
+      !pq_scalar_aggregate_query_shape(join) &&
+      !(join->group || join->group_list || join->select_lex->group_list.first))
+  {
+    if (join->unit->lim.get_offset_limit() >=
+        thd->variables.op_over_pq_offset_threshold)
+      return "offset_pushdown_prio";
+    return "unsupported_limit_offset";
+  }
+  if (join->unit->lim.is_with_ties() &&
+      ((!pq_projection_query_shape(join) &&
+        !(join->group || join->group_list ||
+          join->select_lex->group_list.first)) ||
+       join->unit->lim.get_offset_limit() != 0 ||
+       !join->order))
+    return "unsupported_limit_with_ties";
+  if (pq_has_distinct_aggregate(join))
+  {
+    if (join->group || join->group_list ||
+        join->select_lex->group_list.first)
+    {
+      std::vector<Pq_group_aggregate_target> targets;
+      if (!pq_extract_group_aggregate_targets(join, &targets))
+        return "unsupported_distinct_aggregate";
+    }
+    else
+    {
+      Pq_count_target target;
+      if (!pq_extract_count_target(join, &target) ||
+          target.aggregate_kind != Pq_count_target::PQ_AGGREGATE_COUNT_DISTINCT)
+        return "unsupported_distinct_aggregate";
+    }
+  }
+
+  if (join->group || join->group_list || join->select_lex->group_list.first)
+  {
+    if (join->unit->lim.get_offset_limit() != 0)
+    {
+      if (!pq_query_has_explicit_order_by(join))
+        return "unsupported_limit_offset";
+      if (join->unit->lim.get_offset_limit() >=
+          thd->variables.op_over_pq_offset_threshold)
+        return "offset_pushdown_prio";
+    }
+    if (join->select_lex->olap == ROLLUP_TYPE ||
+        join->rollup.state != ROLLUP::STATE_NONE)
+      return "unsupported_group_rollup";
+    if (!thd->variables.parallel_limit_no_order_by &&
+        join->unit->lim.get_select_limit() != HA_POS_ERROR &&
+        !pq_query_has_explicit_order_by(join))
+      return "unsupported_limit_without_order";
+    if (pq_group_references_generated_column(join))
+      return "unsupported_group_projection";
+    if (pq_group_has_timestamp_key(join))
+      return "unsupported_timestamp_group_key";
+    if (pq_group_has_unsupported_collation(join))
+      return "unsupported_group_collation";
+
+    std::vector<uint> group_fields;
+    std::vector<Pq_group_aggregate_target> aggregate_targets;
+    if (join->join_tab && join->join_tab[0].table &&
+        pq_extract_group_fields(join, &group_fields))
+    {
+      if (!pq_group_select_fields_match_group_order(join, group_fields))
+        return "unsupported_group_projection";
+    }
+    if (!pq_extract_group_aggregate_targets(join, &aggregate_targets))
+    {
+      if (const char *reason=
+            pq_item_list_unsupported_function_reason(join->fields_list))
+        return reason;
+      return "unsupported_aggregate_expression";
+    }
+    if (!group_fields.empty() &&
+        !pq_group_order_is_supported(join, group_fields, aggregate_targets))
+      return "unsupported_group_order";
+    if ((join->having || join->tmp_having || join->select_lex->having) &&
+        (!pq_extract_group_fields(join, &group_fields) ||
+         !pq_group_having_is_supported(join, group_fields, aggregate_targets)))
+      return "unsupported_grouped_having";
+  }
+
+  if (pq_item_references_timestamp_field(join, join->conds))
+    return "unsupported_timestamp_predicate";
+  if (!thd->variables.parallel_limit_no_order_by &&
+      join->unit->lim.get_select_limit() != HA_POS_ERROR &&
+      !join->order)
+    return "unsupported_limit_without_order";
+  if (!join->group && !join->group_list && !join->select_lex->group_list.first &&
+      pq_select_has_sum_func_item(join))
+  {
+    Pq_count_target target;
+    if (!pq_extract_count_target(join, &target))
+    {
+      if (const char *reason=
+            pq_item_list_unsupported_function_reason(join->fields_list))
+        return reason;
+      return "unsupported_aggregate_expression";
+    }
+    if (!pq_scalar_aggregate_order_is_supported(join, target))
+      return "unsupported_aggregate_order";
+    if ((join->having || join->tmp_having || join->select_lex->having) &&
+        !pq_having_is_supported(join, target))
+      return "unsupported_aggregate_having";
+  }
+  if (pq_projection_query_shape(join))
+  {
+    std::vector<uint> fields;
+    if (!pq_extract_selected_projection_fields(join, &fields))
+    {
+      if (const char *reason=
+            pq_item_list_unsupported_function_reason(join->fields_list))
+        return reason;
+      return "unsupported_projection";
+    }
+    if (!pq_projection_order_is_supported(join))
+    {
+      if (pq_projection_order_references_timestamp_field(join))
+        return "unsupported_timestamp_order";
+      return "unsupported_projection_order";
+    }
+  }
+
+  size_t disjuncts= 0;
+  if (pq_predicate_has_too_many_or_disjuncts(join->conds, &disjuncts))
+    return "unsupported_predicate_too_many_disjuncts";
+  if (const char *predicate_reason=
+        pq_predicate_fallback_reason(thd, join->conds))
+    return predicate_reason;
+
+  if (const char *reason= pq_item_unsupported_function_reason(join->conds))
+    return reason;
+
+  return "unsupported_predicate_or_expression";
+}
+
+static void pq_trace_fallback_if_requested(JOIN *join)
+{
+  THD *thd= join->thd;
+  if (!pq_user_requested_execution(join))
+    return;
+
+  Json_writer_object trace_wrapper(thd);
+  Json_writer_object trace_exec(thd, "not_apply_pq_plan");
+  trace_exec.add_select_number(join->select_lex->select_number);
+  trace_exec.add("chosen", false);
+  trace_exec.add("reason", pq_fallback_reason(join));
+  if (join->pq_execution_not_applied_reason)
+    trace_exec.add("execution_reason",
+                   join->pq_execution_not_applied_reason);
+}
+
+static int try_parallel_count_select(JOIN *join)
+{
+  if (!pq_count_query_is_supported(join))
+    return 0;
+
+  THD *thd= join->thd;
+  TABLE *table= join->join_tab[0].table;
+  Pq_predicate_filter predicate_filter;
+  Pq_count_target target;
+  Pq_scalar_aggregate_result aggregate_result;
+
+  if (!pq_extract_count_target(join, &target))
+    return 0;
+  if (!pq_extract_predicate_filter(thd, join, join->conds, &predicate_filter))
+    return thd->is_error() ? pq_abort_after_execution(join) : 0;
+  if (target.aggregate_arg_on_leader)
+  {
+    Pq_memory_reservation memory_reservation;
+    std::vector<Pq_field_row> rows;
+    Pq_not_applied_reason not_applied_reason= PQ_NOT_APPLIED_NONE;
+    uint secondary_keyno= MAX_KEY;
+    const char *secondary_rejected_reason= NULL;
+    bool secondary_requires_cluster_lookup= false;
+    pq_secondary_range_keyno(join, predicate_filter, false,
+                             &secondary_keyno,
+                             &secondary_requires_cluster_lookup,
+                             &secondary_rejected_reason);
+    Pq_execution_result pq_result=
+      pq_parallel_read_fields(thd, table, predicate_filter,
+                              target.aggregate_arg_field_indices,
+                              std::vector<Pq_projection_order_key>(),
+                              secondary_keyno,
+                              secondary_requires_cluster_lookup,
+                              secondary_rejected_reason,
+                              &memory_reservation, &rows,
+                              &not_applied_reason);
+    if (pq_result == PQ_EXEC_NOT_APPLIED)
+      return pq_handle_not_applied_after_attempt(join, not_applied_reason);
+    if (pq_result == PQ_EXEC_ERROR)
+      return pq_abort_after_execution(join);
+    DEBUG_SYNC(thd, "after_pq_materialized_result_ready");
+    if (pq_leader_killed_before_send(thd))
+      return pq_abort_after_execution(join);
+
+    if (target.aggregate_kind == Pq_count_target::PQ_AGGREGATE_COUNT)
+    {
+      Item *count_arg=
+        static_cast<Item_sum_count *>(target.sum_item)->get_arg(0);
+      for (const Pq_field_row &row : rows)
+      {
+        if (!pq_restore_field_row(table, target.aggregate_arg_field_indices,
+                                  row))
+          return pq_abort_after_execution(join);
+        if (!count_arg->is_null())
+          aggregate_result.count++;
+        if (thd->is_error())
+          return pq_abort_after_execution(join);
+      }
+    }
+    else if (target.aggregate_kind ==
+             Pq_count_target::PQ_AGGREGATE_COUNT_DISTINCT)
+    {
+      std::set<Pq_distinct_field_key> distinct_values;
+      Item *distinct_arg=
+        static_cast<Item_sum_count *>(target.sum_item)->get_arg(0);
+      for (const Pq_field_row &row : rows)
+      {
+        Pq_distinct_field_key key;
+        bool is_null= false;
+        if (target.has_field)
+        {
+          if (row.null_values.empty() || row.values.empty())
+            return pq_abort_after_execution(join);
+          if (row.null_values[0])
+            continue;
+          Field *field= table->field[target.field_index];
+          if (pq_count_distinct_field_uses_string_key(field))
+          {
+            if (!pq_restore_field_row(table,
+                                      target.aggregate_arg_field_indices,
+                                      row) ||
+                !pq_make_distinct_item_key(thd, distinct_arg, &key, &is_null))
+              return pq_abort_after_execution(join);
+            if (is_null)
+              continue;
+          }
+          else
+            key.value= row.values[0];
+        }
+        else
+        {
+          if (!pq_restore_field_row(table,
+                                    target.aggregate_arg_field_indices, row))
+            return pq_abort_after_execution(join);
+          if (!pq_make_distinct_item_key(thd, distinct_arg, &key, &is_null))
+            return pq_abort_after_execution(join);
+          if (is_null)
+            continue;
+        }
+        distinct_values.insert(key);
+      }
+      aggregate_result.count= distinct_values.size();
+    }
+    else if (target.aggregate_kind == Pq_count_target::PQ_AGGREGATE_SUM ||
+             target.aggregate_kind == Pq_count_target::PQ_AGGREGATE_AVG)
+    {
+      bool has_sum_value= false;
+      my_decimal sum_decimal;
+      double sum_real= 0.0;
+      my_decimal_set_zero(&sum_decimal);
+      Item_sum_sum *sum_item= static_cast<Item_sum_sum *>(target.sum_item);
+      Item *sum_arg= sum_item->get_arg(0);
+
+      for (const Pq_field_row &row : rows)
+      {
+        if (!pq_restore_field_row(table, target.aggregate_arg_field_indices,
+                                  row))
+          return pq_abort_after_execution(join);
+        if (target.sum_decimal_result)
+        {
+          my_decimal value;
+          my_decimal result;
+          my_decimal *arg_value= sum_arg->val_decimal(&value);
+          if (thd->is_error())
+            return pq_abort_after_execution(join);
+          if (!sum_arg->null_value && arg_value)
+          {
+            has_sum_value= true;
+            aggregate_result.count++;
+            if (!pq_decimal_add(thd, &result, &sum_decimal, arg_value))
+              return pq_abort_after_execution(join);
+            sum_decimal= result;
+          }
+        }
+        else
+        {
+          double arg_value= sum_arg->val_real();
+          if (thd->is_error())
+            return pq_abort_after_execution(join);
+          if (!sum_arg->null_value)
+          {
+            has_sum_value= true;
+            aggregate_result.count++;
+            sum_real+= arg_value;
+          }
+        }
+      }
+
+      aggregate_result.has_sum_value= has_sum_value;
+      aggregate_result.sum_decimal= sum_decimal;
+      aggregate_result.sum_real= sum_real;
+      sum_item->clear();
+      if (target.sum_decimal_result)
+        sum_item->direct_add(has_sum_value ? &sum_decimal : 0);
+      else
+        sum_item->direct_add(sum_real, !has_sum_value);
+      if (sum_item->add())
+        return pq_abort_after_execution(join);
+      if (target.aggregate_kind == Pq_count_target::PQ_AGGREGATE_AVG)
+        static_cast<Item_sum_avg *>(target.sum_item)->count=
+          aggregate_result.count;
+    }
+    else if (target.aggregate_kind == Pq_count_target::PQ_AGGREGATE_MIN ||
+             target.aggregate_kind == Pq_count_target::PQ_AGGREGATE_MAX)
+    {
+      Item_sum_min_max *minmax_item=
+        static_cast<Item_sum_min_max *>(target.sum_item);
+      Item *minmax_arg= minmax_item->get_arg(0);
+      minmax_item->clear();
+      aggregate_result.aggregate_arg_rows= rows;
+
+      for (const Pq_field_row &row : rows)
+      {
+        if (!pq_restore_field_row(table, target.aggregate_arg_field_indices,
+                                  row))
+          return pq_abort_after_execution(join);
+        minmax_item->direct_add(minmax_arg);
+        if (minmax_item->add())
+          return pq_abort_after_execution(join);
+        if (thd->is_error())
+          return pq_abort_after_execution(join);
+      }
+    }
+    else
+      return 0;
+  }
+  else
+  {
+    Pq_not_applied_reason not_applied_reason= PQ_NOT_APPLIED_NONE;
+    uint secondary_keyno= MAX_KEY;
+    const char *secondary_rejected_reason= NULL;
+    pq_covering_secondary_range_keyno(join, predicate_filter,
+                                      &secondary_keyno,
+                                      &secondary_rejected_reason);
+    Pq_execution_result pq_result=
+      pq_parallel_count_table(thd, table, predicate_filter, target,
+                              secondary_keyno, secondary_rejected_reason,
+                              &aggregate_result,
+                              &not_applied_reason);
+    if (pq_result == PQ_EXEC_NOT_APPLIED)
+      return pq_handle_not_applied_after_attempt(join, not_applied_reason);
+    if (pq_result == PQ_EXEC_ERROR)
+      return pq_abort_after_execution(join);
+  }
+
+  if (pq_leader_killed_before_send(thd))
+    return pq_abort_after_execution(join);
+
+  if (target.aggregate_kind == Pq_count_target::PQ_AGGREGATE_COUNT ||
+      target.aggregate_kind == Pq_count_target::PQ_AGGREGATE_COUNT_DISTINCT)
+  {
+    Item_sum_count *count_item= static_cast<Item_sum_count *>(target.sum_item);
+    if (target.aggregate_kind ==
+        Pq_count_target::PQ_AGGREGATE_COUNT_DISTINCT &&
+        count_item->set_aggregator(thd, Aggregator::SIMPLE_AGGREGATOR))
+      return pq_abort_after_execution(join);
+    count_item->make_const((longlong) aggregate_result.count);
+  }
+  else
+    target.sum_item->make_const();
+
+  bool send_row= true;
+  if (join->having)
+  {
+    if (!pq_inject_having_aggregate_values(thd, table, join->having, target,
+                                           aggregate_result))
+      return pq_abort_after_execution(join);
+    send_row= join->having->val_bool();
+    if (thd->is_error())
+      return pq_abort_after_execution(join);
+  }
+
+  ha_rows offset_limit= join->unit->lim.get_offset_limit();
+  ha_rows select_limit= join->unit->lim.get_select_limit();
+  bool send_limited_row= send_row && offset_limit == 0 && select_limit != 0;
+
+  if (send_limited_row &&
+      join->result->send_data_with_check(join->fields_list, join->unit, 0) > 0)
+    return pq_abort_after_execution(join);
+
+  thd->status_var.parallel_query_count++;
+  thd->statement_pq_executed= true;
+  __sync_fetch_and_add(&pq_stmt_executed, 1);
+  join->send_records= send_limited_row ? 1 : 0;
+  thd->limit_found_rows= (join->select_options & OPTION_FOUND_ROWS) ?
+                         (send_row ? 1 : 0) : join->send_records;
+  join->join_free();
+  if (join->result->send_eof())
+    return -1;
+
+  return 1;
+}
+
+static int try_parallel_field_select(JOIN *join)
+{
+  if (!pq_query_base_is_supported(join, true, false, true, true, false, true))
+    return 0;
+
+  THD *thd= join->thd;
+  if (!thd->variables.parallel_limit_no_order_by &&
+      join->unit->lim.get_select_limit() != HA_POS_ERROR &&
+      !join->order)
+    return 0;
+  ha_rows offset_limit= join->unit->lim.get_offset_limit();
+  if (offset_limit != 0 &&
+      (!join->order ||
+       offset_limit >= thd->variables.op_over_pq_offset_threshold))
+    return 0;
+  if (join->unit->lim.is_with_ties() &&
+      (offset_limit != 0 || !join->order))
+    return 0;
+
+  TABLE *table= join->join_tab[0].table;
+  Pq_predicate_filter predicate_filter;
+  std::vector<uint> selected_fields;
+  Pq_memory_reservation memory_reservation;
+  std::vector<Pq_field_row> rows;
+
+  if (!pq_extract_selected_projection_fields(join, &selected_fields))
+    return 0;
+  if (!pq_projection_order_is_supported(join))
+    return 0;
+  std::vector<Pq_projection_order_key> order_keys;
+  if (pq_projection_order_keys(join, &order_keys))
+  {
+    for (const Pq_projection_order_key &order_key : order_keys)
+    {
+      if (order_key.expression)
+      {
+        for (uint field_index : order_key.expression_field_indices)
+        {
+          if (!pq_add_projection_field(table, table->field[field_index],
+                                       &selected_fields))
+            return 0;
+        }
+      }
+      else
+      {
+        if (!pq_add_projection_field(table, table->field[order_key.field_index],
+                                     &selected_fields))
+          return 0;
+      }
+    }
+  }
+  if (!pq_extract_predicate_filter(thd, join, join->conds, &predicate_filter))
+    return thd->is_error() ? pq_abort_after_execution(join) : 0;
+  Pq_not_applied_reason not_applied_reason= PQ_NOT_APPLIED_NONE;
+  uint secondary_keyno= MAX_KEY;
+  const char *secondary_rejected_reason= NULL;
+  bool secondary_requires_cluster_lookup= false;
+  pq_secondary_range_keyno(join, predicate_filter, false, &secondary_keyno,
+                           &secondary_requires_cluster_lookup,
+                           &secondary_rejected_reason);
+  Pq_execution_result pq_result=
+    pq_parallel_read_fields(thd, table, predicate_filter, selected_fields,
+                            order_keys, secondary_keyno,
+                            secondary_requires_cluster_lookup,
+                            secondary_rejected_reason,
+                            &memory_reservation, &rows,
+                            &not_applied_reason);
+  if (pq_result == PQ_EXEC_NOT_APPLIED)
+    return pq_handle_not_applied_after_attempt(join, not_applied_reason);
+  if (pq_result == PQ_EXEC_ERROR)
+    return pq_abort_after_execution(join);
+  DEBUG_SYNC(thd, "after_pq_materialized_result_ready");
+  if (pq_leader_killed_before_send(thd))
+    return pq_abort_after_execution(join);
+
+  for (uint field_index : selected_fields)
+    bitmap_set_bit(table->write_set, field_index);
+
+  const bool with_ties= join->unit->lim.is_with_ties();
+  const Pq_field_row *tie_row= NULL;
+  for (const Pq_field_row &row : rows)
+  {
+    if (join->send_records >= join->unit->lim.get_select_limit())
+    {
+      if (!with_ties || !tie_row ||
+          pq_compare_projection_order_ties(table, selected_fields, order_keys,
+                                           *tie_row, row) != 0)
+        break;
+    }
+    if (!pq_restore_field_row(table, selected_fields, row))
+      return pq_abort_after_execution(join);
+    if (join->result->send_data_with_check(join->fields_list, join->unit,
+                                           join->send_records) > 0)
+      return pq_abort_after_execution(join);
+    join->send_records++;
+    if (with_ties && join->send_records == join->unit->lim.get_select_limit())
+      tie_row= &row;
+  }
+
+  thd->status_var.parallel_query_count++;
+  thd->statement_pq_executed= true;
+  __sync_fetch_and_add(&pq_stmt_executed, 1);
+  thd->limit_found_rows= (join->select_options & OPTION_FOUND_ROWS) ?
+                         rows.size() : join->send_records;
+  join->join_free();
+  if (join->result->send_eof())
+    return -1;
+
+  return 1;
 }
 
 
@@ -5047,6 +15526,7 @@ int JOIN::exec_inner()
     }
     else
     {
+      pq_trace_fallback_if_requested(this);
       (void) return_zero_rows(this, result, &select_lex->leaf_tables,
                               columns_list,
 			      send_row_on_empty_set(),
@@ -5122,7 +15602,32 @@ int JOIN::exec_inner()
                  procedure ? procedure_fields_list : *fields,
                  Protocol::SEND_NUM_ROWS | Protocol::SEND_EOF);
 
-  error= result->view_structure_only() ? false : do_select(this, procedure);
+  if (result->view_structure_only())
+    error= false;
+  else
+  {
+    int parallel_group_result= try_parallel_group_aggregate_select(this);
+    if (parallel_group_result < 0)
+      error= 1;
+    else if (parallel_group_result > 0)
+      error= 0;
+    else
+    {
+      int parallel_count_result= try_parallel_count_select(this);
+      if (parallel_count_result < 0)
+        error= 1;
+      else if (parallel_count_result > 0)
+        error= 0;
+      else
+      {
+        int parallel_field_result= try_parallel_field_select(this);
+        error= parallel_field_result < 0 ? 1 :
+               parallel_field_result > 0 ? 0 :
+               (pq_trace_fallback_if_requested(this),
+                do_select(this, procedure));
+      }
+    }
+  }
   /* Accumulate the counts from all join iterations of all join parts. */
   thd->ps_report_examined_row_count();
 
@@ -5242,10 +15747,9 @@ select_handler *find_select_handler_inner(THD *thd,
     return 0;
 
   TABLE_LIST *tbl= nullptr;
-  // For SQLCOM_INSERT_SELECT the server takes TABLE_LIST
-  // from thd->lex->query_tables and skips its first table
-  // b/c it is the target table for the INSERT..SELECT.
-  if (thd->lex->sql_command != SQLCOM_INSERT_SELECT)
+  // INSERT/REPLACE ... SELECT keep the target table first in query_tables.
+  if (thd->lex->sql_command != SQLCOM_INSERT_SELECT &&
+      thd->lex->sql_command != SQLCOM_REPLACE_SELECT)
   {
     tbl= select_lex->join->tables_list;
   }
@@ -31344,6 +41848,37 @@ bool JOIN_TAB::save_explain_data(Explain_table_access *eta,
   }
 
   /* Build "Extra" field and save it */
+  std::vector<uint> pq_selected_fields;
+  if (join->table_count == 1 && join->join_tab &&
+      join->join_tab[0].table == table &&
+      (pq_count_query_is_supported(join) ||
+       pq_group_explain_query_is_supported(join) ||
+       (pq_query_base_is_supported(join, true, false, true, true, false, true) &&
+        pq_extract_selected_projection_fields(join, &pq_selected_fields,
+                                              false) &&
+        pq_projection_order_is_supported(join))))
+  {
+    Pq_predicate_filter predicate_filter;
+    if (pq_extract_predicate_filter(thd, join, join->conds,
+                                    &predicate_filter, false))
+    {
+      char pq_extra[128];
+      ulong dop= pq_worker_dop(thd, table_list);
+      size_t len= my_snprintf(pq_extra, sizeof(pq_extra),
+                              "Parallel execute (%lu workers, %.*s.%.*s)",
+                              dop,
+                              (int) table->s->db.length,
+                              table->s->db.str,
+                              (int) table->s->table_name.length,
+                              table->s->table_name.str);
+      eta->pq_extra.append(pq_extra, len, system_charset_info);
+      eta->pq_degree= dop;
+      eta->pq_divided_table.copy(table_list->alias.str,
+                                 table_list->alias.length,
+                                 system_charset_info);
+    }
+  }
+
   key_read= table->file->keyread_enabled();
   if ((tab_type == JT_NEXT || tab_type == JT_CONST) && used_index != MAX_KEY &&
       table->covering_keys.is_set(used_index))
@@ -31606,6 +42141,45 @@ bool save_agg_explain_data(JOIN *join, Explain_select *xpl_sel)
 }
 
 
+static bool pq_add_explain_gather_row(Explain_basic_join *parent,
+                                      Explain_query *output,
+                                      Explain_table_access *source,
+                                      uint select_number,
+                                      bool is_analyze)
+{
+  if (!source->pq_extra.length())
+    return false;
+
+  Explain_table_access *gather= new (output->mem_root)
+    Explain_table_access(output->mem_root, is_analyze);
+  if (!gather)
+    return true;
+
+  char table_name[64];
+  size_t table_name_len= my_snprintf(table_name, sizeof(table_name),
+                                     "<gather%u>", select_number);
+  gather->table_name.append(table_name, table_name_len, system_charset_info);
+  gather->type= JT_ALL;
+  gather->rows_set= source->rows_set;
+  gather->rows= source->rows;
+  gather->filtered_set= source->filtered_set;
+  gather->filtered= source->filtered;
+  gather->pq_gather_row= true;
+  gather->pq_degree= source->pq_degree;
+  gather->pq_divided_table.append(source->pq_divided_table.ptr(),
+                                  source->pq_divided_table.length(),
+                                  source->pq_divided_table.charset());
+  gather->pq_extra.append(source->pq_extra.ptr(), source->pq_extra.length(),
+                          source->pq_extra.charset());
+
+  if (parent->add_table(gather, output))
+    return true;
+
+  source->pq_extra.length(0);
+  return false;
+}
+
+
 /**
   Save Query Plan Footprint
 
@@ -31769,8 +42343,13 @@ int JOIN::save_explain_data_intern(Explain_query *output,
       }
       prev_bush_root_tab= tab->bush_root_tab;
 
-      cur_parent->add_table(eta, output);
       if (tab->save_explain_data(eta, used_tables, distinct_arg, first_top_tab))
+        DBUG_RETURN(1);
+      if (pq_add_explain_gather_row(cur_parent, output, eta,
+                                    select_lex->select_number,
+                                    thd->lex->analyze_stmt))
+        DBUG_RETURN(1);
+      if (cur_parent->add_table(eta, output))
         DBUG_RETURN(1);
 
       if (saved_join_tab)

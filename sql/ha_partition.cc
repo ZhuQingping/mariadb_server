@@ -4096,6 +4096,79 @@ err:
   DBUG_RETURN(NULL);
 }
 
+int ha_partition::pq_create_snapshot(THD *thd)
+{
+  DBUG_ENTER("ha_partition::pq_create_snapshot");
+
+  if (!m_file || !m_part_info || !m_tot_parts)
+    DBUG_RETURN(HA_ERR_UNSUPPORTED);
+
+  handler *snapshot_handler= NULL;
+  for (uint i= bitmap_get_first_set(&m_part_info->read_partitions);
+       i < m_tot_parts;
+       i= bitmap_get_next_set(&m_part_info->read_partitions, i))
+  {
+    if (!m_file[i] || !m_file[i]->ht ||
+        m_file[i]->ht->db_type != DB_TYPE_INNODB)
+      DBUG_RETURN(HA_ERR_UNSUPPORTED);
+    if (!snapshot_handler)
+      snapshot_handler= m_file[i];
+  }
+
+  DBUG_RETURN(snapshot_handler ?
+              snapshot_handler->ha_pq_create_snapshot(thd) :
+              HA_ERR_UNSUPPORTED);
+}
+
+int ha_partition::pq_clone_snapshot(THD *thd, THD *leader_thd)
+{
+  DBUG_ENTER("ha_partition::pq_clone_snapshot");
+
+  if (!m_file || !m_part_info || !m_tot_parts)
+    DBUG_RETURN(HA_ERR_UNSUPPORTED);
+
+  handler *snapshot_handler= NULL;
+  for (uint i= bitmap_get_first_set(&m_part_info->read_partitions);
+       i < m_tot_parts;
+       i= bitmap_get_next_set(&m_part_info->read_partitions, i))
+  {
+    if (!m_file[i] || !m_file[i]->ht ||
+        m_file[i]->ht->db_type != DB_TYPE_INNODB)
+      DBUG_RETURN(HA_ERR_UNSUPPORTED);
+    if (!snapshot_handler)
+      snapshot_handler= m_file[i];
+  }
+
+  DBUG_RETURN(snapshot_handler ?
+              snapshot_handler->ha_pq_clone_snapshot(thd, leader_thd) :
+              HA_ERR_UNSUPPORTED);
+}
+
+void ha_partition::pq_refresh_snapshot_for_retry(THD *thd)
+{
+  DBUG_ENTER("ha_partition::pq_refresh_snapshot_for_retry");
+
+  if (!m_file || !m_part_info || !m_tot_parts)
+    DBUG_VOID_RETURN;
+
+  handler *snapshot_handler= NULL;
+  for (uint i= bitmap_get_first_set(&m_part_info->read_partitions);
+       i < m_tot_parts;
+       i= bitmap_get_next_set(&m_part_info->read_partitions, i))
+  {
+    if (!m_file[i] || !m_file[i]->ht ||
+        m_file[i]->ht->db_type != DB_TYPE_INNODB)
+      DBUG_VOID_RETURN;
+    if (!snapshot_handler)
+      snapshot_handler= m_file[i];
+  }
+
+  if (snapshot_handler)
+    snapshot_handler->ha_pq_refresh_snapshot_for_retry(thd);
+
+  DBUG_VOID_RETURN;
+}
+
 
 /*
   Update all sub partitions to point to handler stats

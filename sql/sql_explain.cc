@@ -1700,6 +1700,11 @@ int Explain_table_access::print_explain(select_result_sink *output,
   /* `Extra` */
   StringBuffer<256> extra_buf;
   bool first= true;
+  if (pq_extra.length())
+  {
+    extra_buf.append(pq_extra);
+    first= false;
+  }
   for (int i=0; i < (int)extra_tags.elements(); i++)
   {
     if (first)
@@ -1986,6 +1991,27 @@ void Explain_table_access::print_explain_json(Explain_query *query,
                                               bool is_analyze)
 {
   Json_writer_object jsobj(writer);
+
+  if (pq_gather_row)
+  {
+    writer->add_member("parallel_execute").start_object();
+    writer->add_member("parallel_degree").add_ll((longlong) pq_degree);
+    if (pq_divided_table.length())
+    {
+      writer->add_member("divided_table").add_str(pq_divided_table);
+      writer->add_member("cut_table").add_str(pq_divided_table);
+    }
+
+    writer->add_member("table").start_object();
+    writer->add_member("table_name").add_str(table_name);
+    writer->add_member("access_type").add_str(join_type_str[type]);
+    if (rows_set)
+      writer->add_member("rows").add_ull(rows);
+    writer->end_object();
+
+    writer->end_object();
+    return;
+  }
   
   if (pre_join_sort)
   {
@@ -3181,4 +3207,3 @@ void Subq_materialization_tracker::print_json_members(Json_writer *writer) const
     writer->end_array();
   }
 }
-

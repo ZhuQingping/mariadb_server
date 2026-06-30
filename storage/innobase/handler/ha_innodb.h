@@ -27,6 +27,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 /** Prebuilt structures in an InnoDB table handle used within MySQL */
 struct row_prebuilt_t;
+struct innodb_pq_worker_scan_ctx;
 
 /** InnoDB transaction */
 struct trx_t;
@@ -187,6 +188,55 @@ public:
 	int external_lock(THD *thd, int lock_type) override;
 
 	int start_stmt(THD *thd, thr_lock_type lock_type) override;
+
+	int pq_create_snapshot(THD *thd) override;
+
+	int pq_clone_snapshot(THD *thd, THD *leader_thd) override;
+
+	void pq_refresh_snapshot_for_retry(THD *thd) override;
+
+	bool pq_scan_supported() const override;
+
+	int pq_leader_scan_init(
+		THD *thd,
+		const HA_pq_scan_init_param *param,
+		void **scan_ctx) override;
+
+	int pq_worker_scan_init(
+		THD *thd,
+		void *scan_ctx,
+		const HA_pq_scan_range_param *range) override;
+
+	int pq_worker_scan_next(void *scan_ctx, uchar *buf) override;
+
+	int pq_worker_scan_end() override;
+
+	int pq_leader_scan_end(void *scan_ctx) override;
+
+	bool pq_scan_btree_descriptor_available(void *scan_ctx) override;
+
+	ulonglong pq_scan_btree_descriptor_count(void *scan_ctx) override;
+
+	bool pq_scan_btree_scan_start_available(void *scan_ctx) override;
+
+	bool pq_scan_btree_scan_end_available(void *scan_ctx) override;
+
+	bool pq_scan_btree_boundary_available(void *scan_ctx) override;
+
+	bool pq_scan_btree_descriptor_split_used(void *scan_ctx) override;
+
+	const char *pq_scan_btree_descriptor_rejected_reason(
+		void *scan_ctx) override;
+
+	bool pq_scan_record_buffer_available(void *scan_ctx) override;
+
+	const char *pq_scan_worker_scan_api(void *scan_ctx) override;
+
+	ulonglong pq_scan_mysql_row_len(void *scan_ctx) override;
+
+	ulonglong pq_scan_mysql_prefix_len(void *scan_ctx) override;
+
+	ulonglong pq_scan_mysql_template_cols(void *scan_ctx) override;
 
 	ha_rows records_in_range(
                 uint                    inx,
@@ -527,6 +577,9 @@ protected:
 
 	/** Flags that specify the handler instance (table) capability. */
 	Table_flags		m_int_table_flags;
+
+	/** Worker-local scan state for the first PQ handler scan provider. */
+	innodb_pq_worker_scan_ctx*	m_pq_worker_scan_ctx;
 
 	/** Index into the server's primary key meta-data table->key_info{} */
 	uint			m_primary_key;

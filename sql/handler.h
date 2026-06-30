@@ -62,6 +62,25 @@ struct rpl_binlog_state_base;
 struct handler_binlog_event_group_info;
 struct handler_binlog_purge_info;
 
+struct HA_pq_scan_init_param
+{
+  uint keyno;
+  uint dop;
+  const key_range *scan_start_key;
+  const key_range *scan_end_key;
+  bool reverse;
+};
+
+struct HA_pq_scan_range_param
+{
+  uint keyno;
+  uint worker_id;
+  uint worker_count;
+  const key_range *start_key;
+  const key_range *end_key;
+  bool reverse;
+};
+
 // the following is for checking tables
 
 #define HA_ADMIN_ALREADY_DONE	  1
@@ -3697,6 +3716,195 @@ public:
     return ref != 0;
   }
   virtual handler *clone(const char *name, MEM_ROOT *mem_root);
+  virtual int pq_create_snapshot(THD *thd __attribute__((unused)))
+  {
+    return HA_ERR_UNSUPPORTED;
+  }
+  virtual int pq_clone_snapshot(THD *thd __attribute__((unused)),
+                                THD *leader_thd __attribute__((unused)))
+  {
+    return HA_ERR_UNSUPPORTED;
+  }
+  virtual void pq_refresh_snapshot_for_retry(THD *thd __attribute__((unused)))
+  {
+  }
+  int ha_pq_create_snapshot(THD *thd)
+  {
+    return pq_create_snapshot(thd);
+  }
+  int ha_pq_clone_snapshot(THD *thd, THD *leader_thd)
+  {
+    return pq_clone_snapshot(thd, leader_thd);
+  }
+  void ha_pq_refresh_snapshot_for_retry(THD *thd)
+  {
+    pq_refresh_snapshot_for_retry(thd);
+  }
+  virtual bool pq_scan_supported() const { return false; }
+  virtual int pq_leader_scan_init(
+      THD *thd __attribute__((unused)),
+      const HA_pq_scan_init_param *param __attribute__((unused)),
+      void **scan_ctx __attribute__((unused)))
+  {
+    if (scan_ctx)
+      *scan_ctx= 0;
+    return HA_ERR_UNSUPPORTED;
+  }
+  virtual int pq_worker_scan_init(
+      THD *thd __attribute__((unused)),
+      void *scan_ctx __attribute__((unused)),
+      const HA_pq_scan_range_param *range __attribute__((unused)))
+  {
+    return HA_ERR_UNSUPPORTED;
+  }
+  virtual int pq_worker_scan_next(void *scan_ctx __attribute__((unused)),
+                                  uchar *buf __attribute__((unused)))
+  {
+    return HA_ERR_UNSUPPORTED;
+  }
+  virtual int pq_worker_scan_end()
+  {
+    return HA_ERR_UNSUPPORTED;
+  }
+  virtual int pq_leader_scan_end(void *scan_ctx __attribute__((unused)))
+  {
+    return HA_ERR_UNSUPPORTED;
+  }
+  virtual bool pq_scan_btree_descriptor_available(
+      void *scan_ctx __attribute__((unused)))
+  {
+    return false;
+  }
+  virtual ulonglong pq_scan_btree_descriptor_count(
+      void *scan_ctx __attribute__((unused)))
+  {
+    return 0;
+  }
+  virtual bool pq_scan_btree_scan_start_available(
+      void *scan_ctx __attribute__((unused)))
+  {
+    return false;
+  }
+  virtual bool pq_scan_btree_scan_end_available(
+      void *scan_ctx __attribute__((unused)))
+  {
+    return false;
+  }
+  virtual bool pq_scan_btree_boundary_available(
+      void *scan_ctx __attribute__((unused)))
+  {
+    return false;
+  }
+  virtual bool pq_scan_btree_descriptor_split_used(
+      void *scan_ctx __attribute__((unused)))
+  {
+    return false;
+  }
+  virtual const char *pq_scan_btree_descriptor_rejected_reason(
+      void *scan_ctx __attribute__((unused)))
+  {
+    return NULL;
+  }
+  virtual bool pq_scan_record_buffer_available(
+      void *scan_ctx __attribute__((unused)))
+  {
+    return false;
+  }
+  virtual const char *pq_scan_worker_scan_api(
+      void *scan_ctx __attribute__((unused)))
+  {
+    return "read_range_next";
+  }
+  virtual ulonglong pq_scan_mysql_row_len(
+      void *scan_ctx __attribute__((unused)))
+  {
+    return 0;
+  }
+  virtual ulonglong pq_scan_mysql_prefix_len(
+      void *scan_ctx __attribute__((unused)))
+  {
+    return 0;
+  }
+  virtual ulonglong pq_scan_mysql_template_cols(
+      void *scan_ctx __attribute__((unused)))
+  {
+    return 0;
+  }
+  bool ha_pq_scan_supported() const
+  {
+    return pq_scan_supported();
+  }
+  int ha_pq_leader_scan_init(THD *thd,
+                             const HA_pq_scan_init_param *param,
+                             void **scan_ctx)
+  {
+    return pq_leader_scan_init(thd, param, scan_ctx);
+  }
+  int ha_pq_worker_scan_init(THD *thd, void *scan_ctx,
+                             const HA_pq_scan_range_param *range)
+  {
+    return pq_worker_scan_init(thd, scan_ctx, range);
+  }
+  int ha_pq_worker_scan_next(void *scan_ctx, uchar *buf)
+  {
+    return pq_worker_scan_next(scan_ctx, buf);
+  }
+  int ha_pq_worker_scan_end()
+  {
+    return pq_worker_scan_end();
+  }
+  int ha_pq_leader_scan_end(void *scan_ctx)
+  {
+    return pq_leader_scan_end(scan_ctx);
+  }
+  bool ha_pq_scan_btree_descriptor_available(void *scan_ctx)
+  {
+    return pq_scan_btree_descriptor_available(scan_ctx);
+  }
+  ulonglong ha_pq_scan_btree_descriptor_count(void *scan_ctx)
+  {
+    return pq_scan_btree_descriptor_count(scan_ctx);
+  }
+  bool ha_pq_scan_btree_scan_start_available(void *scan_ctx)
+  {
+    return pq_scan_btree_scan_start_available(scan_ctx);
+  }
+  bool ha_pq_scan_btree_scan_end_available(void *scan_ctx)
+  {
+    return pq_scan_btree_scan_end_available(scan_ctx);
+  }
+  bool ha_pq_scan_btree_boundary_available(void *scan_ctx)
+  {
+    return pq_scan_btree_boundary_available(scan_ctx);
+  }
+  bool ha_pq_scan_btree_descriptor_split_used(void *scan_ctx)
+  {
+    return pq_scan_btree_descriptor_split_used(scan_ctx);
+  }
+  const char *ha_pq_scan_btree_descriptor_rejected_reason(void *scan_ctx)
+  {
+    return pq_scan_btree_descriptor_rejected_reason(scan_ctx);
+  }
+  bool ha_pq_scan_record_buffer_available(void *scan_ctx)
+  {
+    return pq_scan_record_buffer_available(scan_ctx);
+  }
+  const char *ha_pq_scan_worker_scan_api(void *scan_ctx)
+  {
+    return pq_scan_worker_scan_api(scan_ctx);
+  }
+  ulonglong ha_pq_scan_mysql_row_len(void *scan_ctx)
+  {
+    return pq_scan_mysql_row_len(scan_ctx);
+  }
+  ulonglong ha_pq_scan_mysql_prefix_len(void *scan_ctx)
+  {
+    return pq_scan_mysql_prefix_len(scan_ctx);
+  }
+  ulonglong ha_pq_scan_mysql_template_cols(void *scan_ctx)
+  {
+    return pq_scan_mysql_template_cols(scan_ctx);
+  }
   /** This is called after create to allow us to set up cached variables */
   void init()
   {

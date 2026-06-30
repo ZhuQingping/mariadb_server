@@ -1564,6 +1564,13 @@ public:
   */
   bool no_rows_in_result_called;
 
+  /*
+    Set when a PQ execution path was attempted but fell back before producing
+    rows. Optimizer trace uses this to distinguish execution-time setup
+    failures from the later plan-shape fallback reason.
+  */
+  const char *pq_execution_not_applied_reason;
+
   /**
     This is set if SQL_CALC_ROWS was calculated by filesort()
     and should be taken from the appropriate JOIN_TAB

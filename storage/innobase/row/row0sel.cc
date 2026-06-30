@@ -5982,6 +5982,253 @@ func_exit:
 	DBUG_RETURN(err);
 }
 
+bool
+row_pq_record_buffer_scan_supported(
+	const row_prebuilt_t*	prebuilt)
+{
+	if (!prebuilt) {
+		return(false);
+	}
+
+	if (!prebuilt->index
+	    || !dict_index_is_clust(prebuilt->index)
+	    || (prebuilt->index->type & DICT_FTS)
+	    || dict_index_is_spatial(prebuilt->index)
+	    || !prebuilt->index_usable
+	    || prebuilt->select_lock_type != LOCK_NONE
+	    || prebuilt->templ_contains_blob
+	    || prebuilt->clust_index_was_generated
+	    || prebuilt->used_in_HANDLER
+	    || prebuilt->in_fts_query
+	    || prebuilt->pk_filter
+	    || prebuilt->idx_cond) {
+		return(false);
+	}
+
+	return(true);
+}
+
+dberr_t
+row_pq_record_buffer_scan_next(
+	byte*		buf,
+	row_prebuilt_t*	prebuilt,
+	const dtuple_t*	start_tuple,
+	page_cur_mode_t	start_mode,
+	const dtuple_t*	end_tuple,
+	bool		end_exclusive,
+	bool*		start_read,
+	row_pq_record_buffer_t* record_buffer,
+	mem_heap_t**	row_heap)
+{
+	DBUG_ENTER("row_pq_record_buffer_scan_next");
+
+	if (!buf || !start_read
+	    || !row_pq_record_buffer_scan_supported(prebuilt)
+	    || !start_tuple
+	    || !record_buffer || !record_buffer->records
+	    || !record_buffer->row_len || !record_buffer->capacity
+	    || !row_heap) {
+		DBUG_RETURN(DB_UNSUPPORTED);
+	}
+
+	if (record_buffer->pos < record_buffer->count) {
+		memcpy(buf, record_buffer->records
+		       + record_buffer->pos * record_buffer->row_len,
+		       record_buffer->row_len);
+		record_buffer->pos++;
+		if (record_buffer->pos == record_buffer->count) {
+			record_buffer->pos = 0;
+			record_buffer->count = 0;
+		}
+		prebuilt->n_rows_fetched++;
+		DBUG_RETURN(DB_SUCCESS);
+	}
+
+	dict_index_t* index = prebuilt->index;
+	trx_t* trx = prebuilt->trx;
+	btr_pcur_t* pcur = prebuilt->pcur;
+	ibool comp = dict_table_is_comp(prebuilt->table);
+	if (!*row_heap) {
+		*row_heap = mem_heap_create(srv_page_size / 4);
+	}
+	mem_heap_t* heap = *row_heap;
+	mem_heap_empty(heap);
+	rec_offs offsets_[REC_OFFS_NORMAL_SIZE];
+	rec_offs* offsets = offsets_;
+	rec_offs_init(offsets_);
+	dberr_t err = DB_SUCCESS;
+	byte* next_buf = NULL;
+	dtuple_t* vrow = NULL;
+
+	if (!prebuilt->table->space) {
+		DBUG_RETURN(DB_TABLESPACE_DELETED);
+	} else if (!prebuilt->table->is_readable()) {
+		DBUG_RETURN(DB_CORRUPTION);
+	} else if (prebuilt->index->is_corrupted()) {
+		DBUG_RETURN(DB_CORRUPTION);
+	}
+
+	prebuilt->new_rec_locks = 0;
+	pcur->btr_cur.page_cur.index = index;
+	trx->op_info = *start_read ? "starting PQ fast index read"
+				   : "fetching PQ fast rows";
+
+	if (*start_read) {
+		prebuilt->n_rows_fetched = 0;
+		prebuilt->n_fetch_cached = 0;
+		prebuilt->fetch_cache_first = 0;
+
+		if (prebuilt->sel_graph == NULL) {
+			row_prebuild_sel_graph(prebuilt);
+		}
+	}
+
+	mtr_t mtr{trx};
+	mtr.start();
+	mtr.set_log_mode(MTR_LOG_NO_REDO);
+
+	if (prebuilt->table->no_rollback()) {
+		prebuilt->select_lock_type = LOCK_NONE;
+		prebuilt->sql_stat_start = FALSE;
+	} else if (prebuilt->sql_stat_start) {
+		prebuilt->sql_stat_start = FALSE;
+		trx_start_if_not_started(trx, false);
+		if (prebuilt->select_lock_type == LOCK_NONE) {
+			trx->read_view.open(trx);
+		}
+	}
+
+	if (*start_read) {
+		pcur->old_rec = nullptr;
+		err = btr_pcur_open_with_no_init(
+			start_tuple, start_mode, BTR_SEARCH_LEAF, pcur, &mtr);
+		if (err != DB_SUCCESS) {
+			goto func_exit;
+		}
+		pcur->trx_if_known = trx;
+		*start_read = false;
+	} else {
+		bool same_user_rec;
+		bool need_to_process = sel_restore_position_for_mysql(
+			&same_user_rec, BTR_SEARCH_LEAF, pcur, true, &mtr);
+		if (!need_to_process) {
+			goto next_rec_after_check;
+		}
+	}
+
+	for (;;) {
+		const rec_t* rec;
+		const rec_t* result_rec;
+
+		if (trx_is_interrupted(trx)) {
+			err = DB_INTERRUPTED;
+			goto normal_return;
+		}
+
+		rec = btr_pcur_get_rec(pcur);
+		ut_ad(page_rec_is_leaf(rec));
+
+		if (page_rec_is_infimum(rec) || page_rec_is_supremum(rec)
+		    || (page_rec_is_comp(rec)
+			&& (rec_get_info_bits(rec, true)
+			    & REC_INFO_MIN_REC_FLAG))) {
+			goto next_rec;
+		}
+
+		offsets = rec_get_offsets(rec, index, offsets,
+					  index->n_core_fields,
+					  ULINT_UNDEFINED, &heap);
+
+		if (end_tuple) {
+			int cmp = cmp_dtuple_rec(end_tuple, rec, index, offsets);
+			if ((end_exclusive && cmp <= 0)
+			    || (!end_exclusive && cmp < 0)) {
+				err = next_buf ? DB_SUCCESS : DB_END_OF_INDEX;
+				goto normal_return;
+			}
+		}
+
+		result_rec = rec;
+		if (trx->isolation_level == TRX_ISO_READ_UNCOMMITTED
+		    || prebuilt->table->is_temporary()
+		    || prebuilt->table->no_rollback()) {
+		} else {
+			err = row_sel_clust_sees(rec, *index, offsets,
+						 trx->read_view);
+			switch (err) {
+			default:
+				goto normal_return;
+			case DB_SUCCESS:
+				break;
+			case DB_SUCCESS_LOCKED_REC:
+				rec_t* old_vers;
+				err = row_sel_build_prev_vers_for_mysql(
+					prebuilt, index, rec, &offsets,
+					&heap, &old_vers,
+					NULL, &mtr);
+				if (err != DB_SUCCESS) {
+					goto normal_return;
+				}
+				if (old_vers == NULL) {
+					goto next_rec;
+				}
+				result_rec = old_vers;
+			}
+		}
+
+		if (rec_get_deleted_flag(result_rec, comp)) {
+			goto next_rec;
+		}
+
+		next_buf = next_buf
+			? record_buffer->records
+			  + record_buffer->count * record_buffer->row_len
+			: buf;
+		if (!row_sel_store_mysql_rec(next_buf, prebuilt, result_rec,
+					     vrow, false, index, offsets)) {
+			if (next_buf == buf) {
+				next_buf = NULL;
+			}
+			goto next_rec;
+		}
+
+		if (next_buf != buf) {
+			record_buffer->count++;
+		}
+
+		if (record_buffer->count >= record_buffer->capacity) {
+			err = DB_SUCCESS;
+			goto normal_return;
+		}
+
+next_rec:
+		vrow = NULL;
+		prebuilt->new_rec_locks = 0;
+next_rec_after_check:
+		if (btr_pcur_is_after_last_on_page(pcur)) {
+			if (btr_pcur_is_after_last_in_tree(pcur)) {
+				err = next_buf ? DB_SUCCESS : DB_END_OF_INDEX;
+				goto normal_return;
+			}
+			err = btr_pcur_move_to_next_page(pcur, &mtr);
+			if (err != DB_SUCCESS) {
+				goto normal_return;
+			}
+		} else if (!btr_pcur_move_to_next_on_page(pcur)) {
+			err = DB_CORRUPTION;
+			goto normal_return;
+		}
+	}
+
+normal_return:
+	btr_pcur_store_position(pcur, &mtr);
+
+func_exit:
+	mtr.commit();
+	trx->op_info = "";
+	DBUG_RETURN(err);
+}
+
 /********************************************************************//**
 Count rows in a R-Tree leaf level.
 @return DB_SUCCESS if successful */

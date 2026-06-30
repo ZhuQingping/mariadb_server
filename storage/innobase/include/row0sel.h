@@ -92,6 +92,14 @@ row_sel_copy_cached_fields_for_mysql(
 	const byte*	cached_rec,
 	row_prebuilt_t*	prebuilt);
 
+struct row_pq_record_buffer_t {
+	byte*	records;
+	ulint	row_len;
+	ulint	capacity;
+	ulint	pos;
+	ulint	count;
+};
+
 /****************************************************************//**
 Converts a key value stored in MySQL format to an Innobase dtuple. The last
 field of the key value may be just a prefix of a fixed length field: hence
@@ -145,6 +153,36 @@ row_search_mvcc(
 	row_prebuilt_t*	prebuilt,
 	ulint		match_mode,
 	ulint		direction)
+	MY_ATTRIBUTE((warn_unused_result));
+
+/** Whether the narrow PQ record-buffer scan path is available for the
+given row prebuilt. This is intentionally conservative and is used by the
+handler PQ path before falling back to row_search_mvcc() through the normal
+handler range APIs.
+@param[in] prebuilt row prebuilt from the handler
+@return true when row_pq_record_buffer_scan_next() can be used */
+bool
+row_pq_record_buffer_scan_supported(
+	const row_prebuilt_t*	prebuilt)
+	MY_ATTRIBUTE((warn_unused_result));
+
+/** Fetch the next row for a narrow PQ record-buffer scan.
+This is the WL017 row-layer extension point. The initial implementation
+returns DB_UNSUPPORTED so callers keep the current read_range_next() path.
+@param[out] buf MySQL record buffer
+@param[in,out] prebuilt row prebuilt from the handler
+@return DB_SUCCESS, DB_END_OF_INDEX, DB_UNSUPPORTED, or another InnoDB error */
+dberr_t
+row_pq_record_buffer_scan_next(
+	byte*		buf,
+	row_prebuilt_t*	prebuilt,
+	const dtuple_t*	start_tuple,
+	page_cur_mode_t	start_mode,
+	const dtuple_t*	end_tuple,
+	bool		end_exclusive,
+	bool*		start_read,
+	row_pq_record_buffer_t* record_buffer,
+	mem_heap_t**	row_heap)
 	MY_ATTRIBUTE((warn_unused_result));
 
 /********************************************************************//**

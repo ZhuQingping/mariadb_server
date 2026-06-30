@@ -768,11 +768,21 @@ public:
   Explain_table_access(MEM_ROOT *root, bool timed) :
     derived_select_number(0),
     non_merged_sjm_number(0),
+    type(JT_UNKNOWN),
+    used_partitions_set(false),
+    rows_set(false),
+    filtered_set(false),
+    loose_scan_is_scanning(false),
+    rows(0),
+    filtered(0.0),
     cost(0.0),
     loops(0.0),
+    pq_degree(0),
     extra_tags(root),
+    quick_info(NULL),
     range_checked_fer(NULL),
     full_scan_on_null_key(false),
+    pq_gather_row(false),
     start_dups_weedout(false),
     end_dups_weedout(false),
     where_cond(NULL),
@@ -794,6 +804,8 @@ public:
   StringBuffer<32> table_name;
   StringBuffer<32> used_partitions;
   String_list used_partitions_list;
+  StringBuffer<128> pq_extra;
+  StringBuffer<64> pq_divided_table;
   // valid with ET_USING_MRR
   StringBuffer<32> mrr_type;
   StringBuffer<32> firstmatch_table_name;
@@ -843,6 +855,7 @@ public:
   double cost;
 
   double loops;
+  ulong pq_degree;
   /* 
     Contents of the 'Extra' column. Some are converted into strings, some have
     parameters, values for which are stored below.
@@ -856,6 +869,7 @@ public:
   Explain_range_checked_fer *range_checked_fer;
  
   bool full_scan_on_null_key;
+  bool pq_gather_row;
 
   // valid with ET_USING_JOIN_BUFFER
   EXPLAIN_BKA_TYPE bka_type;

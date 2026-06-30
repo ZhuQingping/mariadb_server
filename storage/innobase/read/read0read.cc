@@ -247,6 +247,29 @@ void ReadView::open(trx_t *trx)
   }
 }
 
+bool ReadView::clone_from(const ReadView &src)
+{
+  if (this == &src)
+    return is_open();
+
+  src.m_mutex.wr_lock();
+  const bool src_open= src.is_open();
+
+  if (src_open)
+  {
+    m_mutex.wr_lock();
+    m_open.store(false, std::memory_order_relaxed);
+    static_cast<ReadViewBase&>(*this)=
+      static_cast<const ReadViewBase&>(src);
+    m_creator_trx_id= src.m_creator_trx_id;
+    m_open.store(true, std::memory_order_relaxed);
+    m_mutex.wr_unlock();
+  }
+
+  src.m_mutex.wr_unlock();
+  return src_open;
+}
+
 
 /**
   Clones the oldest view and stores it in view.

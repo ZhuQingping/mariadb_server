@@ -509,6 +509,9 @@ public:
   }
   Partition_share *get_part_share() { return part_share; }
   handler *clone(const char *name, MEM_ROOT *mem_root) override;
+  int pq_create_snapshot(THD *thd) override;
+  int pq_clone_snapshot(THD *thd, THD *leader_thd) override;
+  void pq_refresh_snapshot_for_retry(THD *thd) override;
   void set_part_info(partition_info *part_info) override
   {
      m_part_info= part_info;
