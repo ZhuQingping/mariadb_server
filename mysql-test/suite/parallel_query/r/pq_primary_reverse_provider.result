@@ -1,0 +1,190 @@
+#
+# Parallel Query primary-key reverse handler provider.
+#
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_optimizer_trace= @@optimizer_trace;
+SET @save_optimizer_switch= @@optimizer_switch;
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on';
+SET optimizer_trace= 1;
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+CREATE TABLE pq_primary_reverse_t (
+id INT NOT NULL,
+payload VARCHAR(16) NOT NULL,
+PRIMARY KEY (id)
+) ENGINE=InnoDB;
+CREATE TABLE pq_primary_reverse_composite_t (
+id INT NOT NULL,
+part INT NOT NULL,
+payload VARCHAR(16) NOT NULL,
+PRIMARY KEY (id, part)
+) ENGINE=InnoDB;
+INSERT INTO pq_primary_reverse_t VALUES
+(-100, 'a'), (-30, 'b'), (-7, 'c'), (0, 'd'),
+(5, 'e'), (8, 'f'), (13, 'g'), (21, 'h'),
+(34, 'i'), (55, 'j'), (89, 'k'), (144, 'l');
+INSERT INTO pq_primary_reverse_composite_t VALUES
+(1, 1, 'a'), (1, 2, 'b'), (2, 1, 'c'), (2, 2, 'd');
+# Full primary-key DESC projection uses the native reverse handler provider.
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(16) */ id
+FROM pq_primary_reverse_t
+ORDER BY id DESC;
+id
+144
+89
+55
+34
+21
+13
+8
+5
+0
+-7
+-30
+-100
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].scan_provider') AS full_reverse_scan_provider
+FROM information_schema.optimizer_trace;
+full_reverse_scan_provider
+["innodb_clustered_primary_reverse"]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_split_used') AS full_reverse_descriptor_split_used
+FROM information_schema.optimizer_trace;
+full_reverse_descriptor_split_used
+[false]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_rejected_reason') AS full_reverse_descriptor_rejected_reason
+FROM information_schema.optimizer_trace;
+full_reverse_descriptor_rejected_reason
+["reverse_scan"]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+# Bounded primary-key DESC projection preserves half-open range semantics.
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ id
+FROM pq_primary_reverse_t
+WHERE id >= -30 AND id < 56
+ORDER BY id DESC;
+id
+55
+34
+21
+13
+8
+5
+0
+-7
+-30
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].scan_provider') AS bounded_reverse_scan_provider
+FROM information_schema.optimizer_trace;
+bounded_reverse_scan_provider
+["innodb_clustered_primary_reverse"]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+# Lower-bound-only reverse scan starts from index last.
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ id
+FROM pq_primary_reverse_t
+WHERE id >= 34
+ORDER BY id DESC;
+id
+144
+89
+55
+34
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].scan_provider') AS lower_only_reverse_scan_provider
+FROM information_schema.optimizer_trace;
+lower_only_reverse_scan_provider
+["innodb_clustered_primary_reverse"]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+# Upper-bound-only reverse scan positions before the upper bound.
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ id
+FROM pq_primary_reverse_t
+WHERE id < 34
+ORDER BY id DESC;
+id
+21
+13
+8
+5
+0
+-7
+-30
+-100
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].scan_provider') AS upper_only_reverse_scan_provider
+FROM information_schema.optimizer_trace;
+upper_only_reverse_scan_provider
+["innodb_clustered_primary_reverse"]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+# Empty in-range gap still uses the reverse provider without returning rows.
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ id
+FROM pq_primary_reverse_t
+WHERE id > -99 AND id < -31
+ORDER BY id DESC;
+id
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].scan_provider') AS empty_gap_reverse_scan_provider
+FROM information_schema.optimizer_trace;
+empty_gap_reverse_scan_provider
+["innodb_clustered_primary_reverse"]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+# Composite primary-key DESC does not claim the native reverse provider.
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ id, part
+FROM pq_primary_reverse_composite_t
+ORDER BY id DESC, part DESC;
+id	part
+2	2
+2	1
+1	2
+1	1
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].scan_provider') AS composite_reverse_scan_provider
+FROM information_schema.optimizer_trace;
+composite_reverse_scan_provider
+["innodb_clustered_primary"]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+SET optimizer_trace= @save_optimizer_trace;
+SET optimizer_switch= @save_optimizer_switch;
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;
+DROP TABLE pq_primary_reverse_composite_t;
+DROP TABLE pq_primary_reverse_t;

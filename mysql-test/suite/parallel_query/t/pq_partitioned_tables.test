@@ -1,0 +1,545 @@
+--source include/have_innodb.inc
+--source include/have_partition.inc
+
+--echo #
+--echo # Parallel Query partitioned table coverage.
+--echo #
+
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_parallel_limit_no_order_by= @@parallel_limit_no_order_by;
+SET @save_pq_support_features_switch= @@pq_support_features_switch;
+SET @save_optimizer_trace= @@optimizer_trace;
+SET @save_optimizer_switch= @@optimizer_switch;
+SET @save_op_over_pq_offset_threshold= @@op_over_pq_offset_threshold;
+
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on';
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+SET parallel_limit_no_order_by= ON;
+SET pq_support_features_switch= 'simple_aggregate=on,count_distinct=on';
+SET op_over_pq_offset_threshold= 2048;
+SET optimizer_trace= 1;
+
+CREATE TABLE lineitem_partitioned (
+  l_orderkey INT NOT NULL PRIMARY KEY,
+  l_shipdate DATE NOT NULL,
+  l_quantity INT NOT NULL
+) ENGINE=InnoDB
+PARTITION BY HASH(l_orderkey) PARTITIONS 2;
+INSERT INTO lineitem_partitioned VALUES
+  (1, '1980-01-02', 10),
+  (2, '1981-01-02', 20);
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS partition_table_trace_count
+FROM lineitem_partitioned
+WHERE l_shipdate > '1980-01-01';
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS partition_count_scan_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_available') AS partition_count_handler_scan_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_rejected_reason') AS partition_count_handler_rejected_reason
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].btree_descriptor_split_used') AS partition_count_btree_descriptor_split_used
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_quantity) AS partition_table_trace_sum
+FROM lineitem_partitioned
+WHERE l_shipdate > '1980-01-01';
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS partition_sum_scan_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_available') AS partition_sum_handler_scan_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_rejected_reason') AS partition_sum_handler_rejected_reason
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, l_quantity
+FROM lineitem_partitioned
+WHERE l_shipdate > '1980-01-01'
+ORDER BY l_orderkey;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, l_quantity
+FROM lineitem_partitioned
+WHERE l_shipdate > '1980-01-01'
+ORDER BY l_orderkey
+LIMIT 1, 1;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_shipdate, COUNT(*) AS partition_group_count
+FROM lineitem_partitioned
+WHERE l_shipdate > '1980-01-01'
+GROUP BY l_shipdate
+ORDER BY l_shipdate;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+FLUSH STATUS;
+--replace_regex /[0-9]+/<partition_count>/
+SELECT /*+ PQ(4) */ COUNT(*) AS partition_selection_trace_count
+FROM lineitem_partitioned PARTITION(p0)
+WHERE l_shipdate > '1980-01-01';
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS partition_selection_scan_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_available') AS partition_selection_handler_scan_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_rejected_reason') AS partition_selection_handler_rejected_reason
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+FLUSH STATUS;
+--replace_regex /[0-9]+/<partition_count>/
+SELECT /*+ PQ(4) */ SUM(l_quantity * 2) AS partition_selection_sum
+FROM lineitem_partitioned PARTITION(p0)
+WHERE l_shipdate > '1980-01-01';
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+FLUSH STATUS;
+--replace_regex /[0-9]+/<partition_count>/
+SELECT /*+ PQ(4) */ l_orderkey, l_quantity
+FROM lineitem_partitioned PARTITION(p0)
+WHERE l_shipdate > '1980-01-01'
+ORDER BY l_orderkey;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+FLUSH STATUS;
+--replace_regex /[0-9]+/<partition_count>/
+SELECT /*+ PQ(4) */ l_shipdate, COUNT(*) AS partition_selection_group_count
+FROM lineitem_partitioned PARTITION(p0)
+WHERE l_shipdate > '1980-01-01'
+GROUP BY l_shipdate
+ORDER BY l_shipdate;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+DROP TABLE lineitem_partitioned;
+
+CREATE TABLE lineitem_partitioned_range (
+  l_orderkey INT NOT NULL PRIMARY KEY,
+  l_shipdate DATE NOT NULL,
+  l_quantity INT NOT NULL
+) ENGINE=InnoDB
+PARTITION BY RANGE(l_orderkey) (
+  PARTITION p0 VALUES LESS THAN (3),
+  PARTITION p1 VALUES LESS THAN MAXVALUE
+);
+INSERT INTO lineitem_partitioned_range VALUES
+  (1, '1980-01-02', 10),
+  (2, '1981-01-02', 20),
+  (3, '1982-01-02', 30),
+  (4, '1983-01-02', 40);
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS partition_range_count
+FROM lineitem_partitioned_range
+WHERE l_shipdate > '1980-01-01';
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, l_quantity
+FROM lineitem_partitioned_range
+WHERE l_shipdate > '1980-01-01'
+ORDER BY l_orderkey;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_shipdate, COUNT(*) AS partition_range_group_count
+FROM lineitem_partitioned_range
+WHERE l_shipdate > '1980-01-01'
+GROUP BY l_shipdate
+ORDER BY l_shipdate;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS partition_range_selection_count
+FROM lineitem_partitioned_range PARTITION(p0)
+WHERE l_shipdate > '1980-01-01';
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+DROP TABLE lineitem_partitioned_range;
+
+--echo #
+--echo # Partitioned Q1 grouped merge combines the same group across worker ranges and partitions.
+--echo #
+
+CREATE TABLE lineitem_q1_partitioned_hash (
+  l_orderkey INT NOT NULL,
+  l_linenumber INT NOT NULL,
+  l_shipdate DATE NOT NULL,
+  l_returnflag CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+  l_linestatus CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+  l_quantity DECIMAL(15,2) NOT NULL,
+  l_extendedprice DECIMAL(15,2) NOT NULL,
+  l_discount DECIMAL(15,2) NOT NULL,
+  l_tax DECIMAL(15,2) NOT NULL,
+  PRIMARY KEY (l_orderkey, l_linenumber)
+) ENGINE=InnoDB
+PARTITION BY HASH(l_orderkey) PARTITIONS 4;
+INSERT INTO lineitem_q1_partitioned_hash VALUES
+  (1, 1, '1998-09-01', 'A', 'F', 10.00, 100.00, 0.05, 0.01),
+  (102, 1, '1998-09-01', 'A', 'F', 20.00, 200.00, 0.06, 0.02),
+  (203, 1, '1998-09-01', 'A', 'F', 30.00, 300.00, 0.07, 0.03),
+  (304, 1, '1998-09-01', 'A', 'F', 40.00, 400.00, 0.08, 0.04),
+  (2, 1, '1998-09-02', 'N', 'O', 50.00, 500.00, 0.05, 0.01),
+  (103, 1, '1998-09-02', 'N', 'O', 60.00, 600.00, 0.06, 0.02),
+  (204, 1, '1998-09-02', 'N', 'O', 70.00, 700.00, 0.07, 0.03),
+  (305, 1, '1998-09-02', 'N', 'O', 80.00, 800.00, 0.08, 0.04),
+  (406, 1, '1998-09-03', 'A', 'F', 90.00, 900.00, 0.09, 0.05);
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ l_returnflag, l_linestatus,
+       COUNT(*) AS count_order,
+       SUM(l_quantity) AS sum_qty
+FROM lineitem_q1_partitioned_hash
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       COUNT(*) AS count_order,
+       SUM(l_quantity) AS sum_qty
+FROM lineitem_q1_partitioned_hash
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ SUM(l_extendedprice * l_discount) AS partition_hash_q6_serial_revenue
+FROM lineitem_q1_partitioned_hash
+WHERE l_shipdate >= DATE '1998-09-01'
+  AND l_shipdate < DATE '1998-09-03'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 75;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS partition_hash_q6_revenue
+FROM lineitem_q1_partitioned_hash
+WHERE l_shipdate >= DATE '1998-09-01'
+  AND l_shipdate < DATE '1998-09-03'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 75;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS partition_hash_q6_scan_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_available') AS partition_hash_q6_handler_scan_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_rejected_reason') AS partition_hash_q6_handler_rejected_reason
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+--let $partition_hash_q6_serial= `SELECT /*+ NO_PQ */ SUM(l_extendedprice * l_discount) FROM lineitem_q1_partitioned_hash WHERE l_shipdate >= DATE '1998-09-01' AND l_shipdate < DATE '1998-09-03' AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 75`
+--let $partition_hash_q6_pq= `SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) FROM lineitem_q1_partitioned_hash WHERE l_shipdate >= DATE '1998-09-01' AND l_shipdate < DATE '1998-09-03' AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 75`
+--let $assert_text= HASH partitioned Q6 serial and PQ results must match
+--let $assert_cond= $partition_hash_q6_serial <=> $partition_hash_q6_pq
+--source include/assert.inc
+
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ l_returnflag, l_linestatus,
+       SUM(l_quantity) AS sum_qty,
+       SUM(l_extendedprice) AS sum_base_price,
+       SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price,
+       SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,
+       AVG(l_quantity) AS avg_qty,
+       AVG(l_extendedprice) AS avg_price,
+       AVG(l_discount) AS avg_disc,
+       COUNT(*) AS count_order
+FROM lineitem_q1_partitioned_hash
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       SUM(l_quantity) AS sum_qty,
+       SUM(l_extendedprice) AS sum_base_price,
+       SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price,
+       SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,
+       AVG(l_quantity) AS avg_qty,
+       AVG(l_extendedprice) AS avg_price,
+       AVG(l_discount) AS avg_disc,
+       COUNT(*) AS count_order
+FROM lineitem_q1_partitioned_hash
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS partition_hash_q1_scan_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_available') AS partition_hash_q1_handler_scan_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_rejected_reason') AS partition_hash_q1_handler_rejected_reason
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+DROP TABLE lineitem_q1_partitioned_hash;
+
+CREATE TABLE lineitem_q1_partitioned_range (
+  l_orderkey INT NOT NULL,
+  l_linenumber INT NOT NULL,
+  l_shipdate DATE NOT NULL,
+  l_returnflag CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+  l_linestatus CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+  l_quantity DECIMAL(15,2) NOT NULL,
+  l_extendedprice DECIMAL(15,2) NOT NULL,
+  l_discount DECIMAL(15,2) NOT NULL,
+  l_tax DECIMAL(15,2) NOT NULL,
+  PRIMARY KEY (l_orderkey, l_linenumber)
+) ENGINE=InnoDB
+PARTITION BY RANGE(l_orderkey) (
+  PARTITION p0 VALUES LESS THAN (100),
+  PARTITION p1 VALUES LESS THAN (200),
+  PARTITION p2 VALUES LESS THAN (300),
+  PARTITION p3 VALUES LESS THAN MAXVALUE
+);
+INSERT INTO lineitem_q1_partitioned_range VALUES
+  (1, 1, '1998-09-01', 'A', 'F', 10.00, 100.00, 0.05, 0.01),
+  (102, 1, '1998-09-01', 'A', 'F', 20.00, 200.00, 0.06, 0.02),
+  (203, 1, '1998-09-01', 'A', 'F', 30.00, 300.00, 0.07, 0.03),
+  (304, 1, '1998-09-01', 'A', 'F', 40.00, 400.00, 0.08, 0.04),
+  (2, 1, '1998-09-02', 'N', 'O', 50.00, 500.00, 0.05, 0.01),
+  (103, 1, '1998-09-02', 'N', 'O', 60.00, 600.00, 0.06, 0.02),
+  (204, 1, '1998-09-02', 'N', 'O', 70.00, 700.00, 0.07, 0.03),
+  (305, 1, '1998-09-02', 'N', 'O', 80.00, 800.00, 0.08, 0.04),
+  (406, 1, '1998-09-03', 'A', 'F', 90.00, 900.00, 0.09, 0.05);
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ l_returnflag, l_linestatus,
+       COUNT(*) AS count_order,
+       SUM(l_quantity) AS sum_qty
+FROM lineitem_q1_partitioned_range
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       COUNT(*) AS count_order,
+       SUM(l_quantity) AS sum_qty
+FROM lineitem_q1_partitioned_range
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ SUM(l_extendedprice * l_discount) AS partition_range_q6_serial_revenue
+FROM lineitem_q1_partitioned_range
+WHERE l_shipdate >= DATE '1998-09-01'
+  AND l_shipdate < DATE '1998-09-03'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 75;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS partition_range_q6_revenue
+FROM lineitem_q1_partitioned_range
+WHERE l_shipdate >= DATE '1998-09-01'
+  AND l_shipdate < DATE '1998-09-03'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 75;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+--let $partition_range_q6_serial= `SELECT /*+ NO_PQ */ SUM(l_extendedprice * l_discount) FROM lineitem_q1_partitioned_range WHERE l_shipdate >= DATE '1998-09-01' AND l_shipdate < DATE '1998-09-03' AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 75`
+--let $partition_range_q6_pq= `SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) FROM lineitem_q1_partitioned_range WHERE l_shipdate >= DATE '1998-09-01' AND l_shipdate < DATE '1998-09-03' AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 75`
+--let $assert_text= RANGE partitioned Q6 serial and PQ results must match
+--let $assert_cond= $partition_range_q6_serial <=> $partition_range_q6_pq
+--source include/assert.inc
+
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ SUM(l_extendedprice * l_discount) AS partition_range_p0_q6_serial_revenue
+FROM lineitem_q1_partitioned_range PARTITION(p0)
+WHERE l_shipdate >= DATE '1998-09-01'
+  AND l_shipdate < DATE '1998-09-03'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 75;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS partition_range_p0_q6_revenue
+FROM lineitem_q1_partitioned_range PARTITION(p0)
+WHERE l_shipdate >= DATE '1998-09-01'
+  AND l_shipdate < DATE '1998-09-03'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 75;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ SUM(l_extendedprice * l_discount) AS partition_range_p0_q6_empty_serial_revenue
+FROM lineitem_q1_partitioned_range PARTITION(p0)
+WHERE l_shipdate >= DATE '2099-01-01'
+  AND l_shipdate < DATE '2100-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 75;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS partition_range_p0_q6_empty_revenue
+FROM lineitem_q1_partitioned_range PARTITION(p0)
+WHERE l_shipdate >= DATE '2099-01-01'
+  AND l_shipdate < DATE '2100-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 75;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ l_returnflag, l_linestatus,
+       COUNT(*) AS count_order,
+       SUM(l_quantity) AS sum_qty
+FROM lineitem_q1_partitioned_range PARTITION(p0)
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       COUNT(*) AS count_order,
+       SUM(l_quantity) AS sum_qty
+FROM lineitem_q1_partitioned_range PARTITION(p0)
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ l_returnflag, l_linestatus,
+       COUNT(*) AS count_order,
+       SUM(l_quantity) AS sum_qty
+FROM lineitem_q1_partitioned_range PARTITION(p0)
+WHERE l_shipdate < DATE '1900-01-01'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       COUNT(*) AS count_order,
+       SUM(l_quantity) AS sum_qty
+FROM lineitem_q1_partitioned_range PARTITION(p0)
+WHERE l_shipdate < DATE '1900-01-01'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ l_returnflag, l_linestatus,
+       SUM(l_quantity) AS sum_qty,
+       SUM(l_extendedprice) AS sum_base_price,
+       SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price,
+       SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,
+       AVG(l_quantity) AS avg_qty,
+       AVG(l_extendedprice) AS avg_price,
+       AVG(l_discount) AS avg_disc,
+       COUNT(*) AS count_order
+FROM lineitem_q1_partitioned_range
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       SUM(l_quantity) AS sum_qty,
+       SUM(l_extendedprice) AS sum_base_price,
+       SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price,
+       SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,
+       AVG(l_quantity) AS avg_qty,
+       AVG(l_extendedprice) AS avg_price,
+       AVG(l_discount) AS avg_disc,
+       COUNT(*) AS count_order
+FROM lineitem_q1_partitioned_range
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+DROP TABLE lineitem_q1_partitioned_range;
+
+CREATE TABLE lineitem_partitioned_list (
+  l_orderkey INT NOT NULL PRIMARY KEY,
+  l_shipdate DATE NOT NULL,
+  l_quantity INT NOT NULL
+) ENGINE=InnoDB
+PARTITION BY LIST(l_orderkey) (
+  PARTITION p0 VALUES IN (1, 2),
+  PARTITION p1 VALUES IN (3, 4),
+  PARTITION p2 VALUES IN (5, 6)
+);
+INSERT INTO lineitem_partitioned_list VALUES
+  (1, '1979-12-31', 10),
+  (2, '1980-01-02', 20),
+  (3, '1980-01-02', 30),
+  (4, '1981-05-10', 40),
+  (5, '1981-05-10', 50),
+  (6, '1985-09-09', 60);
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS partition_list_count
+FROM lineitem_partitioned_list
+WHERE l_shipdate > '1980-01-01';
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, l_quantity
+FROM lineitem_partitioned_list
+WHERE l_shipdate > '1980-01-01'
+ORDER BY l_orderkey;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_shipdate, COUNT(*) AS partition_list_group_count
+FROM lineitem_partitioned_list
+WHERE l_shipdate > '1980-01-01'
+GROUP BY l_shipdate
+ORDER BY l_shipdate;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+FLUSH STATUS;
+--replace_regex /"rows": [0-9]+/"rows": #/ /"cost": [0-9.]+/"cost": #/
+EXPLAIN FORMAT=JSON SELECT /*+ PQ(4) */ COUNT(*) AS partition_list_explain_count
+FROM lineitem_partitioned_list
+WHERE l_shipdate > '1980-01-01';
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, l_quantity
+FROM lineitem_partitioned_list PARTITION(p1)
+WHERE l_shipdate > '1980-01-01'
+ORDER BY l_orderkey;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+DROP TABLE lineitem_partitioned_list;
+
+CREATE TABLE lineitem_partitioned_myisam (
+  l_orderkey INT NOT NULL PRIMARY KEY,
+  l_shipdate DATE NOT NULL,
+  l_quantity INT NOT NULL
+) ENGINE=MyISAM
+PARTITION BY HASH(l_orderkey) PARTITIONS 2;
+
+INSERT INTO lineitem_partitioned_myisam VALUES
+  (1, '1980-01-02', 10),
+  (2, '1981-01-02', 20);
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS partition_myisam_trace_count
+FROM lineitem_partitioned_myisam
+WHERE l_shipdate > '1980-01-01';
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_shipdate, COUNT(*) AS partition_myisam_group_count
+FROM lineitem_partitioned_myisam
+WHERE l_shipdate > '1980-01-01'
+GROUP BY l_shipdate
+ORDER BY l_shipdate;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+DROP TABLE lineitem_partitioned_myisam;
+
+SET optimizer_trace= @save_optimizer_trace;
+SET optimizer_switch= @save_optimizer_switch;
+SET op_over_pq_offset_threshold= @save_op_over_pq_offset_threshold;
+SET pq_support_features_switch= @save_pq_support_features_switch;
+SET parallel_limit_no_order_by= @save_parallel_limit_no_order_by;
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;

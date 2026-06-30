@@ -1,0 +1,435 @@
+#
+# Grouped COUNT(DISTINCT) field, expression, memory admission,
+# EXPLAIN, HAVING, and SQL_CALC_FOUND_ROWS boundaries.
+#
+SET @save_pq_support_features_switch= @@pq_support_features_switch;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_optimizer_trace= @@optimizer_trace;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_trace= 'enabled=on';
+#
+# Grouped COUNT(DISTINCT field) merges worker-local distinct sets.
+#
+CREATE TABLE lineitem_group_distinct (
+l_orderkey INT NOT NULL PRIMARY KEY,
+l_shipdate DATE NOT NULL,
+l_returnflag CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+l_linestatus CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+l_quantity INT NULL
+) ENGINE=InnoDB;
+INSERT INTO lineitem_group_distinct VALUES
+(1, '1998-09-01', 'A', 'F', 10),
+(2, '1998-09-01', 'A', 'F', 20),
+(75, '1998-09-01', 'A', 'F', 10),
+(76, '1998-09-01', 'N', 'O', 30),
+(150, '1998-09-01', 'A', 'F', NULL),
+(151, '1998-09-01', 'N', 'O', 30),
+(152, '1998-09-01', 'N', 'O', 40),
+(153, '1998-09-03', 'R', 'F', 50);
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ l_returnflag, l_linestatus,
+COUNT(DISTINCT l_quantity) AS distinct_qty_serial_count
+FROM lineitem_group_distinct
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	distinct_qty_serial_count
+A	F	2
+N	O	2
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+SET pq_support_features_switch= 'simple_aggregate=on,count_distinct=off';
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(DISTINCT l_quantity) AS distinct_qty_switch_off_count
+FROM lineitem_group_distinct
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	distinct_qty_switch_off_count
+A	F	2
+N	O	2
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+SET pq_support_features_switch= 'simple_aggregate=on,count_distinct=on';
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(*) AS count_order,
+SUM(l_quantity) AS sum_qty,
+COUNT(DISTINCT l_quantity) AS distinct_qty_count
+FROM lineitem_group_distinct
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	count_order	sum_qty	distinct_qty_count
+A	F	4	40	2
+N	O	3	100	2
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ l_returnflag, l_linestatus,
+COUNT(DISTINCT l_quantity + (l_orderkey MOD 2)) AS distinct_qty_expr_serial_count
+FROM lineitem_group_distinct
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	distinct_qty_expr_serial_count
+A	F	2
+N	O	3
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(DISTINCT l_quantity + (l_orderkey MOD 2)) AS distinct_qty_expr_count
+FROM lineitem_group_distinct
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	distinct_qty_expr_count
+A	F	2
+N	O	3
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+connect  pq_group_distinct_expr_memory_leader, localhost, root,,test;
+SET pq_support_features_switch= 'simple_aggregate=on,count_distinct=on';
+SET debug_sync= 'after_pq_materialized_result_ready SIGNAL pq_group_distinct_expr_ready WAIT_FOR pq_group_distinct_expr_release';
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus, COUNT(DISTINCT l_quantity + (l_orderkey MOD 2)) AS distinct_qty_expr_memory_count FROM lineitem_group_distinct WHERE l_shipdate <= DATE '1998-09-02' GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus;
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_group_distinct_expr_ready TIMEOUT 30';
+SELECT CAST(VARIABLE_VALUE AS UNSIGNED) > 0 AS pq_group_distinct_expr_memory_reserved
+FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+WHERE VARIABLE_NAME= 'PQ_MEMORY_USED';
+pq_group_distinct_expr_memory_reserved
+1
+SET debug_sync= 'now SIGNAL pq_group_distinct_expr_release';
+connection pq_group_distinct_expr_memory_leader;
+l_returnflag	l_linestatus	distinct_qty_expr_memory_count
+A	F	2
+N	O	3
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+SET debug_sync= 'RESET';
+disconnect pq_group_distinct_expr_memory_leader;
+connection default;
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+Variable_name	Value
+Pq_memory_used	0
+SET debug_sync= 'RESET';
+# Grouped COUNT(DISTINCT expr) memory admission uses all expression dependency fields.
+Table	Op	Msg_type	Msg_text
+test.lineitem_group_distinct_memory	analyze	status	Engine-independent statistics collected
+test.lineitem_group_distinct_memory	analyze	status	OK
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(DISTINCT l_quantity + (l_orderkey MOD 2)) AS distinct_qty_expr_memory_limit_count
+FROM lineitem_group_distinct_memory
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	distinct_qty_expr_memory_limit_count
+A	F	2
+N	O	3
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+SELECT CAST(VARIABLE_VALUE AS UNSIGNED) > @pq_memory_refused_before AS pq_group_distinct_expr_memory_refused
+FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+WHERE VARIABLE_NAME= 'PQ_MEMORY_REFUSED';
+pq_group_distinct_expr_memory_refused
+1
+SET GLOBAL parallel_memory_limit= 104857600;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(DISTINCT CONCAT(l_quantity, '')) AS distinct_qty_string_expr_count
+FROM lineitem_group_distinct
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	distinct_qty_string_expr_count
+A	F	2
+N	O	2
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_distinct_aggregate"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+EXPLAIN SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(DISTINCT l_quantity) AS distinct_qty_count
+FROM lineitem_group_distinct
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	<gather1>	ALL	NULL	NULL	NULL	NULL	#	Parallel execute (4 workers, test.lineitem_group_distinct)
+1	SIMPLE	lineitem_group_distinct	ALL	NULL	NULL	NULL	NULL	#	Using where; Using filesort
+ANALYZE SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(DISTINCT l_quantity) AS distinct_qty_count
+FROM lineitem_group_distinct
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	r_rows	filtered	r_filtered	Extra
+1	SIMPLE	<gather1>	ALL	NULL	NULL	NULL	NULL	#	#	#	#	Parallel execute (4 workers, test.lineitem_group_distinct)
+1	SIMPLE	lineitem_group_distinct	ALL	NULL	NULL	NULL	NULL	#	#	#	#	Using where; Using filesort
+EXPLAIN FORMAT=JSON SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(DISTINCT l_quantity) AS distinct_qty_count
+FROM lineitem_group_distinct
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+EXPLAIN
+{
+  "query_block": {
+    "select_id": 1,
+    "cost": #,
+    "nested_loop": [
+      {
+        "parallel_execute": {
+          "parallel_degree": 4,
+          "divided_table": "lineitem_group_distinct",
+          "cut_table": "lineitem_group_distinct",
+          "table": {
+            "table_name": "<gather1>",
+            "access_type": "ALL",
+            "rows": #
+          }
+        }
+      },
+      {
+        "read_sorted_file": {
+          "filesort": {
+            "sort_key": "lineitem_group_distinct.l_returnflag, lineitem_group_distinct.l_linestatus",
+            "table": {
+              "table_name": "lineitem_group_distinct",
+              "access_type": "ALL",
+              "loops": 1,
+              "rows": #,
+              "cost": #,
+              "filtered": 100,
+              "attached_condition": "lineitem_group_distinct.l_shipdate <= DATE'1998-09-02'"
+            }
+          }
+        }
+      }
+    ]
+  }
+}
+ANALYZE FORMAT=JSON SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(DISTINCT l_quantity) AS distinct_qty_count
+FROM lineitem_group_distinct
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+ANALYZE
+{
+  "query_optimization": {
+    "r_total_time_ms": #
+  },
+  "query_block": {
+    "select_id": 1,
+    "cost": #,
+    "r_loops": 1,
+    "r_total_time_ms": #,
+    "nested_loop": [
+      {
+        "parallel_execute": {
+          "parallel_degree": 4,
+          "divided_table": "lineitem_group_distinct",
+          "cut_table": "lineitem_group_distinct",
+          "table": {
+            "table_name": "<gather1>",
+            "access_type": "ALL",
+            "rows": 8
+          }
+        }
+      },
+      {
+        "read_sorted_file": {
+          "r_rows": null,
+          "filesort": {
+            "sort_key": "lineitem_group_distinct.l_returnflag, lineitem_group_distinct.l_linestatus",
+            "r_loops": null,
+            "r_limit": null,
+            "r_used_priority_queue": null,
+            "r_output_rows": null,
+            "r_sort_mode": "sort_key,rowid",
+            "table": {
+              "table_name": "lineitem_group_distinct",
+              "access_type": "ALL",
+              "loops": 1,
+              "r_loops": 0,
+              "rows": 8,
+              "r_rows": null,
+              "cost": #,
+              "r_table_time_ms": #,
+              "r_other_time_ms": #,
+              "r_engine_stats": {
+                "pages_accessed": #
+              },
+              "filtered": 100,
+              "r_total_filtered": null,
+              "attached_condition": "lineitem_group_distinct.l_shipdate <= DATE'1998-09-02'",
+              "r_filtered": null
+            }
+          }
+        }
+      }
+    ]
+  }
+}
+EXPLAIN FORMAT=JSON SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(DISTINCT l_quantity + (l_orderkey MOD 2)) AS distinct_qty_expr_count
+FROM lineitem_group_distinct
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+EXPLAIN
+{
+  "query_block": {
+    "select_id": 1,
+    "cost": #,
+    "nested_loop": [
+      {
+        "parallel_execute": {
+          "parallel_degree": 4,
+          "divided_table": "lineitem_group_distinct",
+          "cut_table": "lineitem_group_distinct",
+          "table": {
+            "table_name": "<gather1>",
+            "access_type": "ALL",
+            "rows": #
+          }
+        }
+      },
+      {
+        "read_sorted_file": {
+          "filesort": {
+            "sort_key": "lineitem_group_distinct.l_returnflag, lineitem_group_distinct.l_linestatus",
+            "table": {
+              "table_name": "lineitem_group_distinct",
+              "access_type": "ALL",
+              "loops": 1,
+              "rows": #,
+              "cost": #,
+              "filtered": 100,
+              "attached_condition": "lineitem_group_distinct.l_shipdate <= DATE'1998-09-02'"
+            }
+          }
+        }
+      }
+    ]
+  }
+}
+ANALYZE FORMAT=JSON SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(DISTINCT l_quantity + (l_orderkey MOD 2)) AS distinct_qty_expr_count
+FROM lineitem_group_distinct
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+ANALYZE
+{
+  "query_optimization": {
+    "r_total_time_ms": #
+  },
+  "query_block": {
+    "select_id": 1,
+    "cost": #,
+    "r_loops": 1,
+    "r_total_time_ms": #,
+    "nested_loop": [
+      {
+        "parallel_execute": {
+          "parallel_degree": 4,
+          "divided_table": "lineitem_group_distinct",
+          "cut_table": "lineitem_group_distinct",
+          "table": {
+            "table_name": "<gather1>",
+            "access_type": "ALL",
+            "rows": 8
+          }
+        }
+      },
+      {
+        "read_sorted_file": {
+          "r_rows": null,
+          "filesort": {
+            "sort_key": "lineitem_group_distinct.l_returnflag, lineitem_group_distinct.l_linestatus",
+            "r_loops": null,
+            "r_limit": null,
+            "r_used_priority_queue": null,
+            "r_output_rows": null,
+            "r_sort_mode": "sort_key,rowid",
+            "table": {
+              "table_name": "lineitem_group_distinct",
+              "access_type": "ALL",
+              "loops": 1,
+              "r_loops": 0,
+              "rows": 8,
+              "r_rows": null,
+              "cost": #,
+              "r_table_time_ms": #,
+              "r_other_time_ms": #,
+              "r_engine_stats": {
+                "pages_accessed": #
+              },
+              "filtered": 100,
+              "r_total_filtered": null,
+              "attached_condition": "lineitem_group_distinct.l_shipdate <= DATE'1998-09-02'",
+              "r_filtered": null
+            }
+          }
+        }
+      }
+    ]
+  }
+}
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(DISTINCT l_quantity) AS distinct_qty_count
+FROM lineitem_group_distinct
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING distinct_qty_count > 1
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	distinct_qty_count
+A	F	2
+N	O	2
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SQL_CALC_FOUND_ROWS l_returnflag, l_linestatus,
+COUNT(DISTINCT l_quantity) AS distinct_qty_count
+FROM lineitem_group_distinct
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus
+LIMIT 1;
+l_returnflag	l_linestatus	distinct_qty_count
+A	F	2
+SELECT FOUND_ROWS() AS found_rows_after_distinct_grouped_calc;
+found_rows_after_distinct_grouped_calc
+2
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+SET pq_support_features_switch= 'simple_aggregate=on,count_distinct=off';
+SET pq_support_features_switch= @save_pq_support_features_switch;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET optimizer_trace= @save_optimizer_trace;
+SET debug_sync= 'RESET';
+DROP TABLE lineitem_group_distinct;

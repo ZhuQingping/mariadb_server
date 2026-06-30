@@ -366,6 +366,9 @@ The following specify which files/extra groups are read (specified before remain
  --flush             Flush MyISAM tables to disk between SQL commands
  --flush-time=#      A dedicated thread is created to flush all tables at the
  given interval
+ --force-parallel-execute 
+ Force parallel query execution in the current session
+ when the statement is eligible
  --ft-boolean-syntax=name 
  List of operators for MATCH ... AGAINST ( ... IN BOOLEAN
  MODE)
@@ -877,6 +880,12 @@ The following specify which files/extra groups are read (specified before remain
  Enable old-style user limits (before 5.0.3, user
  resources were counted per each user+host vs. per
  account)
+ --op-over-pq-offset-threshold=# 
+ TaurusDB-compatible minimum OFFSET threshold where offset
+ pushdown may take precedence over Parallel Query. The
+ current MariaDB PQ v1 uses this threshold for bounded
+ ORDER BY projection PQ; larger OFFSET values remain on
+ the serial fallback path
  --open-files-limit=# 
  If this is not 0, then mariadbd will use this value to
  reserve file descriptors to use with setrlimit(). If this
@@ -977,7 +986,7 @@ The following specify which files/extra groups are read (specified before remain
  extended_keys, exists_to_in, orderby_uses_equalities, condition_pushdown_for_derived,
  split_materialized, condition_pushdown_for_subquery, rowid_filter,
  condition_pushdown_from_having, not_null_range_scan, hash_join_cardinality,
- cset_narrowing, sargable_casefold, reorder_outer_joins
+ cset_narrowing, sargable_casefold, reorder_outer_joins, parallel_query
  --optimizer-trace=name 
  Controls tracing of the Optimizer:
  optimizer_trace=option=val[,option=val...], where option
@@ -1005,6 +1014,66 @@ The following specify which files/extra groups are read (specified before remain
  Cost of checking the row against the WHERE clause.
  Increasing this will have the optimizer to prefer plans
  with less row combinations
+ --parallel-batch-max-mem-size=# 
+ Maximum memory size in bytes for the TaurusDB parallel
+ query batch buffer. The current MariaDB PQ MVP exposes
+ this control variable before the full batch message
+ protocol is ported
+ --parallel-batch-max-slot=# 
+ Maximum slot count for the TaurusDB parallel query batch
+ buffer manager. The current MariaDB PQ MVP exposes this
+ control variable before the full batch message protocol
+ is ported
+ --parallel-cost-threshold=# 
+ TaurusDB-compatible Parallel Query optimizer cost
+ threshold. The current MariaDB PQ v1 exposes this control
+ variable before the full TaurusDB cost model is ported
+ --parallel-default-dop=# 
+ Default degree of parallelism for eligible parallel
+ queries
+ --parallel-fail-retry 
+ TaurusDB-compatible switch controlling whether Parallel
+ Query setup failures may retry without PQ. The current
+ MariaDB PQ v1 exposes this control variable before the
+ full TaurusDB retry mechanism is ported
+ (Defaults to on; use --skip-parallel-fail-retry to disable.)
+ --parallel-graceful-fallback 
+ Allow TaurusDB-style graceful fallback from Parallel
+ Query setup failures. The current MariaDB PQ v1 fallback
+ remains bounded to the implemented fast paths
+ (Defaults to on; use --skip-parallel-graceful-fallback to disable.)
+ --parallel-limit-no-order-by 
+ TaurusDB-compatible switch controlling whether LIMIT
+ without ORDER BY may use Parallel Query. The current
+ MariaDB PQ v1 still follows its bounded LIMIT/ORDER
+ eligibility checks
+ (Defaults to on; use --skip-parallel-limit-no-order-by to disable.)
+ --parallel-max-threads=# 
+ Maximum number of concurrently running parallel query
+ worker threads
+ --parallel-memory-limit=# 
+ Global memory admission limit for parallel query worker
+ execution and result materialization. The current MariaDB
+ PQ MVP reserves estimated budgets and falls back to
+ serial execution when the limit would be exceeded
+ --parallel-queue-timeout=# 
+ Queue timeout in milliseconds for parallel query worker
+ admission when parallel_max_threads is exhausted. A value
+ of 0 disables waiting
+ --parallel-rows-threshold=# 
+ TaurusDB-compatible Parallel Query row-count threshold.
+ The current MariaDB PQ v1 exposes this control variable
+ before the full TaurusDB cost model is ported
+ --parallel-setup-cost=# 
+ TaurusDB-compatible fixed setup cost for Parallel Query
+ cost modeling. The current MariaDB PQ v1 exposes this
+ control variable before the full TaurusDB cost model is
+ ported
+ --parallel-tuple-cost=# 
+ TaurusDB-compatible per-row transfer cost for Parallel
+ Query cost modeling. The current MariaDB PQ v1 exposes
+ this control variable before the full TaurusDB cost model
+ is ported
  --path=name         Comma-separated list of schema names that defines the
  search order for stored routines
  --performance-schema 
@@ -1188,6 +1257,33 @@ The following specify which files/extra groups are read (specified before remain
  --port-open-timeout=# 
  Maximum time in seconds to wait for the port to become
  free. (Default: No wait)
+ --pq-hash-join-max-hash-table-refills[=#] 
+ TaurusDB-compatible upper limit of estimated hash table
+ refills before disabling Parallel Query when parallel
+ hash join spill to disk is unavailable. The current
+ MariaDB PQ v1 exposes this control variable before
+ parallel hash join is ported
+ --pq-master-enable  Global Parallel Query master switch. The current MariaDB
+ PQ v1 exposes this TaurusDB-compatible control variable;
+ execution eligibility remains governed by the v1
+ fast-path checks
+ (Defaults to on; use --skip-pq-master-enable to disable.)
+ --pq-msg-queue-size=# 
+ Parallel query message queue size in bytes. The current
+ MariaDB PQ MVP exposes this TaurusDB-compatible setting
+ before the full message queue protocol is ported
+ --pq-msg-queue-spin-lock=# 
+ Spin count used by the TaurusDB parallel query message
+ queue protocol. The current MariaDB PQ MVP exposes this
+ setting for compatibility
+ --pq-support-features-switch=name 
+ TaurusDB-compatible Parallel Query feature switch. The
+ current MariaDB PQ v1 exposes the control surface while
+ unsupported feature bits remain constrained by v1
+ eligibility checks. Takes a comma-separated list of
+ option=value pairs, where value is on, off, or default,
+ and options are: simple_aggregate, count_distinct, correlated_subquery,
+ hash_join_spill_to_disk, insert_select
  --preload-buffer-size=# 
  The size of the buffer that is allocated when preloading
  indexes
@@ -1820,6 +1916,7 @@ extra-port 0
 flashback FALSE
 flush FALSE
 flush-time 0
+force-parallel-execute FALSE
 ft-boolean-syntax + -><()~*:""&|
 ft-max-word-len 84
 ft-min-word-len 4
@@ -1965,6 +2062,7 @@ note-verbosity basic,explain
 old-mode UTF8_IS_UTF8MB3
 old-passwords FALSE
 old-style-user-limits FALSE
+op-over-pq-offset-threshold 1000
 optimizer-adjust-secondary-key-costs 0
 optimizer-disk-read-cost 10.24
 optimizer-disk-read-ratio 0.02
@@ -1987,11 +2085,24 @@ optimizer-rowid-copy-cost 0.002653
 optimizer-scan-setup-cost 10
 optimizer-search-depth 62
 optimizer-selectivity-sampling-limit 100
-optimizer-switch index_merge=on,index_merge_union=on,index_merge_sort_union=on,index_merge_intersection=on,index_merge_sort_intersection=off,index_condition_pushdown=on,derived_merge=on,derived_with_keys=on,firstmatch=on,loosescan=on,duplicateweedout=on,materialization=on,in_to_exists=on,semijoin=on,partial_match_rowid_merge=on,partial_match_table_scan=on,subquery_cache=on,mrr=off,mrr_cost_based=off,mrr_sort_keys=off,outer_join_with_cache=on,semijoin_with_cache=on,join_cache_incremental=on,join_cache_hashed=on,join_cache_bka=on,optimize_join_buffer_size=on,table_elimination=on,extended_keys=on,exists_to_in=on,orderby_uses_equalities=on,condition_pushdown_for_derived=on,split_materialized=on,condition_pushdown_for_subquery=on,rowid_filter=on,condition_pushdown_from_having=on,not_null_range_scan=off,hash_join_cardinality=on,cset_narrowing=on,sargable_casefold=on
+optimizer-switch index_merge=on,index_merge_union=on,index_merge_sort_union=on,index_merge_intersection=on,index_merge_sort_intersection=off,index_condition_pushdown=on,derived_merge=on,derived_with_keys=on,firstmatch=on,loosescan=on,duplicateweedout=on,materialization=on,in_to_exists=on,semijoin=on,partial_match_rowid_merge=on,partial_match_table_scan=on,subquery_cache=on,mrr=off,mrr_cost_based=off,mrr_sort_keys=off,outer_join_with_cache=on,semijoin_with_cache=on,join_cache_incremental=on,join_cache_hashed=on,join_cache_bka=on,optimize_join_buffer_size=on,table_elimination=on,extended_keys=on,exists_to_in=on,orderby_uses_equalities=on,condition_pushdown_for_derived=on,split_materialized=on,condition_pushdown_for_subquery=on,rowid_filter=on,condition_pushdown_from_having=on,not_null_range_scan=off,hash_join_cardinality=on,cset_narrowing=on,sargable_casefold=on,reorder_outer_joins=off,parallel_query=on
 optimizer-trace 
 optimizer-trace-max-mem-size 1048576
 optimizer-use-condition-selectivity 4
 optimizer-where-cost 0.032
+parallel-batch-max-mem-size 1048576
+parallel-batch-max-slot 8
+parallel-cost-threshold 1000
+parallel-default-dop 4
+parallel-fail-retry TRUE
+parallel-graceful-fallback TRUE
+parallel-limit-no-order-by TRUE
+parallel-max-threads 64
+parallel-memory-limit 104857600
+parallel-queue-timeout 0
+parallel-rows-threshold 10000
+parallel-setup-cost 250
+parallel-tuple-cost 1.5
 path CURRENT_SCHEMA
 performance-schema FALSE
 performance-schema-accounts-size -1
@@ -2053,6 +2164,11 @@ performance-schema-setup-objects-size -1
 performance-schema-users-size -1
 port 3306
 port-open-timeout 0
+pq-hash-join-max-hash-table-refills 1
+pq-master-enable TRUE
+pq-msg-queue-size 1048576
+pq-msg-queue-spin-lock 1000
+pq-support-features-switch simple_aggregate=on,count_distinct=off,correlated_subquery=on
 preload-buffer-size 32768
 profiling-history-size 15
 progress-report-time 5

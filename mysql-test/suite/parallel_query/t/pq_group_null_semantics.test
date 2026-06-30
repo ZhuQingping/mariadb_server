@@ -1,0 +1,91 @@
+--source include/have_innodb.inc
+
+--echo #
+--echo # Parallel Query grouped NULL semantics coverage.
+--echo #
+
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_pq_support_features_switch= @@pq_support_features_switch;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_optimizer_switch= @@optimizer_switch;
+
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on';
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+SET pq_support_features_switch= 'simple_aggregate=on,count_distinct=on';
+
+--echo #
+--echo # Grouped aggregates preserve SQL NULL semantics on the PQ path.
+--echo #
+
+CREATE TABLE lineitem_q1_group_nullable (
+  l_orderkey INT NOT NULL,
+  l_linenumber INT NOT NULL,
+  l_shipdate DATE NOT NULL,
+  l_returnflag CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+  l_linestatus CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+  l_quantity DECIMAL(15,2) NULL,
+  l_discount DECIMAL(15,2) NULL,
+  PRIMARY KEY (l_orderkey, l_linenumber)
+) ENGINE=InnoDB;
+
+INSERT INTO lineitem_q1_group_nullable VALUES
+  (1, 1, '1998-09-01', 'A', 'F', 10.00, 0.05),
+  (2, 1, '1998-09-02', 'A', 'F', NULL, NULL),
+  (3, 1, '1998-08-30', 'N', 'O', NULL, NULL),
+  (4, 1, '1998-08-31', 'N', 'O', NULL, NULL),
+  (5, 1, '1998-07-15', 'R', 'F', 60.00, 0.08);
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       COUNT(l_quantity) AS count_qty,
+       SUM(l_quantity) AS sum_qty,
+       AVG(l_quantity) AS avg_qty,
+       MIN(l_quantity) AS min_qty,
+       MAX(l_quantity) AS max_qty,
+       COUNT(*) AS count_order
+FROM lineitem_q1_group_nullable
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       COUNT(l_quantity + l_discount) AS count_expr,
+       SUM(l_quantity + l_discount) AS sum_expr,
+       AVG(l_quantity + l_discount) AS avg_expr,
+       MIN(l_quantity + l_discount) AS min_expr,
+       MAX(l_quantity + l_discount) AS max_expr,
+       COUNT(*) AS count_order
+FROM lineitem_q1_group_nullable
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       SUM(l_quantity) AS sum_qty
+FROM lineitem_q1_group_nullable
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING sum_qty IS NOT NULL
+ORDER BY l_returnflag, l_linestatus;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+SET optimizer_switch= @save_optimizer_switch;
+SET pq_support_features_switch= @save_pq_support_features_switch;
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;
+
+DROP TABLE lineitem_q1_group_nullable;

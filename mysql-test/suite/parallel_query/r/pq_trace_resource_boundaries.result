@@ -1,0 +1,275 @@
+#
+# Parallel Query trace resource boundary coverage.
+#
+CREATE TABLE lineitem (
+l_orderkey INT NOT NULL PRIMARY KEY,
+l_shipdate DATE NOT NULL,
+l_quantity INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO lineitem VALUES
+(1, '1979-12-31', 10),
+(2, '1980-01-01', 20),
+(3, '1980-01-02', 30),
+(4, '1981-05-10', 40),
+(5, '1992-07-15', 50),
+(6, '1978-03-20', 60),
+(7, '1980-06-01', 70),
+(8, '1985-09-09', 80);
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_parallel_queue_timeout= @@parallel_queue_timeout;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_optimizer_trace= @@optimizer_trace;
+SET @save_optimizer_switch= @@optimizer_switch;
+SET @save_debug_dbug= @@debug_dbug;
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on';
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+SET parallel_queue_timeout= 0;
+SET optimizer_trace= 1;
+SET parallel_default_dop= 1;
+FLUSH STATUS;
+SELECT /*+ PQ() */ COUNT(*) AS low_dop_trace_count
+FROM lineitem
+WHERE l_shipdate > '1980-01-01';
+low_dop_trace_count
+5
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "dop_less_than_two"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+SET parallel_default_dop= 4;
+FLUSH STATUS;
+SELECT /*+ NO_PQ PQ(4) */ COUNT(*) AS no_pq_trace_count
+FROM lineitem
+WHERE l_shipdate > '1980-01-01';
+no_pq_trace_count
+5
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "no_pq_hint"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+SET GLOBAL pq_master_enable= OFF;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS pq_master_disabled_trace_count
+FROM lineitem
+WHERE l_shipdate > '1980-01-01';
+pq_master_disabled_trace_count
+5
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "pq_master_disabled"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 1;
+# EXPLAIN is plan-shape based and can still show PQ before runtime admission.
+EXPLAIN FORMAT=JSON SELECT /*+ PQ(4) */ COUNT(*) AS pq_threads_exhausted_explain_count
+FROM lineitem
+WHERE l_shipdate > '1980-01-01';
+EXPLAIN
+{
+  "query_block": {
+    "select_id": 1,
+    "cost": 0.0121588,
+    "nested_loop": [
+      {
+        "parallel_execute": {
+          "parallel_degree": 4,
+          "divided_table": "lineitem",
+          "cut_table": "lineitem",
+          "table": {
+            "table_name": "<gather1>",
+            "access_type": "ALL",
+            "rows": 8
+          }
+        }
+      },
+      {
+        "table": {
+          "table_name": "lineitem",
+          "access_type": "ALL",
+          "loops": 1,
+          "rows": 8,
+          "cost": 0.0121588,
+          "filtered": 100,
+          "attached_condition": "lineitem.l_shipdate > '1980-01-01'"
+        }
+      }
+    ]
+  }
+}
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS pq_threads_exhausted_trace_count
+FROM lineitem
+WHERE l_shipdate > '1980-01-01';
+pq_threads_exhausted_trace_count
+5
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "parallel_threads_exhausted",
+        "execution_reason": "parallel_threads_exhausted"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_max_threads= 0;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS pq_zero_threads_trace_count
+FROM lineitem
+WHERE l_shipdate > '1980-01-01';
+pq_zero_threads_trace_count
+5
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "parallel_threads_exhausted",
+        "execution_reason": "parallel_threads_exhausted"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_max_threads= 4;
+connect  con3, localhost, root,,test;
+connection con3;
+SET debug_sync= 'after_pq_thread_reserve SIGNAL pq_trace_reserved WAIT_FOR pq_trace_release';
+SELECT /*+ PQ(4) */ COUNT(*) AS pq_trace_holder_count FROM lineitem WHERE l_shipdate > '1980-01-01';
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_trace_reserved TIMEOUT 30';
+SET parallel_queue_timeout= 0;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS pq_threads_running_trace_count
+FROM lineitem
+WHERE l_shipdate > '1980-01-01';
+pq_threads_running_trace_count
+5
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "parallel_threads_exhausted",
+        "execution_reason": "parallel_threads_exhausted"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+SET debug_sync= 'now SIGNAL pq_trace_release';
+connection con3;
+pq_trace_holder_count
+5
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+SET debug_sync= 'RESET';
+disconnect con3;
+connection default;
+SET debug_sync= 'RESET';
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 4096;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS pq_memory_exhausted_trace_count
+FROM lineitem
+WHERE l_shipdate > '1980-01-01';
+pq_memory_exhausted_trace_count
+5
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "parallel_memory_exhausted",
+        "execution_reason": "parallel_memory_exhausted"
+    }
+]
+SELECT json_contains(json_extract(trace,
+'$**.not_apply_pq_plan[0].execution_reason'),
+'"parallel_memory_exhausted"') AS has_pq_execution_reason
+FROM information_schema.optimizer_trace;
+has_pq_execution_reason
+1
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=off';
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS optimizer_switch_disabled_trace_count
+FROM lineitem
+WHERE l_shipdate > '1980-01-01';
+optimizer_switch_disabled_trace_count
+5
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "optimizer_switch_disabled"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+SET optimizer_switch= 'parallel_query=on';
+SET debug_sync= 'RESET';
+SET optimizer_trace= @save_optimizer_trace;
+SET optimizer_switch= @save_optimizer_switch;
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET parallel_queue_timeout= @save_parallel_queue_timeout;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;
+SET SESSION debug_dbug= @save_debug_dbug;
+DROP TABLE lineitem;

@@ -1,0 +1,47 @@
+# bool global/session
+
+SET @start_global_value= @@global.force_parallel_execute;
+SET @start_value= @@session.force_parallel_execute;
+
+#
+# exists as global and session
+#
+SHOW GLOBAL VARIABLES LIKE 'force_parallel_execute';
+SHOW SESSION VARIABLES LIKE 'force_parallel_execute';
+SELECT * FROM information_schema.global_variables
+WHERE variable_name='force_parallel_execute';
+SELECT * FROM information_schema.session_variables
+WHERE variable_name='force_parallel_execute';
+
+#
+# default and writable values
+#
+SET @@session.force_parallel_execute= DEFAULT;
+SELECT @@session.force_parallel_execute;
+SET @@session.force_parallel_execute= ON;
+SELECT @@session.force_parallel_execute;
+SET @@session.force_parallel_execute= OFF;
+SELECT @@session.force_parallel_execute;
+SET @@global.force_parallel_execute= ON;
+SELECT @@global.force_parallel_execute;
+SET @@global.force_parallel_execute= OFF;
+SELECT @@global.force_parallel_execute;
+
+#
+# incorrect assignments
+#
+--error ER_WRONG_VALUE_FOR_VAR
+SET @@session.force_parallel_execute= 2;
+--error ER_WRONG_VALUE_FOR_VAR
+SET @@session.force_parallel_execute= 'invalid';
+
+#
+# local/session aliases
+#
+SET @@local.force_parallel_execute= ON;
+SELECT @@local.force_parallel_execute = @@session.force_parallel_execute;
+SET force_parallel_execute= OFF;
+SELECT @@force_parallel_execute;
+
+SET @@global.force_parallel_execute= @start_global_value;
+SET @@session.force_parallel_execute= @start_value;

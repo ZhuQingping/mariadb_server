@@ -1,0 +1,266 @@
+--source include/have_innodb.inc
+--source include/have_debug_sync.inc
+
+--echo #
+--echo # Q1 lifecycle boundaries cover worker launch failure, MDL error,
+--echo # leader KILL, materialized-result KILL, and admission error paths
+--echo # for the grouped aggregate PQ worker path.
+--echo #
+
+SET @save_parallel_fail_retry= @@parallel_fail_retry;
+SET @save_parallel_graceful_fallback= @@parallel_graceful_fallback;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_debug_dbug= @@debug_dbug;
+
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+
+CREATE TABLE lineitem_q1_group (
+  l_orderkey INT NOT NULL,
+  l_linenumber INT NOT NULL,
+  l_shipdate DATE NOT NULL,
+  l_returnflag CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+  l_linestatus CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+  l_quantity DECIMAL(15,2) NOT NULL,
+  l_extendedprice DECIMAL(15,2) NOT NULL,
+  l_discount DECIMAL(15,2) NOT NULL,
+  l_tax DECIMAL(15,2) NOT NULL,
+  l_comment BLOB NOT NULL,
+  PRIMARY KEY (l_orderkey, l_linenumber)
+) ENGINE=InnoDB;
+
+INSERT INTO lineitem_q1_group VALUES
+  (1, 1, '1998-09-01', 'A', 'F', 10.00, 100.00, 0.05, 0.10, 'aa'),
+  (2, 1, '1998-09-02', 'A', 'F', 20.00, 200.00, 0.10, 0.08, 'bbb'),
+  (3, 1, '1998-09-03', 'A', 'F', 30.00, 300.00, 0.02, 0.04, 'cccc'),
+  (4, 1, '1998-08-30', 'N', 'O', 40.00, 400.00, 0.07, 0.05, 'dd'),
+  (5, 1, '1998-08-31', 'N', 'O', 50.00, 500.00, 0.06, 0.03, 'eee'),
+  (6, 1, '1998-07-15', 'R', 'F', 60.00, 600.00, 0.08, 0.07, 'ffff');
+
+--echo # Q1 grouped aggregate does not fall back after partial worker thread launch failure.
+SET SESSION debug_dbug='d,pq_fail_worker_create_after_first';
+FLUSH STATUS;
+--error ER_CANT_CREATE_THREAD
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       COUNT(*) AS count_order,
+       SUM(l_quantity) AS sum_qty
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SET SESSION debug_dbug= @save_debug_dbug;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+
+--echo # Q1 grouped worker THD initialization failures cancel sibling workers.
+SET SESSION debug_dbug='d,pq_fail_worker_thd_init';
+FLUSH STATUS;
+--error ER_UNKNOWN_ERROR
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       COUNT(*) AS count_order,
+       SUM(l_quantity) AS sum_qty
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SET SESSION debug_dbug= @save_debug_dbug;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+
+--echo # Q1 full grouped aggregate mid-scan worker errors cancel sibling workers.
+SET SESSION debug_dbug='d,pq_fail_worker_mid_scan';
+FLUSH STATUS;
+--error ER_UNKNOWN_ERROR
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       SUM(l_quantity) AS sum_qty,
+       SUM(l_extendedprice) AS sum_base_price,
+       SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price,
+       SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,
+       AVG(l_quantity) AS avg_qty,
+       AVG(l_extendedprice) AS avg_price,
+       AVG(l_discount) AS avg_disc,
+       COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SET SESSION debug_dbug= @save_debug_dbug;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+
+--echo # Q1 full grouped aggregate last-worker mid-scan errors also release resources.
+SET SESSION debug_dbug='d,pq_fail_last_worker_mid_scan';
+FLUSH STATUS;
+--error ER_UNKNOWN_ERROR
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       SUM(l_quantity) AS sum_qty,
+       SUM(l_extendedprice) AS sum_base_price,
+       SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price,
+       SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,
+       AVG(l_quantity) AS avg_qty,
+       AVG(l_extendedprice) AS avg_price,
+       AVG(l_discount) AS avg_disc,
+       COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SET SESSION debug_dbug= @save_debug_dbug;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+
+--echo #
+--echo # Q1 grouped worker open failures preserve non-KILL diagnostics.
+--echo #
+
+connect (pq_group_mdl_leader, localhost, root,,test);
+connect (pq_group_mdl_ddl, localhost, root,,test);
+
+connection pq_group_mdl_leader;
+SET debug_sync= 'after_pq_create_snapshot SIGNAL pq_group_mdl_snapshot WAIT_FOR pq_group_mdl_release';
+--send SELECT /*+ PQ(4) */ l_returnflag, l_linestatus, COUNT(*) AS count_order, SUM(l_quantity) AS sum_qty FROM lineitem_q1_group WHERE l_shipdate <= DATE '1998-09-02' GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus
+
+connection pq_group_mdl_ddl;
+SET debug_sync= 'now WAIT_FOR pq_group_mdl_snapshot TIMEOUT 30';
+--send ALTER TABLE lineitem_q1_group ADD COLUMN pq_group_mdl_guard INT DEFAULT 0
+
+connection default;
+let $wait_condition= SELECT COUNT(*) = 1 FROM information_schema.processlist WHERE state = 'Waiting for table metadata lock' AND info LIKE 'ALTER TABLE lineitem_q1_group ADD COLUMN pq_group_mdl_guard%';
+--source include/wait_condition.inc
+SET debug_sync= 'now SIGNAL pq_group_mdl_release';
+
+connection pq_group_mdl_leader;
+--error ER_LOCK_WAIT_TIMEOUT
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+SET debug_sync= 'RESET';
+disconnect pq_group_mdl_leader;
+
+connection pq_group_mdl_ddl;
+--reap
+ALTER TABLE lineitem_q1_group DROP COLUMN pq_group_mdl_guard;
+disconnect pq_group_mdl_ddl;
+
+connection default;
+SET debug_sync= 'RESET';
+
+connect (pq_group_kill_leader, localhost, root,,test);
+--let $pq_group_kill_leader_id= `SELECT CONNECTION_ID()`
+SET debug_sync= 'after_pq_workers_launched SIGNAL pq_group_workers_launched WAIT_FOR pq_group_kill_release';
+--send SELECT /*+ PQ(4) */ l_returnflag, l_linestatus, COUNT(*) AS count_order, SUM(l_quantity) AS sum_qty FROM lineitem_q1_group WHERE l_shipdate <= DATE '1998-09-02' GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_group_workers_launched TIMEOUT 30';
+--disable_query_log
+--eval KILL QUERY $pq_group_kill_leader_id
+--enable_query_log
+SET debug_sync= 'now SIGNAL pq_group_kill_release';
+
+connection pq_group_kill_leader;
+--error ER_QUERY_INTERRUPTED
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+disconnect pq_group_kill_leader;
+
+connection default;
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+SET debug_sync= 'RESET';
+
+connect (pq_q1_full_kill_leader, localhost, root,,test);
+--let $pq_q1_full_kill_leader_id= `SELECT CONNECTION_ID()`
+SET debug_sync= 'after_pq_workers_launched SIGNAL pq_q1_full_workers_launched WAIT_FOR pq_q1_full_kill_release';
+--send SELECT /*+ PQ(4) */ l_returnflag, l_linestatus, SUM(l_quantity) AS sum_qty, SUM(l_extendedprice) AS sum_base_price, SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price, SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge, AVG(l_quantity) AS avg_qty, AVG(l_extendedprice) AS avg_price, AVG(l_discount) AS avg_disc, COUNT(*) AS count_order FROM lineitem_q1_group WHERE l_shipdate <= DATE '1998-09-02' GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_q1_full_workers_launched TIMEOUT 30';
+--disable_query_log
+--eval KILL QUERY $pq_q1_full_kill_leader_id
+--enable_query_log
+SET debug_sync= 'now SIGNAL pq_q1_full_kill_release';
+
+connection pq_q1_full_kill_leader;
+--error ER_QUERY_INTERRUPTED
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+disconnect pq_q1_full_kill_leader;
+
+connection default;
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+SET debug_sync= 'RESET';
+
+connect (pq_q1_ready_kill_leader, localhost, root,,test);
+--let $pq_q1_ready_kill_leader_id= `SELECT CONNECTION_ID()`
+SET debug_sync= 'after_pq_materialized_result_ready SIGNAL pq_q1_ready WAIT_FOR pq_q1_ready_release';
+--send SELECT /*+ PQ(4) */ l_returnflag, l_linestatus, SUM(l_quantity) AS sum_qty, SUM(l_extendedprice) AS sum_base_price, SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price, SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge, AVG(l_quantity) AS avg_qty, AVG(l_extendedprice) AS avg_price, AVG(l_discount) AS avg_disc, COUNT(*) AS count_order FROM lineitem_q1_group WHERE l_shipdate <= DATE '1998-09-02' GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_q1_ready TIMEOUT 30';
+--disable_query_log
+--eval KILL QUERY $pq_q1_ready_kill_leader_id
+--enable_query_log
+SET debug_sync= 'now SIGNAL pq_q1_ready_release';
+
+connection pq_q1_ready_kill_leader;
+--error ER_QUERY_INTERRUPTED
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+disconnect pq_q1_ready_kill_leader;
+
+connection default;
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+SET debug_sync= 'RESET';
+
+--echo # Q1 explicit PQ errors on setup/admission failure when retry/fallback is disabled.
+SET GLOBAL parallel_memory_limit= 0;
+SET parallel_fail_retry= OFF;
+--disable_abort_on_error ONCE
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+--let $q1_no_fail_retry_errno= $mysql_errno
+SET parallel_fail_retry= ON;
+SET GLOBAL parallel_memory_limit= 104857600;
+--let $assert_text= Q1 fail-retry disabled admission failure should return ER_UNKNOWN_ERROR
+--let $assert_cond= $q1_no_fail_retry_errno = 1105
+--source include/assert.inc
+
+SET GLOBAL parallel_memory_limit= 0;
+SET parallel_graceful_fallback= OFF;
+--disable_abort_on_error ONCE
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+--let $q1_no_graceful_fallback_errno= $mysql_errno
+SET parallel_graceful_fallback= ON;
+SET GLOBAL parallel_memory_limit= 104857600;
+--let $assert_text= Q1 graceful-fallback disabled admission failure should return ER_UNKNOWN_ERROR
+--let $assert_cond= $q1_no_graceful_fallback_errno = 1105
+--source include/assert.inc
+
+SET SESSION debug_dbug= @save_debug_dbug;
+SET parallel_fail_retry= @save_parallel_fail_retry;
+SET parallel_graceful_fallback= @save_parallel_graceful_fallback;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET debug_sync= 'RESET';
+
+DROP TABLE lineitem_q1_group;

@@ -1,0 +1,196 @@
+--source include/have_innodb.inc
+
+--echo #
+--echo # Parallel Query projection gather-merge boundary coverage.
+--echo #
+
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_optimizer_trace= @@optimizer_trace;
+SET @save_optimizer_switch= @@optimizer_switch;
+
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on';
+SET optimizer_trace= 1;
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+
+CREATE TABLE pq_projection_gather_t (
+  id INT NOT NULL,
+  qty INT NOT NULL,
+  payload VARCHAR(16) NOT NULL,
+  PRIMARY KEY (id),
+  KEY idx_qty (qty)
+) ENGINE=InnoDB;
+
+INSERT INTO pq_projection_gather_t VALUES
+  (-100, 3, 'a'), (-30, 2, 'b'), (-7, 5, 'c'), (0, 4, 'd'),
+  (5, 1, 'e'), (8, 9, 'f'), (13, 8, 'g'), (21, 7, 'h'),
+  (34, 6, 'i'), (55, 5, 'j'), (89, 4, 'k'), (144, 3, 'l');
+
+--echo # Primary-key ASC projection can gather-merge naturally ordered worker streams.
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ id
+FROM pq_projection_gather_t
+ORDER BY id;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS pk_asc_scan_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].projection_order_strategy') AS pk_asc_order_strategy
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].projection_order_natural') AS pk_asc_order_natural
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # ORDER BY primary key can gather-merge when the key is not returned.
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ payload
+FROM pq_projection_gather_t
+ORDER BY id
+LIMIT 4;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].projection_order_strategy') AS hidden_pk_order_strategy
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # Primary-key DESC projection can gather-merge reverse worker streams.
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ id
+FROM pq_projection_gather_t
+WHERE id >= -30 AND id < 90
+ORDER BY id DESC;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS pk_desc_scan_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].projection_order_strategy') AS pk_desc_order_strategy
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].projection_order_natural') AS pk_desc_order_natural
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # Non-primary ORDER BY remains PQ but uses the existing leader sort fallback.
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ id, qty
+FROM pq_projection_gather_t
+ORDER BY qty, id;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].projection_order_strategy') AS non_pk_order_strategy
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].projection_order_natural') AS non_pk_order_natural
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+CREATE TABLE pq_projection_gather_composite_t (
+  grp INT NOT NULL,
+  seq INT NOT NULL,
+  payload VARCHAR(16) NOT NULL,
+  PRIMARY KEY (grp, seq)
+) ENGINE=InnoDB;
+
+INSERT INTO pq_projection_gather_composite_t VALUES
+  (-4, 2, 'a'), (-4, 4, 'b'), (-1, 1, 'c'), (-1, 3, 'd'),
+  (0, 1, 'e'), (0, 2, 'f'), (3, 1, 'g'), (3, 4, 'h'),
+  (8, 1, 'i'), (8, 3, 'j'), (13, 2, 'k'), (21, 1, 'l');
+
+--echo # Full composite primary-key ASC projection can gather-merge worker streams.
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ grp, seq
+FROM pq_projection_gather_composite_t
+ORDER BY grp, seq;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS composite_pk_asc_scan_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].projection_order_strategy') AS composite_pk_asc_order_strategy
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].projection_order_natural') AS composite_pk_asc_order_natural
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # Full composite primary-key ASC gather-merge works when key fields are hidden.
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ payload
+FROM pq_projection_gather_composite_t
+ORDER BY grp, seq
+LIMIT 5;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].projection_order_strategy') AS composite_hidden_pk_order_strategy
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # Partial composite primary-key ORDER BY remains PQ but uses leader sort.
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ grp
+FROM pq_projection_gather_composite_t
+ORDER BY grp
+LIMIT 6;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].projection_order_strategy') AS composite_pk_partial_order_strategy
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].projection_order_natural') AS composite_pk_partial_order_natural
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # Composite primary-key DESC remains PQ but uses leader sort.
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ grp, seq
+FROM pq_projection_gather_composite_t
+ORDER BY grp DESC, seq DESC;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].projection_order_strategy') AS composite_pk_desc_order_strategy
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].projection_order_natural') AS composite_pk_desc_order_natural
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # Composite primary-key mixed direction remains PQ but uses leader sort.
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ grp, seq
+FROM pq_projection_gather_composite_t
+ORDER BY grp, seq DESC;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].projection_order_strategy') AS composite_pk_mixed_order_strategy
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+SET optimizer_trace= @save_optimizer_trace;
+SET optimizer_switch= @save_optimizer_switch;
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;
+
+DROP TABLE pq_projection_gather_composite_t;
+DROP TABLE pq_projection_gather_t;

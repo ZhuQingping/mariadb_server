@@ -1,0 +1,723 @@
+--source include/have_innodb.inc
+
+--echo #
+--echo # Parallel Query secondary-index scan-provider boundary coverage.
+--echo #
+
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_optimizer_trace= @@optimizer_trace;
+SET @save_optimizer_switch= @@optimizer_switch;
+SET @save_transaction_isolation= @@transaction_isolation;
+
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on,index_condition_pushdown=on';
+SET optimizer_trace= 1;
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+
+CREATE TABLE lineitem_secondary_pq (
+  l_orderkey INT NOT NULL,
+  l_linenumber INT NOT NULL,
+  l_shipdate DATE NOT NULL,
+  l_nullable_shipdate DATE NULL,
+  l_ship_year INT AS (YEAR(l_shipdate)) PERSISTENT,
+  l_returnflag CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+  l_comment VARCHAR(20) NOT NULL DEFAULT '',
+  l_quantity DECIMAL(15,2) NOT NULL,
+  l_extendedprice DECIMAL(15,2) NOT NULL,
+  l_discount DECIMAL(15,2) NOT NULL,
+  PRIMARY KEY (l_orderkey, l_linenumber),
+  KEY idx_shipdate (l_shipdate),
+  KEY idx_nullable_shipdate (l_nullable_shipdate),
+  KEY idx_ship_year (l_ship_year),
+  KEY idx_shipdate_desc (l_shipdate DESC),
+  KEY idx_comment_prefix (l_comment(3)),
+  KEY idx_returnflag (l_returnflag),
+  KEY idx_shipdate_quantity (l_shipdate, l_quantity)
+) ENGINE=InnoDB;
+
+INSERT INTO lineitem_secondary_pq
+  (l_orderkey, l_linenumber, l_shipdate, l_nullable_shipdate,
+   l_returnflag, l_quantity, l_extendedprice, l_discount)
+VALUES
+  (1, 1, '1993-12-31', '1993-12-31', 'N', 10.00, 100.00, 0.06),
+  (2, 1, '1994-01-01', '1994-01-01', 'A', 12.00, 200.00, 0.05),
+  (3, 1, '1994-02-15', '1994-02-15', 'A', 18.00, 250.00, 0.06),
+  (4, 1, '1994-06-15', NULL, 'R', 23.00, 300.00, 0.06),
+  (5, 1, '1994-08-20', '1994-08-20', 'A', 22.00, 350.00, 0.07),
+  (6, 1, '1994-12-31', '1994-12-31', 'N', 24.00, 400.00, 0.07),
+  (7, 1, '1995-01-01', '1995-01-01', 'A', 20.00, 500.00, 0.06),
+  (8, 1, '1995-05-01', '1995-05-01', 'R', 15.00, 600.00, 0.04);
+
+UPDATE lineitem_secondary_pq
+SET l_comment= CONCAT('c', l_returnflag, l_orderkey);
+
+--echo # Covering secondary forward range can use the native InnoDB secondary provider without ICP.
+SET optimizer_switch= 'parallel_query=on,index_condition_pushdown=off';
+SET force_parallel_execute= OFF;
+SELECT COUNT(*) AS covering_secondary_serial_count
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01';
+
+SET force_parallel_execute= ON;
+--replace_column 9 #
+EXPLAIN SELECT /*+ PQ(4) */ COUNT(*) AS covering_secondary_pq_count
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01';
+
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS covering_secondary_pq_count
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01';
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS covering_secondary_scan_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_available') AS covering_secondary_handler_scan_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].record_buffer_available') AS covering_secondary_record_buffer_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].worker_scan_api') AS covering_secondary_worker_scan_api
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].vfd_used') AS covering_secondary_vfd_used
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].secondary_requires_cluster_lookup') AS covering_secondary_requires_cluster_lookup
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].secondary_keyread_used') AS covering_secondary_keyread_used
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].btree_descriptor_rejected_reason') AS covering_secondary_btree_rejected_reason
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # Covering secondary forward projection can use the same native secondary provider.
+SET force_parallel_execute= OFF;
+SELECT l_shipdate AS covering_secondary_serial_shipdate
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+ORDER BY l_shipdate;
+
+SET force_parallel_execute= ON;
+--replace_column 9 #
+EXPLAIN SELECT /*+ PQ(4) */ l_shipdate AS covering_secondary_pq_shipdate
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+ORDER BY l_shipdate;
+
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_shipdate AS covering_secondary_pq_shipdate
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+ORDER BY l_shipdate;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS covering_secondary_projection_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_available') AS covering_secondary_projection_handler_available
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # Non-covering secondary forward projection can use clustered lookup through the native secondary provider.
+SET force_parallel_execute= OFF;
+SELECT l_quantity AS noncovering_secondary_serial_quantity
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+ORDER BY l_shipdate, l_quantity;
+
+SET force_parallel_execute= ON;
+--replace_column 9 #
+EXPLAIN SELECT /*+ PQ(4) */ l_quantity AS noncovering_secondary_pq_quantity
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+ORDER BY l_shipdate, l_quantity;
+
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_quantity AS noncovering_secondary_pq_quantity
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+ORDER BY l_shipdate, l_quantity;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS noncovering_secondary_projection_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_available') AS noncovering_secondary_projection_handler_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].secondary_requires_cluster_lookup') AS noncovering_secondary_projection_requires_cluster_lookup
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].secondary_keyread_used') AS noncovering_secondary_projection_keyread_used
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # Non-covering secondary scalar aggregate without ICP can use clustered lookup through the native secondary provider.
+SET optimizer_switch= 'parallel_query=on,index_condition_pushdown=off';
+SET force_parallel_execute= OFF;
+SELECT SUM(l_extendedprice * l_discount) AS noncovering_secondary_serial_revenue
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01';
+SET @noncovering_secondary_serial_revenue= (
+  SELECT SUM(l_extendedprice * l_discount)
+  FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate)
+  WHERE l_shipdate >= DATE '1994-01-01'
+    AND l_shipdate < DATE '1995-01-01');
+
+SET force_parallel_execute= ON;
+--replace_column 9 #
+EXPLAIN SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS noncovering_secondary_pq_revenue
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01';
+
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS noncovering_secondary_pq_revenue
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01';
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS noncovering_secondary_aggregate_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_available') AS noncovering_secondary_aggregate_handler_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].record_buffer_available') AS noncovering_secondary_aggregate_record_buffer_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].worker_scan_api') AS noncovering_secondary_aggregate_worker_scan_api
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].vfd_used') AS noncovering_secondary_aggregate_vfd_used
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].secondary_requires_cluster_lookup') AS noncovering_secondary_aggregate_requires_cluster_lookup
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].secondary_keyread_used') AS noncovering_secondary_aggregate_keyread_used
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].btree_descriptor_rejected_reason') AS noncovering_secondary_aggregate_btree_rejected_reason
+FROM information_schema.optimizer_trace;
+SET @noncovering_secondary_pq_revenue= (
+  SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount)
+  FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate)
+  WHERE l_shipdate >= DATE '1994-01-01'
+    AND l_shipdate < DATE '1995-01-01');
+SELECT @noncovering_secondary_serial_revenue =
+       @noncovering_secondary_pq_revenue AS noncovering_secondary_revenue_equal;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # Non-covering secondary grouped aggregate without ICP can use clustered lookup through the native secondary provider.
+SET optimizer_switch= 'parallel_query=on,index_condition_pushdown=off';
+SET force_parallel_execute= OFF;
+SELECT l_returnflag,
+       SUM(l_quantity) AS noncovering_secondary_serial_sum_qty,
+       SUM(l_extendedprice * l_discount) AS noncovering_secondary_serial_revenue,
+       COUNT(*) AS noncovering_secondary_serial_count
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+GROUP BY l_returnflag
+ORDER BY l_returnflag;
+
+SET force_parallel_execute= ON;
+--replace_column 9 #
+EXPLAIN SELECT /*+ PQ(4) */ l_returnflag,
+       SUM(l_quantity) AS noncovering_secondary_pq_sum_qty,
+       SUM(l_extendedprice * l_discount) AS noncovering_secondary_pq_revenue,
+       COUNT(*) AS noncovering_secondary_pq_count
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+GROUP BY l_returnflag
+ORDER BY l_returnflag;
+
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag,
+       SUM(l_quantity) AS noncovering_secondary_pq_sum_qty,
+       SUM(l_extendedprice * l_discount) AS noncovering_secondary_pq_revenue,
+       COUNT(*) AS noncovering_secondary_pq_count
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+GROUP BY l_returnflag
+ORDER BY l_returnflag;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS noncovering_secondary_group_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_available') AS noncovering_secondary_group_handler_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].secondary_requires_cluster_lookup') AS noncovering_secondary_group_requires_cluster_lookup
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].secondary_keyread_used') AS noncovering_secondary_group_keyread_used
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].btree_descriptor_rejected_reason') AS noncovering_secondary_group_btree_rejected_reason
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # Nullable secondary split keys remain on the SQL primary-key scan provider.
+--replace_column 9 #
+EXPLAIN SELECT /*+ PQ(4) */ l_nullable_shipdate
+FROM lineitem_secondary_pq FORCE INDEX(idx_nullable_shipdate)
+WHERE l_nullable_shipdate >= DATE '1994-01-01'
+  AND l_nullable_shipdate < DATE '1995-01-01'
+ORDER BY l_nullable_shipdate;
+
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_nullable_shipdate
+FROM lineitem_secondary_pq FORCE INDEX(idx_nullable_shipdate)
+WHERE l_nullable_shipdate >= DATE '1994-01-01'
+  AND l_nullable_shipdate < DATE '1995-01-01'
+ORDER BY l_nullable_shipdate;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS nullable_secondary_scan_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_available') AS nullable_secondary_handler_scan_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_rejected_reason') AS nullable_secondary_handler_rejected_reason
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # Descending secondary split keys remain on the SQL primary-key scan provider.
+--replace_column 9 #
+EXPLAIN SELECT /*+ PQ(4) */ l_shipdate
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate_desc)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+ORDER BY l_shipdate;
+
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_shipdate
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate_desc)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+ORDER BY l_shipdate;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS descending_secondary_scan_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_available') AS descending_secondary_handler_scan_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_rejected_reason') AS descending_secondary_handler_rejected_reason
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # Prefix secondary split keys remain outside native secondary PQ.
+--replace_column 9 #
+EXPLAIN SELECT /*+ PQ(4) */ l_comment
+FROM lineitem_secondary_pq FORCE INDEX(idx_comment_prefix)
+WHERE l_comment >= 'cA'
+  AND l_comment < 'cB'
+ORDER BY l_comment;
+
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_comment
+FROM lineitem_secondary_pq FORCE INDEX(idx_comment_prefix)
+WHERE l_comment >= 'cA'
+  AND l_comment < 'cB'
+ORDER BY l_comment;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS prefix_secondary_scan_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_available') AS prefix_secondary_handler_scan_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_rejected_reason') AS prefix_secondary_handler_rejected_reason
+FROM information_schema.optimizer_trace;
+SELECT json_detailed(json_extract(trace,
+       '$**.not_apply_pq_plan')) AS prefix_secondary_not_apply_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # Prefix secondary indexes remain rejected before native secondary range use.
+--replace_column 9 #
+EXPLAIN SELECT /*+ PQ(4) */ COUNT(*) AS prefix_secondary_count
+FROM lineitem_secondary_pq FORCE INDEX(idx_comment_prefix)
+WHERE l_comment >= 'cA'
+  AND l_comment < 'cB';
+
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS prefix_secondary_count
+FROM lineitem_secondary_pq FORCE INDEX(idx_comment_prefix)
+WHERE l_comment >= 'cA'
+  AND l_comment < 'cB';
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS prefix_secondary_count_scan_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_available') AS prefix_secondary_count_handler_scan_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_rejected_reason') AS prefix_secondary_count_handler_rejected_reason
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # Generated-column secondary split keys remain outside native secondary PQ.
+--replace_column 9 #
+EXPLAIN SELECT /*+ PQ(4) */ l_ship_year
+FROM lineitem_secondary_pq FORCE INDEX(idx_ship_year)
+WHERE l_ship_year >= 1994
+  AND l_ship_year < 1995
+ORDER BY l_ship_year;
+
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_ship_year
+FROM lineitem_secondary_pq FORCE INDEX(idx_ship_year)
+WHERE l_ship_year >= 1994
+  AND l_ship_year < 1995
+ORDER BY l_ship_year;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS generated_secondary_scan_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_available') AS generated_secondary_handler_scan_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_rejected_reason') AS generated_secondary_handler_rejected_reason
+FROM information_schema.optimizer_trace;
+SELECT json_detailed(json_extract(trace,
+       '$**.not_apply_pq_plan')) AS generated_secondary_not_apply_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # Generated-column secondary COUNT-only shapes remain outside PQ admission.
+--replace_column 9 #
+EXPLAIN SELECT /*+ PQ(4) */ COUNT(*) AS generated_secondary_count
+FROM lineitem_secondary_pq FORCE INDEX(idx_ship_year)
+WHERE l_ship_year >= 1994
+  AND l_ship_year < 1995;
+
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS generated_secondary_count
+FROM lineitem_secondary_pq FORCE INDEX(idx_ship_year)
+WHERE l_ship_year >= 1994
+  AND l_ship_year < 1995;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS generated_secondary_count_scan_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_available') AS generated_secondary_count_handler_scan_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_rejected_reason') AS generated_secondary_count_handler_rejected_reason
+FROM information_schema.optimizer_trace;
+SELECT json_detailed(json_extract(trace,
+       '$**.not_apply_pq_plan')) AS generated_secondary_count_not_apply_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # Secondary range/ICP-like Q6 plan remains the SQL primary-key scan provider at runtime.
+SET optimizer_switch= 'parallel_query=on,index_condition_pushdown=on';
+--replace_column 9 #
+EXPLAIN SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_secondary_range_revenue
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 24;
+
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_secondary_range_revenue
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 24;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS secondary_range_scan_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_available') AS secondary_range_handler_scan_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_rejected_reason') AS secondary_range_handler_rejected_reason
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # Simple secondary ICP candidate still rejects native secondary-provider ICP.
+--replace_column 9 #
+EXPLAIN SELECT /*+ PQ(4) */ COUNT(*) AS secondary_simple_icp_count
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_quantity < 24;
+
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS secondary_simple_icp_count
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_quantity < 24;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS secondary_simple_icp_scan_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_available') AS secondary_simple_icp_handler_scan_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_rejected_reason') AS secondary_simple_icp_handler_rejected_reason
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # Secondary ICP OR candidate remains outside native secondary-provider ICP.
+--replace_column 9 #
+EXPLAIN SELECT /*+ PQ(4) */ COUNT(*) AS secondary_or_icp_count
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND (l_quantity < 24 OR l_discount = 0.07);
+
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS secondary_or_icp_count
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND (l_quantity < 24 OR l_discount = 0.07);
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS secondary_or_icp_scan_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_available') AS secondary_or_icp_handler_scan_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_rejected_reason') AS secondary_or_icp_handler_rejected_reason
+FROM information_schema.optimizer_trace;
+SELECT json_detailed(json_extract(trace,
+       '$**.not_apply_pq_plan')) AS secondary_or_icp_not_apply_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # String/collation secondary range split keys remain SQL primary-key scan provider.
+--replace_column 9 #
+EXPLAIN SELECT /*+ PQ(4) */ COUNT(*) AS secondary_string_range_count
+FROM lineitem_secondary_pq FORCE INDEX(idx_returnflag)
+WHERE l_returnflag >= 'A'
+  AND l_returnflag < 'B';
+
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS secondary_string_range_count
+FROM lineitem_secondary_pq FORCE INDEX(idx_returnflag)
+WHERE l_returnflag >= 'A'
+  AND l_returnflag < 'B';
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS secondary_string_range_scan_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_available') AS secondary_string_range_handler_scan_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_rejected_reason') AS secondary_string_range_handler_rejected_reason
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # Secondary ref access also keeps the SQL primary-key scan provider boundary.
+--replace_column 9 #
+EXPLAIN SELECT /*+ PQ(4) */ COUNT(*) AS secondary_ref_count
+FROM lineitem_secondary_pq FORCE INDEX(idx_returnflag)
+WHERE l_returnflag = 'A';
+
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS secondary_ref_count
+FROM lineitem_secondary_pq FORCE INDEX(idx_returnflag)
+WHERE l_returnflag = 'A';
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS secondary_ref_scan_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_available') AS secondary_ref_handler_scan_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_rejected_reason') AS secondary_ref_handler_rejected_reason
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # Secondary composite range/ICP-like shape remains SQL primary-key split.
+--replace_column 9 #
+EXPLAIN SELECT /*+ PQ(4) */ COUNT(*) AS secondary_composite_range_count
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate_quantity)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_quantity < 24;
+
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS secondary_composite_range_count
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate_quantity)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_quantity < 24;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS secondary_composite_scan_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_available') AS secondary_composite_handler_scan_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_rejected_reason') AS secondary_composite_handler_rejected_reason
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # Reverse secondary-order projection still uses the SQL primary-key scan provider.
+--replace_column 9 #
+EXPLAIN SELECT /*+ PQ(4) */ l_shipdate
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+ORDER BY l_shipdate DESC;
+
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_shipdate
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+ORDER BY l_shipdate DESC;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS reverse_order_scan_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_available') AS reverse_order_handler_scan_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_rejected_reason') AS reverse_order_handler_rejected_reason
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # Unsupported isolation keeps secondary provider disabled.
+SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS secondary_read_uncommitted_count
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01';
+SELECT json_detailed(json_extract(trace,
+       '$**.not_apply_pq_plan')) AS secondary_read_uncommitted_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+SET SESSION transaction_isolation= @save_transaction_isolation;
+
+--echo # Locking reads keep secondary provider disabled.
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_shipdate
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+ORDER BY l_shipdate
+FOR UPDATE;
+SELECT json_detailed(json_extract(trace,
+       '$**.not_apply_pq_plan')) AS secondary_for_update_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_shipdate
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+ORDER BY l_shipdate
+LOCK IN SHARE MODE;
+SELECT json_detailed(json_extract(trace,
+       '$**.not_apply_pq_plan')) AS secondary_lock_in_share_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # Active write transactions keep secondary provider disabled.
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+START TRANSACTION;
+INSERT INTO lineitem_secondary_pq
+  (l_orderkey, l_linenumber, l_shipdate, l_nullable_shipdate,
+   l_returnflag, l_quantity, l_extendedprice, l_discount)
+VALUES
+  (100, 1, '1994-09-01', '1994-09-01', 'A', 99.00, 900.00, 0.05);
+SELECT /*+ PQ(4) */ COUNT(*) AS secondary_active_transaction_count
+FROM lineitem_secondary_pq FORCE INDEX(idx_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01';
+SELECT json_detailed(json_extract(trace,
+       '$**.not_apply_pq_plan')) AS secondary_active_transaction_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+ROLLBACK;
+
+SET optimizer_trace= @save_optimizer_trace;
+SET optimizer_switch= @save_optimizer_switch;
+SET SESSION transaction_isolation= @save_transaction_isolation;
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;
+
+DROP TABLE lineitem_secondary_pq;

@@ -1,0 +1,53 @@
+# flagset global/session
+
+SET @start_global_value= @@global.pq_support_features_switch;
+SET @start_value= @@session.pq_support_features_switch;
+
+#
+# exists as global and session
+#
+SHOW GLOBAL VARIABLES LIKE 'pq_support_features_switch';
+SHOW SESSION VARIABLES LIKE 'pq_support_features_switch';
+SELECT * FROM information_schema.global_variables
+WHERE variable_name='pq_support_features_switch';
+SELECT * FROM information_schema.session_variables
+WHERE variable_name='pq_support_features_switch';
+
+#
+# default and writable values
+#
+SET @@session.pq_support_features_switch= DEFAULT;
+SELECT @@session.pq_support_features_switch;
+SET @@session.pq_support_features_switch= 'simple_aggregate=on,count_distinct=on';
+SELECT @@session.pq_support_features_switch;
+SET @@session.pq_support_features_switch= 'simple_aggregate=off';
+SELECT @@session.pq_support_features_switch;
+SET @@global.pq_support_features_switch= 'simple_aggregate=on,count_distinct=off';
+SELECT @@global.pq_support_features_switch;
+
+#
+# default token
+#
+SET @@session.pq_support_features_switch= 'default';
+SELECT @@session.pq_support_features_switch;
+
+#
+# incorrect assignments
+#
+--error ER_WRONG_TYPE_FOR_VAR
+SET @@session.pq_support_features_switch= 1.5;
+--error ER_WRONG_VALUE_FOR_VAR
+SET @@session.pq_support_features_switch= 'simple_aggregate';
+--error ER_WRONG_VALUE_FOR_VAR
+SET @@session.pq_support_features_switch= 'unknown_feature=on';
+
+#
+# local/session aliases
+#
+SET @@local.pq_support_features_switch= 'simple_aggregate=on,count_distinct=on';
+SELECT @@local.pq_support_features_switch = @@session.pq_support_features_switch;
+SET pq_support_features_switch= 'simple_aggregate=on,count_distinct=off';
+SELECT @@pq_support_features_switch;
+
+SET @@global.pq_support_features_switch= @start_global_value;
+SET @@session.pq_support_features_switch= @start_value;

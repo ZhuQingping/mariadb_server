@@ -1,0 +1,166 @@
+#
+# Parallel Query Q1/Q6 v1 range demo coverage.
+#
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_optimizer_switch= @@optimizer_switch;
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on';
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+CREATE TABLE lineitem_range_demo (
+l_orderkey INT NOT NULL,
+l_linenumber INT NOT NULL,
+l_shipdate DATE NOT NULL,
+l_returnflag CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+l_linestatus CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+l_quantity DECIMAL(15,2) NOT NULL,
+l_extendedprice DECIMAL(15,2) NOT NULL,
+l_discount DECIMAL(15,2) NOT NULL,
+l_tax DECIMAL(15,2) NOT NULL,
+PRIMARY KEY (l_orderkey, l_linenumber),
+KEY idx_shipdate (l_shipdate)
+) ENGINE=InnoDB;
+INSERT INTO lineitem_range_demo VALUES
+(1, 1, '1994-01-01', 'A', 'F', 12.00, 100.00, 0.06, 0.10),
+(5, 1, '1994-03-10', 'A', 'F', 10.00, 200.00, 0.05, 0.08),
+(8, 1, '1994-06-15', 'N', 'O', 23.00, 300.00, 0.06, 0.04),
+(12, 1, '1994-07-01', 'A', 'F', 18.00, 400.00, 0.07, 0.02),
+(16, 1, '1994-08-20', 'N', 'O', 20.00, 500.00, 0.06, 0.03),
+(20, 1, '1994-09-01', 'R', 'F', 24.00, 600.00, 0.06, 0.05),
+(24, 1, '1995-01-01', 'A', 'F', 19.00, 700.00, 0.06, 0.01),
+(28, 1, '1994-10-10', 'N', 'O', 22.00, 800.00, 0.08, 0.06),
+(32, 1, '1998-08-30', 'A', 'F', 30.00, 900.00, 0.05, 0.07),
+(36, 1, '1998-08-31', 'N', 'O', 40.00, 1000.00, 0.06, 0.08),
+(40, 1, '1998-09-03', 'R', 'F', 50.00, 1100.00, 0.07, 0.09),
+(44, 1, '1998-07-15', 'A', 'F', 60.00, 1200.00, 0.04, 0.01),
+(48, 1, '1998-07-16', 'N', 'O', 70.00, 1300.00, 0.03, 0.02),
+(52, 1, '1993-12-31', 'A', 'F', 15.00, 1400.00, 0.06, 0.03),
+(56, 1, '1999-01-01', 'N', 'O', 16.00, 1500.00, 0.06, 0.04);
+# Ordinary projection stays on PQ with an explicit primary-key range.
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ l_orderkey, l_linenumber, l_shipdate, l_quantity
+FROM lineitem_range_demo
+WHERE l_orderkey >= 5
+AND l_orderkey < 30
+AND l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+ORDER BY l_orderkey, l_linenumber;
+l_orderkey	l_linenumber	l_shipdate	l_quantity
+5	1	1994-03-10	10.00
+8	1	1994-06-15	23.00
+12	1	1994-07-01	18.00
+16	1	1994-08-20	20.00
+20	1	1994-09-01	24.00
+28	1	1994-10-10	22.00
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, l_linenumber, l_shipdate, l_quantity
+FROM lineitem_range_demo
+WHERE l_orderkey >= 5
+AND l_orderkey < 30
+AND l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+ORDER BY l_orderkey, l_linenumber;
+l_orderkey	l_linenumber	l_shipdate	l_quantity
+5	1	1994-03-10	10.00
+8	1	1994-06-15	23.00
+12	1	1994-07-01	18.00
+16	1	1994-08-20	20.00
+20	1	1994-09-01	24.00
+28	1	1994-10-10	22.00
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+# Q6 demo shape stays on PQ with the same range clipping predicate.
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ SUM(l_extendedprice * l_discount) AS q6_serial_revenue
+FROM lineitem_range_demo
+WHERE l_orderkey >= 5
+AND l_orderkey < 30
+AND l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24;
+q6_serial_revenue
+86.0000
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_pq_revenue
+FROM lineitem_range_demo
+WHERE l_orderkey >= 5
+AND l_orderkey < 30
+AND l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24;
+q6_pq_revenue
+86.0000
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+# Q1 demo shape stays on PQ with primary-key range clipping.
+FLUSH STATUS;
+SELECT /*+ NO_PQ */
+l_returnflag,
+l_linestatus,
+SUM(l_quantity) AS sum_qty,
+SUM(l_extendedprice) AS sum_base_price,
+SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price,
+SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,
+AVG(l_quantity) AS avg_qty,
+AVG(l_extendedprice) AS avg_price,
+AVG(l_discount) AS avg_disc,
+COUNT(*) AS count_order
+FROM lineitem_range_demo
+WHERE l_orderkey >= 32
+AND l_orderkey < 52
+AND l_shipdate <= DATE '1998-12-01' - INTERVAL '90' DAY
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	sum_qty	sum_base_price	sum_disc_price	sum_charge	avg_qty	avg_price	avg_disc	count_order
+A	F	90.00	2100.00	2007.0000	2078.370000	45.000000	1050.000000	0.045000	2
+N	O	110.00	2300.00	2201.0000	2301.420000	55.000000	1150.000000	0.045000	2
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */
+l_returnflag,
+l_linestatus,
+SUM(l_quantity) AS sum_qty,
+SUM(l_extendedprice) AS sum_base_price,
+SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price,
+SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,
+AVG(l_quantity) AS avg_qty,
+AVG(l_extendedprice) AS avg_price,
+AVG(l_discount) AS avg_disc,
+COUNT(*) AS count_order
+FROM lineitem_range_demo
+WHERE l_orderkey >= 32
+AND l_orderkey < 52
+AND l_shipdate <= DATE '1998-12-01' - INTERVAL '90' DAY
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	sum_qty	sum_base_price	sum_disc_price	sum_charge	avg_qty	avg_price	avg_disc	count_order
+A	F	90.00	2100.00	2007.0000	2078.370000	45.000000	1050.000000	0.045000	2
+N	O	110.00	2300.00	2201.0000	2301.420000	55.000000	1150.000000	0.045000	2
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+DROP TABLE lineitem_range_demo;
+SET optimizer_switch= @save_optimizer_switch;
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;

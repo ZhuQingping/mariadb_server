@@ -1,0 +1,379 @@
+#
+# Parallel Query secondary-index MVCC lookup boundaries.
+#
+CREATE TABLE pq_secondary_mvcc (
+id INT NOT NULL PRIMARY KEY,
+shipdate DATE NOT NULL,
+l_returnflag CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+l_quantity DECIMAL(15,2) NOT NULL,
+qty INT NOT NULL,
+KEY idx_shipdate (shipdate)
+) ENGINE=InnoDB;
+INSERT INTO pq_secondary_mvcc VALUES
+(1, '1994-01-01', 'A', 10.00, 10),
+(2, '1994-02-01', 'A', 20.00, 20),
+(3, '1994-03-01', 'B', 30.00, 30),
+(4, '1994-04-01', 'B', 40.00, 40),
+(5, '1995-01-01', 'C', 50.00, 50);
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_optimizer_trace= @@optimizer_trace;
+SET @save_optimizer_switch= @@optimizer_switch;
+SET @save_transaction_isolation= @@transaction_isolation;
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on,index_condition_pushdown=off';
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+connect  pq_secondary_mvcc_reader, localhost, root,,test;
+connection pq_secondary_mvcc_reader;
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+SET optimizer_switch= 'parallel_query=on,index_condition_pushdown=off';
+SET optimizer_trace= 1;
+# REPEATABLE READ non-covering secondary workers keep the leader snapshot.
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SET debug_sync= 'after_pq_create_snapshot SIGNAL pq_secondary_mvcc_rr_snapshot WAIT_FOR pq_secondary_mvcc_rr_release';
+SELECT /*+ PQ(4) */ id AS rr_snapshot_id, qty AS rr_snapshot_qty FROM pq_secondary_mvcc FORCE INDEX(idx_shipdate) WHERE shipdate >= DATE '1994-01-01' AND shipdate < DATE '1995-01-01' ORDER BY shipdate, id;
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_secondary_mvcc_rr_snapshot TIMEOUT 30';
+UPDATE pq_secondary_mvcc SET qty= 999 WHERE id= 2;
+UPDATE pq_secondary_mvcc SET shipdate= '1995-02-01' WHERE id= 3;
+DELETE FROM pq_secondary_mvcc WHERE id= 4;
+INSERT INTO pq_secondary_mvcc VALUES (9, '1994-06-01', 'A', 90.00, 90);
+SET debug_sync= 'now SIGNAL pq_secondary_mvcc_rr_release';
+connection pq_secondary_mvcc_reader;
+rr_snapshot_id	rr_snapshot_qty
+1	10
+2	20
+3	30
+4	40
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].scan_provider') AS rr_secondary_mvcc_scan_provider
+FROM information_schema.optimizer_trace;
+rr_secondary_mvcc_scan_provider
+["innodb_secondary_range"]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].secondary_requires_cluster_lookup') AS rr_secondary_mvcc_requires_cluster_lookup
+FROM information_schema.optimizer_trace;
+rr_secondary_mvcc_requires_cluster_lookup
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].secondary_keyread_used') AS rr_secondary_mvcc_keyread_used
+FROM information_schema.optimizer_trace;
+rr_secondary_mvcc_keyread_used
+[false]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+SET debug_sync= 'RESET';
+connection default;
+SELECT id AS rr_current_id, qty AS rr_current_qty
+FROM pq_secondary_mvcc FORCE INDEX(idx_shipdate)
+WHERE shipdate >= DATE '1994-01-01'
+  AND shipdate < DATE '1995-01-01'
+ORDER BY shipdate, id;
+rr_current_id	rr_current_qty
+1	10
+2	999
+9	90
+TRUNCATE TABLE pq_secondary_mvcc;
+INSERT INTO pq_secondary_mvcc VALUES
+(1, '1994-01-01', 'A', 10.00, 10),
+(2, '1994-02-01', 'A', 20.00, 20),
+(3, '1994-03-01', 'B', 30.00, 30),
+(4, '1994-04-01', 'B', 40.00, 40),
+(5, '1995-01-01', 'C', 50.00, 50);
+connection pq_secondary_mvcc_reader;
+# READ COMMITTED non-covering secondary workers keep the leader statement snapshot.
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SET debug_sync= 'after_pq_create_snapshot SIGNAL pq_secondary_mvcc_rc_snapshot WAIT_FOR pq_secondary_mvcc_rc_release';
+SELECT /*+ PQ(4) */ id AS rc_snapshot_id, qty AS rc_snapshot_qty FROM pq_secondary_mvcc FORCE INDEX(idx_shipdate) WHERE shipdate >= DATE '1994-01-01' AND shipdate < DATE '1995-01-01' ORDER BY shipdate, id;
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_secondary_mvcc_rc_snapshot TIMEOUT 30';
+UPDATE pq_secondary_mvcc SET qty= 999 WHERE id= 2;
+UPDATE pq_secondary_mvcc SET shipdate= '1995-02-01' WHERE id= 3;
+DELETE FROM pq_secondary_mvcc WHERE id= 4;
+INSERT INTO pq_secondary_mvcc VALUES (9, '1994-06-01', 'A', 90.00, 90);
+SET debug_sync= 'now SIGNAL pq_secondary_mvcc_rc_release';
+connection pq_secondary_mvcc_reader;
+rc_snapshot_id	rc_snapshot_qty
+1	10
+2	20
+3	30
+4	40
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].scan_provider') AS rc_secondary_mvcc_scan_provider
+FROM information_schema.optimizer_trace;
+rc_secondary_mvcc_scan_provider
+["innodb_secondary_range"]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].secondary_requires_cluster_lookup') AS rc_secondary_mvcc_requires_cluster_lookup
+FROM information_schema.optimizer_trace;
+rc_secondary_mvcc_requires_cluster_lookup
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].secondary_keyread_used') AS rc_secondary_mvcc_keyread_used
+FROM information_schema.optimizer_trace;
+rc_secondary_mvcc_keyread_used
+[false]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+SET debug_sync= 'RESET';
+connection default;
+SELECT id AS rc_current_id, qty AS rc_current_qty
+FROM pq_secondary_mvcc FORCE INDEX(idx_shipdate)
+WHERE shipdate >= DATE '1994-01-01'
+  AND shipdate < DATE '1995-01-01'
+ORDER BY shipdate, id;
+rc_current_id	rc_current_qty
+1	10
+2	999
+9	90
+TRUNCATE TABLE pq_secondary_mvcc;
+INSERT INTO pq_secondary_mvcc VALUES
+(1, '1994-01-01', 'A', 10.00, 10),
+(2, '1994-02-01', 'A', 20.00, 20),
+(3, '1994-03-01', 'B', 30.00, 30),
+(4, '1994-04-01', 'B', 40.00, 40),
+(5, '1995-01-01', 'C', 50.00, 50);
+connection pq_secondary_mvcc_reader;
+# REPEATABLE READ non-covering secondary grouped aggregate keeps the leader snapshot.
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SET debug_sync= 'after_pq_create_snapshot SIGNAL pq_secondary_mvcc_group_rr_snapshot WAIT_FOR pq_secondary_mvcc_group_rr_release';
+SELECT /*+ PQ(4) */ l_returnflag AS rr_group_flag, SUM(l_quantity) AS rr_group_sum_qty, COUNT(*) AS rr_group_count FROM pq_secondary_mvcc FORCE INDEX(idx_shipdate) WHERE shipdate >= DATE '1994-01-01' AND shipdate < DATE '1995-01-01' GROUP BY l_returnflag ORDER BY l_returnflag;
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_secondary_mvcc_group_rr_snapshot TIMEOUT 30';
+UPDATE pq_secondary_mvcc SET l_quantity= 999.00, qty= 999 WHERE id= 2;
+UPDATE pq_secondary_mvcc SET shipdate= '1995-02-01' WHERE id= 3;
+DELETE FROM pq_secondary_mvcc WHERE id= 4;
+INSERT INTO pq_secondary_mvcc VALUES (9, '1994-06-01', 'A', 90.00, 90);
+SET debug_sync= 'now SIGNAL pq_secondary_mvcc_group_rr_release';
+connection pq_secondary_mvcc_reader;
+rr_group_flag	rr_group_sum_qty	rr_group_count
+A	30.00	2
+B	70.00	2
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].scan_provider') AS rr_group_secondary_mvcc_scan_provider
+FROM information_schema.optimizer_trace;
+rr_group_secondary_mvcc_scan_provider
+["innodb_secondary_range"]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].secondary_requires_cluster_lookup') AS rr_group_secondary_mvcc_requires_cluster_lookup
+FROM information_schema.optimizer_trace;
+rr_group_secondary_mvcc_requires_cluster_lookup
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].secondary_keyread_used') AS rr_group_secondary_mvcc_keyread_used
+FROM information_schema.optimizer_trace;
+rr_group_secondary_mvcc_keyread_used
+[false]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+SET debug_sync= 'RESET';
+connection default;
+SELECT l_returnflag AS rr_group_current_flag,
+SUM(l_quantity) AS rr_group_current_sum_qty,
+COUNT(*) AS rr_group_current_count
+FROM pq_secondary_mvcc FORCE INDEX(idx_shipdate)
+WHERE shipdate >= DATE '1994-01-01'
+  AND shipdate < DATE '1995-01-01'
+GROUP BY l_returnflag
+ORDER BY l_returnflag;
+rr_group_current_flag	rr_group_current_sum_qty	rr_group_current_count
+A	1099.00	3
+TRUNCATE TABLE pq_secondary_mvcc;
+INSERT INTO pq_secondary_mvcc VALUES
+(1, '1994-01-01', 'A', 10.00, 10),
+(2, '1994-02-01', 'A', 20.00, 20),
+(3, '1994-03-01', 'B', 30.00, 30),
+(4, '1994-04-01', 'B', 40.00, 40),
+(5, '1995-01-01', 'C', 50.00, 50);
+connection pq_secondary_mvcc_reader;
+# READ COMMITTED non-covering secondary grouped aggregate keeps the leader statement snapshot.
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SET debug_sync= 'after_pq_create_snapshot SIGNAL pq_secondary_mvcc_group_rc_snapshot WAIT_FOR pq_secondary_mvcc_group_rc_release';
+SELECT /*+ PQ(4) */ l_returnflag AS rc_group_flag, SUM(l_quantity) AS rc_group_sum_qty, COUNT(*) AS rc_group_count FROM pq_secondary_mvcc FORCE INDEX(idx_shipdate) WHERE shipdate >= DATE '1994-01-01' AND shipdate < DATE '1995-01-01' GROUP BY l_returnflag ORDER BY l_returnflag;
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_secondary_mvcc_group_rc_snapshot TIMEOUT 30';
+UPDATE pq_secondary_mvcc SET l_quantity= 999.00, qty= 999 WHERE id= 2;
+UPDATE pq_secondary_mvcc SET shipdate= '1995-02-01' WHERE id= 3;
+DELETE FROM pq_secondary_mvcc WHERE id= 4;
+INSERT INTO pq_secondary_mvcc VALUES (9, '1994-06-01', 'A', 90.00, 90);
+SET debug_sync= 'now SIGNAL pq_secondary_mvcc_group_rc_release';
+connection pq_secondary_mvcc_reader;
+rc_group_flag	rc_group_sum_qty	rc_group_count
+A	30.00	2
+B	70.00	2
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].scan_provider') AS rc_group_secondary_mvcc_scan_provider
+FROM information_schema.optimizer_trace;
+rc_group_secondary_mvcc_scan_provider
+["innodb_secondary_range"]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].secondary_requires_cluster_lookup') AS rc_group_secondary_mvcc_requires_cluster_lookup
+FROM information_schema.optimizer_trace;
+rc_group_secondary_mvcc_requires_cluster_lookup
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].secondary_keyread_used') AS rc_group_secondary_mvcc_keyread_used
+FROM information_schema.optimizer_trace;
+rc_group_secondary_mvcc_keyread_used
+[false]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+SET debug_sync= 'RESET';
+connection default;
+SELECT l_returnflag AS rc_group_current_flag,
+SUM(l_quantity) AS rc_group_current_sum_qty,
+COUNT(*) AS rc_group_current_count
+FROM pq_secondary_mvcc FORCE INDEX(idx_shipdate)
+WHERE shipdate >= DATE '1994-01-01'
+  AND shipdate < DATE '1995-01-01'
+GROUP BY l_returnflag
+ORDER BY l_returnflag;
+rc_group_current_flag	rc_group_current_sum_qty	rc_group_current_count
+A	1099.00	3
+TRUNCATE TABLE pq_secondary_mvcc;
+INSERT INTO pq_secondary_mvcc VALUES
+(1, '1994-01-01', 'A', 10.00, 10),
+(2, '1994-02-01', 'A', 20.00, 20),
+(3, '1994-03-01', 'B', 30.00, 30),
+(4, '1994-04-01', 'B', 40.00, 40),
+(5, '1995-01-01', 'C', 50.00, 50);
+connection pq_secondary_mvcc_reader;
+# REPEATABLE READ non-covering secondary workers ignore uncommitted DML.
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SET debug_sync= 'after_pq_create_snapshot SIGNAL pq_secondary_mvcc_rr_uncommitted_snapshot WAIT_FOR pq_secondary_mvcc_rr_uncommitted_release';
+SELECT /*+ PQ(4) */ id AS rr_uncommitted_id, qty AS rr_uncommitted_qty FROM pq_secondary_mvcc FORCE INDEX(idx_shipdate) WHERE shipdate >= DATE '1994-01-01' AND shipdate < DATE '1995-01-01' ORDER BY shipdate, id;
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_secondary_mvcc_rr_uncommitted_snapshot TIMEOUT 30';
+START TRANSACTION;
+UPDATE pq_secondary_mvcc SET qty= 777 WHERE id= 2;
+UPDATE pq_secondary_mvcc SET shipdate= '1995-02-01' WHERE id= 3;
+DELETE FROM pq_secondary_mvcc WHERE id= 4;
+INSERT INTO pq_secondary_mvcc VALUES (9, '1994-06-01', 'A', 90.00, 90);
+SET debug_sync= 'now SIGNAL pq_secondary_mvcc_rr_uncommitted_release';
+connection pq_secondary_mvcc_reader;
+rr_uncommitted_id	rr_uncommitted_qty
+1	10
+2	20
+3	30
+4	40
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].scan_provider') AS rr_uncommitted_secondary_mvcc_scan_provider
+FROM information_schema.optimizer_trace;
+rr_uncommitted_secondary_mvcc_scan_provider
+["innodb_secondary_range"]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].secondary_requires_cluster_lookup') AS rr_uncommitted_secondary_mvcc_requires_cluster_lookup
+FROM information_schema.optimizer_trace;
+rr_uncommitted_secondary_mvcc_requires_cluster_lookup
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].secondary_keyread_used') AS rr_uncommitted_secondary_mvcc_keyread_used
+FROM information_schema.optimizer_trace;
+rr_uncommitted_secondary_mvcc_keyread_used
+[false]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+SET debug_sync= 'RESET';
+connection default;
+ROLLBACK;
+SELECT id AS rr_uncommitted_current_id, qty AS rr_uncommitted_current_qty
+FROM pq_secondary_mvcc FORCE INDEX(idx_shipdate)
+WHERE shipdate >= DATE '1994-01-01'
+  AND shipdate < DATE '1995-01-01'
+ORDER BY shipdate, id;
+rr_uncommitted_current_id	rr_uncommitted_current_qty
+1	10
+2	20
+3	30
+4	40
+connection pq_secondary_mvcc_reader;
+# READ COMMITTED non-covering secondary workers ignore uncommitted DML.
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SET debug_sync= 'after_pq_create_snapshot SIGNAL pq_secondary_mvcc_rc_uncommitted_snapshot WAIT_FOR pq_secondary_mvcc_rc_uncommitted_release';
+SELECT /*+ PQ(4) */ id AS rc_uncommitted_id, qty AS rc_uncommitted_qty FROM pq_secondary_mvcc FORCE INDEX(idx_shipdate) WHERE shipdate >= DATE '1994-01-01' AND shipdate < DATE '1995-01-01' ORDER BY shipdate, id;
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_secondary_mvcc_rc_uncommitted_snapshot TIMEOUT 30';
+START TRANSACTION;
+UPDATE pq_secondary_mvcc SET qty= 888 WHERE id= 2;
+UPDATE pq_secondary_mvcc SET shipdate= '1995-02-01' WHERE id= 3;
+DELETE FROM pq_secondary_mvcc WHERE id= 4;
+INSERT INTO pq_secondary_mvcc VALUES (9, '1994-06-01', 'A', 90.00, 90);
+SET debug_sync= 'now SIGNAL pq_secondary_mvcc_rc_uncommitted_release';
+connection pq_secondary_mvcc_reader;
+rc_uncommitted_id	rc_uncommitted_qty
+1	10
+2	20
+3	30
+4	40
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].scan_provider') AS rc_uncommitted_secondary_mvcc_scan_provider
+FROM information_schema.optimizer_trace;
+rc_uncommitted_secondary_mvcc_scan_provider
+["innodb_secondary_range"]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].secondary_requires_cluster_lookup') AS rc_uncommitted_secondary_mvcc_requires_cluster_lookup
+FROM information_schema.optimizer_trace;
+rc_uncommitted_secondary_mvcc_requires_cluster_lookup
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].secondary_keyread_used') AS rc_uncommitted_secondary_mvcc_keyread_used
+FROM information_schema.optimizer_trace;
+rc_uncommitted_secondary_mvcc_keyread_used
+[false]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+SET debug_sync= 'RESET';
+disconnect pq_secondary_mvcc_reader;
+connection default;
+ROLLBACK;
+SELECT id AS rc_uncommitted_current_id, qty AS rc_uncommitted_current_qty
+FROM pq_secondary_mvcc FORCE INDEX(idx_shipdate)
+WHERE shipdate >= DATE '1994-01-01'
+  AND shipdate < DATE '1995-01-01'
+ORDER BY shipdate, id;
+rc_uncommitted_current_id	rc_uncommitted_current_qty
+1	10
+2	20
+3	30
+4	40
+SET debug_sync= 'RESET';
+SET SESSION transaction_isolation= @save_transaction_isolation;
+SET optimizer_trace= @save_optimizer_trace;
+SET optimizer_switch= @save_optimizer_switch;
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;
+DROP TABLE pq_secondary_mvcc;

@@ -1,0 +1,129 @@
+--source include/have_innodb.inc
+
+--echo #
+--echo # Parallel Query predicate trace boundary coverage.
+--echo #
+
+CREATE TABLE lineitem (
+  l_orderkey INT NOT NULL PRIMARY KEY,
+  l_shipdate DATE NOT NULL,
+  l_quantity INT NOT NULL
+) ENGINE=InnoDB;
+
+INSERT INTO lineitem VALUES
+  (1, '1979-12-31', 10),
+  (2, '1980-01-01', 20),
+  (3, '1980-01-02', 30),
+  (4, '1981-05-10', 40),
+  (5, '1992-07-15', 50),
+  (6, '1978-03-20', 60),
+  (7, '1980-06-01', 70),
+  (8, '1985-09-09', 80);
+
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_pq_support_features_switch= @@pq_support_features_switch;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_optimizer_trace= @@optimizer_trace;
+SET @save_optimizer_switch= @@optimizer_switch;
+
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on';
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+SET pq_support_features_switch= 'simple_aggregate=on,count_distinct=on,correlated_subquery=on,hash_join_spill_to_disk=on,insert_select=on';
+SET optimizer_trace= 1;
+
+CREATE TABLE lineitem_q1_ci_group (
+  l_orderkey INT NOT NULL PRIMARY KEY,
+  l_shipdate DATE NOT NULL,
+  l_returnflag CHAR(1) CHARACTER SET latin1 COLLATE latin1_swedish_ci NOT NULL,
+  l_quantity INT NOT NULL
+) ENGINE=InnoDB;
+
+INSERT INTO lineitem_q1_ci_group VALUES
+  (1, '1998-09-01', 'a', 10),
+  (2, '1998-09-02', 'A', 20);
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, COUNT(*) AS count_order
+FROM lineitem_q1_ci_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag
+ORDER BY l_returnflag;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS not_in_trace_count
+FROM lineitem
+WHERE l_quantity NOT IN (20, NULL);
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS regexp_trace_count
+FROM lineitem
+WHERE CAST(l_shipdate AS CHAR) REGEXP '^198';
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS too_many_in_trace_count
+FROM lineitem
+WHERE l_orderkey IN (1, 2, 3, 4, 5, 6, 7, 8, 9,
+                     10, 11, 12, 13, 14, 15, 16, 17);
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS row_in_trace_count
+FROM lineitem
+WHERE (l_orderkey, l_quantity) IN ((1, 10), (3, 30));
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS subquery_in_trace_count
+FROM lineitem
+WHERE l_orderkey IN (SELECT l_orderkey FROM lineitem WHERE l_orderkey IN (1, 2));
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS unsupported_expr_predicate_trace_count
+FROM lineitem
+WHERE l_quantity + 1 > 30;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, COUNT(*) AS count_order
+FROM lineitem_q1_ci_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag
+ORDER BY l_returnflag;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+SET optimizer_trace= @save_optimizer_trace;
+SET optimizer_switch= @save_optimizer_switch;
+SET pq_support_features_switch= @save_pq_support_features_switch;
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;
+
+DROP TABLE lineitem_q1_ci_group;
+DROP TABLE lineitem;

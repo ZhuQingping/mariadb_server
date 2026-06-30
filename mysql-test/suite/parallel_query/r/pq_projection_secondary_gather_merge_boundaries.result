@@ -1,0 +1,157 @@
+#
+# Parallel Query secondary projection gather-merge boundary coverage.
+#
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_optimizer_trace= @@optimizer_trace;
+SET @save_optimizer_switch= @@optimizer_switch;
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on,index_condition_pushdown=off';
+SET optimizer_trace= 1;
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+CREATE TABLE pq_projection_secondary_gather_t (
+pk1 INT NOT NULL,
+pk2 INT NOT NULL,
+sec INT NOT NULL,
+payload VARCHAR(16) NOT NULL,
+PRIMARY KEY (pk1, pk2),
+KEY idx_sec (sec),
+KEY idx_payload_sec (payload, sec)
+) ENGINE=InnoDB;
+INSERT INTO pq_projection_secondary_gather_t VALUES
+(1, 2, 10, 'a'), (1, 1, 10, 'b'), (2, 1, 10, 'c'),
+(3, 1, 20, 'd'), (2, 2, 20, 'e'), (4, 1, 20, 'f'),
+(5, 1, 30, 'g'), (5, 2, 30, 'h'), (6, 1, 30, 'i'),
+(7, 1, 40, 'j'), (8, 1, 40, 'k'), (9, 1, 50, 'l');
+# Covering secondary ASC projection can gather-merge with explicit full-PK tie-break.
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ sec, pk1, pk2
+FROM pq_projection_secondary_gather_t FORCE INDEX(idx_sec)
+WHERE sec >= 10 AND sec < 50
+ORDER BY sec, pk1, pk2
+LIMIT 8;
+sec	pk1	pk2
+10	1	1
+10	1	2
+10	2	1
+20	2	2
+20	3	1
+20	4	1
+30	5	1
+30	5	2
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].scan_provider') AS secondary_covering_scan_provider
+FROM information_schema.optimizer_trace;
+secondary_covering_scan_provider
+["innodb_secondary_range"]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].secondary_requires_cluster_lookup') AS secondary_covering_requires_cluster_lookup
+FROM information_schema.optimizer_trace;
+secondary_covering_requires_cluster_lookup
+[false]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].secondary_keyread_used') AS secondary_covering_keyread_used
+FROM information_schema.optimizer_trace;
+secondary_covering_keyread_used
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].projection_order_strategy') AS secondary_covering_order_strategy
+FROM information_schema.optimizer_trace;
+secondary_covering_order_strategy
+["gather_merge"]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].projection_order_natural') AS secondary_covering_order_natural
+FROM information_schema.optimizer_trace;
+secondary_covering_order_natural
+[true]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+# Secondary ORDER BY without full-PK tie-break remains on leader sort.
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ sec
+FROM pq_projection_secondary_gather_t FORCE INDEX(idx_sec)
+WHERE sec >= 10 AND sec < 50
+ORDER BY sec
+LIMIT 6;
+sec
+10
+10
+10
+20
+20
+20
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].projection_order_strategy') AS secondary_no_pk_order_strategy
+FROM information_schema.optimizer_trace;
+secondary_no_pk_order_strategy
+["leader_sort"]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+# Secondary ORDER BY with descending PK tie-break remains on leader sort.
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ sec, pk1, pk2
+FROM pq_projection_secondary_gather_t FORCE INDEX(idx_sec)
+WHERE sec >= 10 AND sec < 50
+ORDER BY sec, pk1 DESC, pk2
+LIMIT 6;
+sec	pk1	pk2
+10	2	1
+10	1	1
+10	1	2
+20	4	1
+20	3	1
+20	2	2
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].projection_order_strategy') AS secondary_desc_pk_order_strategy
+FROM information_schema.optimizer_trace;
+secondary_desc_pk_order_strategy
+["leader_sort"]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+# Non-covering secondary projection remains on leader sort for this slice.
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ payload
+FROM pq_projection_secondary_gather_t FORCE INDEX(idx_sec)
+WHERE sec >= 10 AND sec < 50
+ORDER BY sec, pk1, pk2
+LIMIT 6;
+payload
+b
+a
+c
+e
+d
+f
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].projection_order_strategy') AS secondary_noncovering_order_strategy
+FROM information_schema.optimizer_trace;
+secondary_noncovering_order_strategy
+["leader_sort"]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+SET optimizer_trace= @save_optimizer_trace;
+SET optimizer_switch= @save_optimizer_switch;
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;
+DROP TABLE pq_projection_secondary_gather_t;

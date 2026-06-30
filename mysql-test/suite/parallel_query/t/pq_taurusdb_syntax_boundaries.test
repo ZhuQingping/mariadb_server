@@ -1,0 +1,157 @@
+--source include/have_innodb.inc
+
+--echo #
+--echo # TaurusDB syntax compatibility boundaries for MariaDB PQ v1.
+--echo #
+
+CREATE TABLE lineitem_pq_syntax (
+  l_orderkey INT NOT NULL PRIMARY KEY,
+  l_shipdate DATE NOT NULL,
+  l_quantity DECIMAL(15,2) NOT NULL,
+  l_extendedprice DECIMAL(15,2) NOT NULL,
+  l_discount DECIMAL(15,2) NOT NULL
+) ENGINE=InnoDB;
+
+INSERT INTO lineitem_pq_syntax VALUES
+  (1, '1994-01-01', 10.00, 100.00, 0.05),
+  (2, '1994-06-01', 20.00, 200.00, 0.06),
+  (3, '1995-01-01', 30.00, 300.00, 0.07);
+
+SET @save_optimizer_switch= @@optimizer_switch;
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_parallel_cost_threshold= @@parallel_cost_threshold;
+SET @save_parallel_rows_threshold= @@parallel_rows_threshold;
+SET @save_parallel_setup_cost= @@parallel_setup_cost;
+SET @save_parallel_tuple_cost= @@parallel_tuple_cost;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on';
+SET force_parallel_execute= OFF;
+SET parallel_default_dop= 4;
+SET parallel_cost_threshold= 18446744073709551615;
+SET parallel_rows_threshold= 0;
+SET parallel_setup_cost= 0;
+SET parallel_tuple_cost= 0;
+
+--echo # TaurusDB table-at-query-block PQ hint syntax is accepted.
+FLUSH STATUS;
+SELECT /*+ QB_NAME(pq_table_qb) PQ(lineitem_pq_syntax @pq_table_qb, 4) */
+       SUM(l_extendedprice * l_discount) AS revenue
+FROM lineitem_pq_syntax
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01';
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # TaurusDB table-at-query-block PQ hint syntax is visible in EXPLAIN.
+--replace_column 9 #
+EXPLAIN SELECT /*+ QB_NAME(pq_table_qb_explain) PQ(lineitem_pq_syntax @pq_table_qb_explain, 4) */
+       SUM(l_extendedprice * l_discount) AS revenue
+FROM lineitem_pq_syntax
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01';
+
+--replace_regex /"rows": [0-9]+/"rows": #/ /"cost": [0-9.]+/"cost": #/
+EXPLAIN FORMAT=JSON SELECT /*+ QB_NAME(pq_table_qb_json) PQ(lineitem_pq_syntax @pq_table_qb_json, 4) */
+       SUM(l_extendedprice * l_discount) AS revenue
+FROM lineitem_pq_syntax
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01';
+
+--echo # TaurusDB table-at-query-block PQ hint syntax accepts space DOP.
+FLUSH STATUS;
+SELECT /*+ QB_NAME(pq_table_qb_space_dop) PQ(lineitem_pq_syntax @pq_table_qb_space_dop 4) */
+       SUM(l_extendedprice * l_discount) AS revenue
+FROM lineitem_pq_syntax
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01';
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # TaurusDB table-at-query-block PQ hint syntax does not consume following hints.
+FLUSH STATUS;
+SELECT /*+ QB_NAME(pq_table_qb_with_next_hint) PQ(lineitem_pq_syntax @pq_table_qb_with_next_hint 4) MAX_EXECUTION_TIME(1000000) */
+       SUM(l_extendedprice * l_discount) AS revenue
+FROM lineitem_pq_syntax
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01';
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # TaurusDB table-at-query-block PQ hint syntax uses default DOP.
+FLUSH STATUS;
+SELECT /*+ QB_NAME(pq_table_qb_default) PQ(lineitem_pq_syntax @pq_table_qb_default) */
+       SUM(l_extendedprice * l_discount) AS revenue
+FROM lineitem_pq_syntax
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01';
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # TaurusDB table-at-query-block PQ hint syntax binds the named query block.
+FLUSH STATUS;
+SELECT /*+ PQ(lineitem_pq_syntax @missing_qb, 4) */
+       SUM(l_extendedprice * l_discount) AS revenue
+FROM lineitem_pq_syntax
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01';
+SHOW WARNINGS;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # TaurusDB table-at-query-block PQ hint syntax ignores invalid DOP.
+FLUSH STATUS;
+SELECT /*+ QB_NAME(pq_table_qb_bad_dop) PQ(lineitem_pq_syntax @pq_table_qb_bad_dop, 0) */
+       SUM(l_extendedprice * l_discount) AS revenue
+FROM lineitem_pq_syntax
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01';
+SHOW WARNINGS;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # MariaDB currently parses SET_VAR as an unsupported optimizer hint.
+FLUSH STATUS;
+SELECT /*+ SET_VAR(parallel_cost_threshold=0) */ SUM(l_extendedprice * l_discount) AS revenue
+FROM lineitem_pq_syntax
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01';
+SHOW WARNINGS;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # MariaDB SET STATEMENT is the statement-local PQ sysvar alternative.
+FLUSH STATUS;
+SET STATEMENT force_parallel_execute=ON, parallel_default_dop=4 FOR
+SELECT SUM(l_extendedprice * l_discount) AS revenue
+FROM lineitem_pq_syntax
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01';
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SELECT @@force_parallel_execute AS force_parallel_execute_after_statement;
+
+--echo # MariaDB does not support MySQL/TaurusDB EXPLAIN FORMAT=TREE.
+--error ER_UNKNOWN_EXPLAIN_FORMAT
+EXPLAIN FORMAT=TREE SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS revenue
+FROM lineitem_pq_syntax
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01';
+
+--echo # MariaDB uses ANALYZE SELECT, not MySQL/TaurusDB EXPLAIN ANALYZE.
+--error ER_PARSE_ERROR
+EXPLAIN ANALYZE SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS revenue
+FROM lineitem_pq_syntax
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01';
+
+SET optimizer_switch= @save_optimizer_switch;
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET parallel_cost_threshold= @save_parallel_cost_threshold;
+SET parallel_rows_threshold= @save_parallel_rows_threshold;
+SET parallel_setup_cost= @save_parallel_setup_cost;
+SET parallel_tuple_cost= @save_parallel_tuple_cost;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;
+
+DROP TABLE lineitem_pq_syntax;

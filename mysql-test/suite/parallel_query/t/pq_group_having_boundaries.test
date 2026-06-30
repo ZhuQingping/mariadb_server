@@ -1,0 +1,123 @@
+--source include/have_innodb.inc
+
+--echo #
+--echo # Parallel Query grouped HAVING boundary coverage.
+--echo #
+
+CREATE TABLE lineitem_q1_group (
+  l_orderkey INT NOT NULL,
+  l_linenumber INT NOT NULL,
+  l_shipdate DATE NOT NULL,
+  l_returnflag CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+  l_linestatus CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+  l_quantity DECIMAL(15,2) NOT NULL,
+  l_extendedprice DECIMAL(15,2) NOT NULL,
+  l_discount DECIMAL(15,2) NOT NULL,
+  l_tax DECIMAL(15,2) NOT NULL,
+  l_comment BLOB NOT NULL,
+  PRIMARY KEY (l_orderkey, l_linenumber)
+) ENGINE=InnoDB;
+
+INSERT INTO lineitem_q1_group VALUES
+  (1, 1, '1998-09-01', 'A', 'F', 10.00, 100.00, 0.05, 0.10, 'aa'),
+  (2, 1, '1998-09-02', 'A', 'F', 20.00, 200.00, 0.10, 0.08, 'bbb'),
+  (3, 1, '1998-09-03', 'A', 'F', 30.00, 300.00, 0.02, 0.04, 'cccc'),
+  (4, 1, '1998-08-30', 'N', 'O', 40.00, 400.00, 0.07, 0.05, 'dd'),
+  (5, 1, '1998-08-31', 'N', 'O', 50.00, 500.00, 0.06, 0.03, 'eee'),
+  (6, 1, '1998-07-15', 'R', 'F', 60.00, 600.00, 0.08, 0.07, 'ffff');
+
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_pq_support_features_switch= @@pq_support_features_switch;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_optimizer_switch= @@optimizer_switch;
+
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on';
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+SET pq_support_features_switch= 'simple_aggregate=on,count_distinct=on';
+
+--echo #
+--echo # Grouped HAVING over selected aggregates is evaluated by the leader.
+--echo #
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING count_order > 1
+ORDER BY l_returnflag, l_linestatus;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING l_returnflag = 'A'
+ORDER BY l_returnflag, l_linestatus;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       COUNT(*) AS count_order,
+       SUM(l_quantity) AS sum_qty
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING count_order > 1 AND sum_qty IS NOT NULL AND l_returnflag <> 'R'
+ORDER BY l_returnflag, l_linestatus;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING count_order > 1 OR l_returnflag = 'R'
+ORDER BY l_returnflag, l_linestatus;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # Grouped HAVING can filter all groups before ORDER BY LIMIT on the PQ path.
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       SUM(l_quantity) AS sum_qty,
+       COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING sum_qty > 1000
+ORDER BY l_returnflag DESC, l_linestatus ASC
+LIMIT 1;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING count_order > (SELECT COUNT(*)
+                      FROM lineitem_q1_group
+                      WHERE l_returnflag = 'R')
+ORDER BY l_returnflag, l_linestatus;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+SET optimizer_switch= @save_optimizer_switch;
+SET pq_support_features_switch= @save_pq_support_features_switch;
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;
+
+DROP TABLE lineitem_q1_group;

@@ -25,6 +25,7 @@ materialization	on
 optimize_join_buffer_size	on
 orderby_uses_equalities	on
 outer_join_with_cache	on
+parallel_query	on
 partial_match_rowid_merge	on
 partial_match_table_scan	on
 rowid_filter	on

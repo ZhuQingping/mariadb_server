@@ -1,0 +1,65 @@
+#
+# Parallel Query scalar aggregate edge coverage.
+#
+CREATE TABLE lineitem (
+l_orderkey INT NOT NULL PRIMARY KEY,
+l_shipdate DATE NOT NULL,
+l_quantity INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO lineitem VALUES
+(1, '1979-12-31', 10),
+(2, '1980-01-01', 20),
+(3, '1980-01-02', 30),
+(4, '1981-05-10', 40),
+(5, '1992-07-15', 50),
+(6, '1978-03-20', 60),
+(7, '1980-06-01', 70),
+(8, '1985-09-09', 80);
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_pq_support_features_switch= @@pq_support_features_switch;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_optimizer_switch= @@optimizer_switch;
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on';
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+SET pq_support_features_switch= 'simple_aggregate=on,count_distinct=on,correlated_subquery=on,hash_join_spill_to_disk=on,insert_select=on';
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_quantity) AS sum_quantity_no_where
+FROM lineitem;
+sum_quantity_no_where
+360
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_quantity) AS sum_quantity_or
+FROM lineitem
+WHERE l_quantity < 30 OR l_quantity > 60;
+sum_quantity_or
+180
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_quantity) AS sum_quantity_empty
+FROM lineitem
+WHERE l_shipdate > '2100-01-01';
+sum_quantity_empty
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+SET optimizer_switch= @save_optimizer_switch;
+SET pq_support_features_switch= @save_pq_support_features_switch;
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;
+DROP TABLE lineitem;

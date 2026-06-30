@@ -1,0 +1,52 @@
+SET @start_global_value= @@global.pq_support_features_switch;
+SET @start_value= @@session.pq_support_features_switch;
+SHOW GLOBAL VARIABLES LIKE 'pq_support_features_switch';
+Variable_name	Value
+pq_support_features_switch	simple_aggregate=on,count_distinct=off,correlated_subquery=on,hash_join_spill_to_disk=off,insert_select=off
+SHOW SESSION VARIABLES LIKE 'pq_support_features_switch';
+Variable_name	Value
+pq_support_features_switch	simple_aggregate=on,count_distinct=off,correlated_subquery=on,hash_join_spill_to_disk=off,insert_select=off
+SELECT * FROM information_schema.global_variables
+WHERE variable_name='pq_support_features_switch';
+VARIABLE_NAME	VARIABLE_VALUE
+PQ_SUPPORT_FEATURES_SWITCH	simple_aggregate=on,count_distinct=off,correlated_subquery=on,hash_join_spill_to_disk=off,insert_select=off
+SELECT * FROM information_schema.session_variables
+WHERE variable_name='pq_support_features_switch';
+VARIABLE_NAME	VARIABLE_VALUE
+PQ_SUPPORT_FEATURES_SWITCH	simple_aggregate=on,count_distinct=off,correlated_subquery=on,hash_join_spill_to_disk=off,insert_select=off
+SET @@session.pq_support_features_switch= DEFAULT;
+SELECT @@session.pq_support_features_switch;
+@@session.pq_support_features_switch
+simple_aggregate=on,count_distinct=off,correlated_subquery=on,hash_join_spill_to_disk=off,insert_select=off
+SET @@session.pq_support_features_switch= 'simple_aggregate=on,count_distinct=on';
+SELECT @@session.pq_support_features_switch;
+@@session.pq_support_features_switch
+simple_aggregate=on,count_distinct=on,correlated_subquery=on,hash_join_spill_to_disk=off,insert_select=off
+SET @@session.pq_support_features_switch= 'simple_aggregate=off';
+SELECT @@session.pq_support_features_switch;
+@@session.pq_support_features_switch
+simple_aggregate=off,count_distinct=on,correlated_subquery=on,hash_join_spill_to_disk=off,insert_select=off
+SET @@global.pq_support_features_switch= 'simple_aggregate=on,count_distinct=off';
+SELECT @@global.pq_support_features_switch;
+@@global.pq_support_features_switch
+simple_aggregate=on,count_distinct=off,correlated_subquery=on,hash_join_spill_to_disk=off,insert_select=off
+SET @@session.pq_support_features_switch= 'default';
+SELECT @@session.pq_support_features_switch;
+@@session.pq_support_features_switch
+simple_aggregate=on,count_distinct=off,correlated_subquery=on,hash_join_spill_to_disk=off,insert_select=off
+SET @@session.pq_support_features_switch= 1.5;
+ERROR 42000: Incorrect argument type to variable 'pq_support_features_switch'
+SET @@session.pq_support_features_switch= 'simple_aggregate';
+ERROR 42000: Variable 'pq_support_features_switch' can't be set to the value of 'simple_aggregate'
+SET @@session.pq_support_features_switch= 'unknown_feature=on';
+ERROR 42000: Variable 'pq_support_features_switch' can't be set to the value of 'unknown_feature=on'
+SET @@local.pq_support_features_switch= 'simple_aggregate=on,count_distinct=on';
+SELECT @@local.pq_support_features_switch = @@session.pq_support_features_switch;
+@@local.pq_support_features_switch = @@session.pq_support_features_switch
+1
+SET pq_support_features_switch= 'simple_aggregate=on,count_distinct=off';
+SELECT @@pq_support_features_switch;
+@@pq_support_features_switch
+simple_aggregate=on,count_distinct=off,correlated_subquery=on,hash_join_spill_to_disk=off,insert_select=off
+SET @@global.pq_support_features_switch= @start_global_value;
+SET @@session.pq_support_features_switch= @start_value;

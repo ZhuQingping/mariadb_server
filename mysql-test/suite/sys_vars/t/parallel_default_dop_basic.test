@@ -1,0 +1,49 @@
+# ulong global/session
+
+SET @start_global_value= @@global.parallel_default_dop;
+SET @start_value= @@session.parallel_default_dop;
+
+#
+# exists as global and session
+#
+SHOW GLOBAL VARIABLES LIKE 'parallel_default_dop';
+SHOW SESSION VARIABLES LIKE 'parallel_default_dop';
+SELECT * FROM information_schema.global_variables
+WHERE variable_name='parallel_default_dop';
+SELECT * FROM information_schema.session_variables
+WHERE variable_name='parallel_default_dop';
+
+#
+# default and writable values
+#
+SET @@session.parallel_default_dop= DEFAULT;
+SELECT @@session.parallel_default_dop;
+SET @@session.parallel_default_dop= 8;
+SELECT @@session.parallel_default_dop;
+SET @@global.parallel_default_dop= 16;
+SELECT @@global.parallel_default_dop;
+
+#
+# min value
+#
+SET @@session.parallel_default_dop= 0;
+SELECT @@session.parallel_default_dop;
+
+#
+# incorrect assignments
+#
+--error ER_WRONG_TYPE_FOR_VAR
+SET @@session.parallel_default_dop= 1.1;
+--error ER_WRONG_TYPE_FOR_VAR
+SET @@session.parallel_default_dop= 'invalid';
+
+#
+# local/session aliases
+#
+SET @@local.parallel_default_dop= 4;
+SELECT @@local.parallel_default_dop = @@session.parallel_default_dop;
+SET parallel_default_dop= 6;
+SELECT @@parallel_default_dop;
+
+SET @@global.parallel_default_dop= @start_global_value;
+SET @@session.parallel_default_dop= @start_value;

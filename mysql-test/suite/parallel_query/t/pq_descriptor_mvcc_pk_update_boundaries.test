@@ -1,0 +1,410 @@
+--source include/have_innodb.inc
+--source include/have_sequence.inc
+--source include/have_innodb_16k.inc
+--source include/have_debug_sync.inc
+
+--echo #
+--echo # Parallel Query descriptor MVCC primary-key movement boundaries.
+--echo #
+
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_optimizer_trace= @@optimizer_trace;
+SET @save_optimizer_switch= @@optimizer_switch;
+SET @save_transaction_isolation= @@transaction_isolation;
+
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on';
+SET optimizer_trace= 1;
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 64;
+
+CREATE TABLE pq_descriptor_mvcc_pk_update (
+  id INT NOT NULL,
+  payload VARBINARY(768) NOT NULL,
+  PRIMARY KEY (id)
+) ENGINE=InnoDB STATS_PERSISTENT=1;
+
+INSERT INTO pq_descriptor_mvcc_pk_update
+SELECT CAST(seq AS SIGNED) * 10 - 163840,
+       REPEAT(CHAR(65 + MOD(seq, 26)), 768)
+FROM seq_1_to_32768;
+
+connect (pq_descriptor_mvcc_reader, localhost, root,,test);
+connection pq_descriptor_mvcc_reader;
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 64;
+SET optimizer_switch= 'parallel_query=on';
+SET optimizer_trace= 1;
+
+--echo # REPEATABLE READ descriptor workers keep the leader snapshot across PK movement.
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SET debug_sync= 'after_pq_create_snapshot SIGNAL pq_descriptor_mvcc_rr_snapshot WAIT_FOR pq_descriptor_mvcc_rr_release';
+--send SELECT /*+ PQ(64) */ COUNT(*) AS descriptor_mvcc_rr_count FROM pq_descriptor_mvcc_pk_update WHERE id > -163840
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_descriptor_mvcc_rr_snapshot TIMEOUT 30';
+UPDATE pq_descriptor_mvcc_pk_update
+SET id= -200000
+WHERE id= -163830;
+DELETE FROM pq_descriptor_mvcc_pk_update
+WHERE id= -163820;
+INSERT INTO pq_descriptor_mvcc_pk_update
+VALUES (-163835, REPEAT('Z', 768));
+SET debug_sync= 'now SIGNAL pq_descriptor_mvcc_rr_release';
+
+connection pq_descriptor_mvcc_reader;
+--reap
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].btree_descriptor_split_used') AS rr_btree_descriptor_split_used
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+
+connection default;
+SELECT COUNT(*) AS descriptor_mvcc_rr_current_count
+FROM pq_descriptor_mvcc_pk_update
+WHERE id > -163840;
+
+TRUNCATE TABLE pq_descriptor_mvcc_pk_update;
+INSERT INTO pq_descriptor_mvcc_pk_update
+SELECT CAST(seq AS SIGNED) * 10 - 163840,
+       REPEAT(CHAR(65 + MOD(seq, 26)), 768)
+FROM seq_1_to_32768;
+
+connection pq_descriptor_mvcc_reader;
+--echo # REPEATABLE READ descriptor projection keeps row identity across PK movement.
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SET debug_sync= 'after_pq_create_snapshot SIGNAL pq_descriptor_mvcc_rr_projection_snapshot WAIT_FOR pq_descriptor_mvcc_rr_projection_release';
+--send SELECT /*+ PQ(64) */ id AS descriptor_mvcc_rr_snapshot_id FROM pq_descriptor_mvcc_pk_update WHERE id >= -163835 AND id <= -163820 ORDER BY id
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_descriptor_mvcc_rr_projection_snapshot TIMEOUT 30';
+UPDATE pq_descriptor_mvcc_pk_update
+SET id= -200000
+WHERE id= -163830;
+DELETE FROM pq_descriptor_mvcc_pk_update
+WHERE id= -163820;
+INSERT INTO pq_descriptor_mvcc_pk_update
+VALUES (-163835, REPEAT('Z', 768));
+SET debug_sync= 'now SIGNAL pq_descriptor_mvcc_rr_projection_release';
+
+connection pq_descriptor_mvcc_reader;
+--reap
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].btree_descriptor_split_used') AS rr_projection_btree_descriptor_split_used
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].btree_descriptor_execution_used') AS rr_projection_btree_descriptor_execution_used
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+
+connection default;
+SELECT id AS descriptor_mvcc_rr_current_id
+FROM pq_descriptor_mvcc_pk_update
+WHERE id >= -163835 AND id <= -163820
+ORDER BY id;
+
+TRUNCATE TABLE pq_descriptor_mvcc_pk_update;
+INSERT INTO pq_descriptor_mvcc_pk_update
+SELECT CAST(seq AS SIGNED) * 10 - 163840,
+       REPEAT(CHAR(65 + MOD(seq, 26)), 768)
+FROM seq_1_to_32768;
+
+connection pq_descriptor_mvcc_reader;
+--echo # READ COMMITTED descriptor workers keep the leader statement snapshot across PK movement.
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SET debug_sync= 'after_pq_create_snapshot SIGNAL pq_descriptor_mvcc_rc_snapshot WAIT_FOR pq_descriptor_mvcc_rc_release';
+--send SELECT /*+ PQ(64) */ COUNT(*) AS descriptor_mvcc_rc_count FROM pq_descriptor_mvcc_pk_update WHERE id > -163840
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_descriptor_mvcc_rc_snapshot TIMEOUT 30';
+UPDATE pq_descriptor_mvcc_pk_update
+SET id= -200000
+WHERE id= -163830;
+DELETE FROM pq_descriptor_mvcc_pk_update
+WHERE id= -163820;
+INSERT INTO pq_descriptor_mvcc_pk_update
+VALUES (-163835, REPEAT('Z', 768));
+SET debug_sync= 'now SIGNAL pq_descriptor_mvcc_rc_release';
+
+connection pq_descriptor_mvcc_reader;
+--reap
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].btree_descriptor_split_used') AS rc_btree_descriptor_split_used
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+disconnect pq_descriptor_mvcc_reader;
+
+connection default;
+SELECT COUNT(*) AS descriptor_mvcc_rc_current_count
+FROM pq_descriptor_mvcc_pk_update
+WHERE id > -163840;
+
+TRUNCATE TABLE pq_descriptor_mvcc_pk_update;
+INSERT INTO pq_descriptor_mvcc_pk_update
+SELECT CAST(seq AS SIGNED) * 10 - 163840,
+       REPEAT(CHAR(65 + MOD(seq, 26)), 768)
+FROM seq_1_to_32768;
+
+connect (pq_descriptor_mvcc_projection_reader, localhost, root,,test);
+connection pq_descriptor_mvcc_projection_reader;
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 64;
+SET optimizer_switch= 'parallel_query=on';
+SET optimizer_trace= 1;
+
+--echo # READ COMMITTED descriptor projection keeps statement row identity across PK movement.
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SET debug_sync= 'after_pq_create_snapshot SIGNAL pq_descriptor_mvcc_rc_projection_snapshot WAIT_FOR pq_descriptor_mvcc_rc_projection_release';
+--send SELECT /*+ PQ(64) */ id AS descriptor_mvcc_rc_snapshot_id FROM pq_descriptor_mvcc_pk_update WHERE id >= -163835 AND id <= -163820 ORDER BY id
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_descriptor_mvcc_rc_projection_snapshot TIMEOUT 30';
+UPDATE pq_descriptor_mvcc_pk_update
+SET id= -200000
+WHERE id= -163830;
+DELETE FROM pq_descriptor_mvcc_pk_update
+WHERE id= -163820;
+INSERT INTO pq_descriptor_mvcc_pk_update
+VALUES (-163835, REPEAT('Z', 768));
+SET debug_sync= 'now SIGNAL pq_descriptor_mvcc_rc_projection_release';
+
+connection pq_descriptor_mvcc_projection_reader;
+--reap
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].btree_descriptor_split_used') AS rc_projection_btree_descriptor_split_used
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].btree_descriptor_execution_used') AS rc_projection_btree_descriptor_execution_used
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+disconnect pq_descriptor_mvcc_projection_reader;
+
+connection default;
+SELECT id AS descriptor_mvcc_rc_current_id
+FROM pq_descriptor_mvcc_pk_update
+WHERE id >= -163835 AND id <= -163820
+ORDER BY id;
+
+CREATE TABLE pq_descriptor_mvcc_ubigint_pk_update (
+  id BIGINT UNSIGNED NOT NULL,
+  payload VARBINARY(768) NOT NULL,
+  PRIMARY KEY (id)
+) ENGINE=InnoDB STATS_PERSISTENT=1;
+
+INSERT INTO pq_descriptor_mvcc_ubigint_pk_update
+SELECT 9223372036854775808 + seq * 10,
+       REPEAT(CHAR(65 + MOD(seq, 26)), 768)
+FROM seq_1_to_32768;
+
+connect (pq_descriptor_mvcc_ubigint_reader, localhost, root,,test);
+connection pq_descriptor_mvcc_ubigint_reader;
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 64;
+SET optimizer_switch= 'parallel_query=on';
+SET optimizer_trace= 1;
+
+--echo # REPEATABLE READ unsigned descriptor workers keep the leader snapshot across high-domain PK movement.
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SET debug_sync= 'after_pq_create_snapshot SIGNAL pq_descriptor_mvcc_ubigint_rr_snapshot WAIT_FOR pq_descriptor_mvcc_ubigint_rr_release';
+--send SELECT /*+ PQ(64) */ COUNT(*) AS descriptor_mvcc_ubigint_rr_count FROM pq_descriptor_mvcc_ubigint_pk_update WHERE id > 9223372036854775808
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_descriptor_mvcc_ubigint_rr_snapshot TIMEOUT 30';
+UPDATE pq_descriptor_mvcc_ubigint_pk_update
+SET id= 9223372036854775808
+WHERE id= 9223372036854775818;
+DELETE FROM pq_descriptor_mvcc_ubigint_pk_update
+WHERE id= 9223372036854775828;
+INSERT INTO pq_descriptor_mvcc_ubigint_pk_update
+VALUES (9223372036854775813, REPEAT('Y', 768));
+SET debug_sync= 'now SIGNAL pq_descriptor_mvcc_ubigint_rr_release';
+
+connection pq_descriptor_mvcc_ubigint_reader;
+--reap
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].btree_descriptor_split_used') AS ubigint_rr_btree_descriptor_split_used
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].btree_descriptor_execution_used') AS ubigint_rr_btree_descriptor_execution_used
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+
+connection default;
+SELECT COUNT(*) AS descriptor_mvcc_ubigint_rr_current_count
+FROM pq_descriptor_mvcc_ubigint_pk_update
+WHERE id > 9223372036854775808;
+
+TRUNCATE TABLE pq_descriptor_mvcc_ubigint_pk_update;
+INSERT INTO pq_descriptor_mvcc_ubigint_pk_update
+SELECT 9223372036854775808 + seq * 10,
+       REPEAT(CHAR(65 + MOD(seq, 26)), 768)
+FROM seq_1_to_32768;
+
+connection pq_descriptor_mvcc_ubigint_reader;
+--echo # READ COMMITTED unsigned descriptor workers keep the leader statement snapshot across high-domain PK movement.
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SET debug_sync= 'after_pq_create_snapshot SIGNAL pq_descriptor_mvcc_ubigint_rc_snapshot WAIT_FOR pq_descriptor_mvcc_ubigint_rc_release';
+--send SELECT /*+ PQ(64) */ COUNT(*) AS descriptor_mvcc_ubigint_rc_count FROM pq_descriptor_mvcc_ubigint_pk_update WHERE id > 9223372036854775808
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_descriptor_mvcc_ubigint_rc_snapshot TIMEOUT 30';
+UPDATE pq_descriptor_mvcc_ubigint_pk_update
+SET id= 9223372036854775808
+WHERE id= 9223372036854775818;
+DELETE FROM pq_descriptor_mvcc_ubigint_pk_update
+WHERE id= 9223372036854775828;
+INSERT INTO pq_descriptor_mvcc_ubigint_pk_update
+VALUES (9223372036854775813, REPEAT('Y', 768));
+SET debug_sync= 'now SIGNAL pq_descriptor_mvcc_ubigint_rc_release';
+
+connection pq_descriptor_mvcc_ubigint_reader;
+--reap
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].btree_descriptor_split_used') AS ubigint_rc_btree_descriptor_split_used
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].btree_descriptor_execution_used') AS ubigint_rc_btree_descriptor_execution_used
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+disconnect pq_descriptor_mvcc_ubigint_reader;
+
+connection default;
+SELECT COUNT(*) AS descriptor_mvcc_ubigint_rc_current_count
+FROM pq_descriptor_mvcc_ubigint_pk_update
+WHERE id > 9223372036854775808;
+
+TRUNCATE TABLE pq_descriptor_mvcc_ubigint_pk_update;
+INSERT INTO pq_descriptor_mvcc_ubigint_pk_update
+SELECT 9223372036854775808 + seq * 10,
+       REPEAT(CHAR(65 + MOD(seq, 26)), 768)
+FROM seq_1_to_32768;
+
+connect (pq_descriptor_mvcc_ubigint_projection_reader, localhost, root,,test);
+connection pq_descriptor_mvcc_ubigint_projection_reader;
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 64;
+SET optimizer_switch= 'parallel_query=on';
+SET optimizer_trace= 1;
+
+--echo # REPEATABLE READ unsigned descriptor projection keeps row identity across high-domain PK movement.
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SET debug_sync= 'after_pq_create_snapshot SIGNAL pq_descriptor_mvcc_ubigint_rr_projection_snapshot WAIT_FOR pq_descriptor_mvcc_ubigint_rr_projection_release';
+--send SELECT /*+ PQ(64) */ id AS descriptor_mvcc_ubigint_rr_snapshot_id FROM pq_descriptor_mvcc_ubigint_pk_update WHERE id >= 9223372036854775813 AND id <= 9223372036854775828 ORDER BY id
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_descriptor_mvcc_ubigint_rr_projection_snapshot TIMEOUT 30';
+UPDATE pq_descriptor_mvcc_ubigint_pk_update
+SET id= 9223372036854775808
+WHERE id= 9223372036854775818;
+DELETE FROM pq_descriptor_mvcc_ubigint_pk_update
+WHERE id= 9223372036854775828;
+INSERT INTO pq_descriptor_mvcc_ubigint_pk_update
+VALUES (9223372036854775813, REPEAT('Y', 768));
+SET debug_sync= 'now SIGNAL pq_descriptor_mvcc_ubigint_rr_projection_release';
+
+connection pq_descriptor_mvcc_ubigint_projection_reader;
+--reap
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].btree_descriptor_split_used') AS ubigint_rr_projection_btree_descriptor_split_used
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].btree_descriptor_execution_used') AS ubigint_rr_projection_btree_descriptor_execution_used
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+
+connection default;
+SELECT id AS descriptor_mvcc_ubigint_rr_current_id
+FROM pq_descriptor_mvcc_ubigint_pk_update
+WHERE id >= 9223372036854775813 AND id <= 9223372036854775828
+ORDER BY id;
+
+TRUNCATE TABLE pq_descriptor_mvcc_ubigint_pk_update;
+INSERT INTO pq_descriptor_mvcc_ubigint_pk_update
+SELECT 9223372036854775808 + seq * 10,
+       REPEAT(CHAR(65 + MOD(seq, 26)), 768)
+FROM seq_1_to_32768;
+
+connection pq_descriptor_mvcc_ubigint_projection_reader;
+--echo # READ COMMITTED unsigned descriptor projection keeps statement row identity across high-domain PK movement.
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SET debug_sync= 'after_pq_create_snapshot SIGNAL pq_descriptor_mvcc_ubigint_rc_projection_snapshot WAIT_FOR pq_descriptor_mvcc_ubigint_rc_projection_release';
+--send SELECT /*+ PQ(64) */ id AS descriptor_mvcc_ubigint_rc_snapshot_id FROM pq_descriptor_mvcc_ubigint_pk_update WHERE id >= 9223372036854775813 AND id <= 9223372036854775828 ORDER BY id
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_descriptor_mvcc_ubigint_rc_projection_snapshot TIMEOUT 30';
+UPDATE pq_descriptor_mvcc_ubigint_pk_update
+SET id= 9223372036854775808
+WHERE id= 9223372036854775818;
+DELETE FROM pq_descriptor_mvcc_ubigint_pk_update
+WHERE id= 9223372036854775828;
+INSERT INTO pq_descriptor_mvcc_ubigint_pk_update
+VALUES (9223372036854775813, REPEAT('Y', 768));
+SET debug_sync= 'now SIGNAL pq_descriptor_mvcc_ubigint_rc_projection_release';
+
+connection pq_descriptor_mvcc_ubigint_projection_reader;
+--reap
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].btree_descriptor_split_used') AS ubigint_rc_projection_btree_descriptor_split_used
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].btree_descriptor_execution_used') AS ubigint_rc_projection_btree_descriptor_execution_used
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+disconnect pq_descriptor_mvcc_ubigint_projection_reader;
+
+connection default;
+SELECT id AS descriptor_mvcc_ubigint_rc_current_id
+FROM pq_descriptor_mvcc_ubigint_pk_update
+WHERE id >= 9223372036854775813 AND id <= 9223372036854775828
+ORDER BY id;
+
+SET debug_sync= 'RESET';
+SET SESSION transaction_isolation= @save_transaction_isolation;
+SET optimizer_trace= @save_optimizer_trace;
+SET optimizer_switch= @save_optimizer_switch;
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;
+
+DROP TABLE pq_descriptor_mvcc_ubigint_pk_update;
+DROP TABLE pq_descriptor_mvcc_pk_update;

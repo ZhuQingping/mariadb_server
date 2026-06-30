@@ -1,0 +1,51 @@
+# ulong global/session
+
+SET @start_global_value= @@global.parallel_queue_timeout;
+SET @start_value= @@session.parallel_queue_timeout;
+
+#
+# exists as global and session
+#
+SHOW GLOBAL VARIABLES LIKE 'parallel_queue_timeout';
+SHOW SESSION VARIABLES LIKE 'parallel_queue_timeout';
+SELECT * FROM information_schema.global_variables
+WHERE variable_name='parallel_queue_timeout';
+SELECT * FROM information_schema.session_variables
+WHERE variable_name='parallel_queue_timeout';
+
+#
+# default and writable values
+#
+SET @@session.parallel_queue_timeout= DEFAULT;
+SELECT @@session.parallel_queue_timeout;
+SET @@session.parallel_queue_timeout= 1;
+SELECT @@session.parallel_queue_timeout;
+SET @@session.parallel_queue_timeout= 5000;
+SELECT @@session.parallel_queue_timeout;
+SET @@global.parallel_queue_timeout= 1000;
+SELECT @@global.parallel_queue_timeout;
+
+#
+# min value
+#
+SET @@session.parallel_queue_timeout= 0;
+SELECT @@session.parallel_queue_timeout;
+
+#
+# incorrect assignments
+#
+--error ER_WRONG_TYPE_FOR_VAR
+SET @@session.parallel_queue_timeout= 1.5;
+--error ER_WRONG_TYPE_FOR_VAR
+SET @@session.parallel_queue_timeout= 'invalid';
+
+#
+# local/session aliases
+#
+SET @@local.parallel_queue_timeout= 4;
+SELECT @@local.parallel_queue_timeout = @@session.parallel_queue_timeout;
+SET parallel_queue_timeout= 6;
+SELECT @@parallel_queue_timeout;
+
+SET @@global.parallel_queue_timeout= @start_global_value;
+SET @@session.parallel_queue_timeout= @start_value;

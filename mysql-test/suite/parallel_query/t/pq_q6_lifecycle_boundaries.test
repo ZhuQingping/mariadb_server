@@ -1,0 +1,224 @@
+--source include/have_innodb.inc
+--source include/have_debug_sync.inc
+
+--echo #
+--echo # Q6 lifecycle boundaries cover kill, worker launch failure, MDL error,
+--echo # and admission error paths for the scalar aggregate PQ worker path.
+--echo #
+
+SET @save_parallel_fail_retry= @@parallel_fail_retry;
+SET @save_parallel_graceful_fallback= @@parallel_graceful_fallback;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_debug_dbug= @@debug_dbug;
+
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+
+CREATE TABLE lineitem_q6 (
+  l_orderkey INT NOT NULL,
+  l_linenumber INT NOT NULL,
+  l_shipdate DATE NOT NULL,
+  l_quantity DECIMAL(15,2) NOT NULL,
+  l_extendedprice DECIMAL(15,2) NOT NULL,
+  l_discount DECIMAL(15,2) NOT NULL,
+  PRIMARY KEY (l_orderkey, l_linenumber),
+  KEY idx_q6_shipdate (l_shipdate)
+) ENGINE=InnoDB;
+
+INSERT INTO lineitem_q6 VALUES
+  (1, 1, '1993-12-31', 10.00, 100.00, 0.06),
+  (2, 1, '1994-01-01', 12.00, 200.00, 0.05),
+  (3, 1, '1994-06-15', 23.00, 300.00, 0.06),
+  (3, 2, '1994-06-16', 18.00, 1000.00, 0.06),
+  (4, 1, '1994-12-31', 24.00, 400.00, 0.07),
+  (5, 1, '1995-01-01', 20.00, 500.00, 0.06),
+  (6, 1, '1994-03-20', 20.00, 600.00, 0.04),
+  (7, 1, '1994-08-08', 21.00, 700.00, 0.08),
+  (8, 1, '1994-09-09', 22.00, 800.00, 0.07);
+
+connect (pq_q6_kill_leader, localhost, root,,test);
+--let $pq_q6_kill_leader_id= `SELECT CONNECTION_ID()`
+SET debug_sync= 'after_pq_workers_launched SIGNAL pq_q6_workers_launched WAIT_FOR pq_q6_kill_release';
+--send SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_killed_revenue FROM lineitem_q6 WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01' AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 24
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_q6_workers_launched TIMEOUT 30';
+--disable_query_log
+--eval KILL QUERY $pq_q6_kill_leader_id
+--enable_query_log
+SET debug_sync= 'now SIGNAL pq_q6_kill_release';
+
+connection pq_q6_kill_leader;
+--error ER_QUERY_INTERRUPTED
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+disconnect pq_q6_kill_leader;
+
+connection default;
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+SET debug_sync= 'RESET';
+
+connect (pq_q6_ready_kill_leader, localhost, root,,test);
+--let $pq_q6_ready_kill_leader_id= `SELECT CONNECTION_ID()`
+SET debug_sync= 'after_pq_materialized_result_ready SIGNAL pq_q6_ready WAIT_FOR pq_q6_ready_release';
+--send SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_ready_killed_revenue FROM lineitem_q6 WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01' AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 24
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_q6_ready TIMEOUT 30';
+--disable_query_log
+--eval KILL QUERY $pq_q6_ready_kill_leader_id
+--enable_query_log
+SET debug_sync= 'now SIGNAL pq_q6_ready_release';
+
+connection pq_q6_ready_kill_leader;
+--error ER_QUERY_INTERRUPTED
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+disconnect pq_q6_ready_kill_leader;
+
+connection default;
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+SET debug_sync= 'RESET';
+--echo # Q6 scalar aggregate does not fall back after partial worker thread launch failure.
+SET SESSION debug_dbug='d,pq_fail_worker_create_after_first';
+FLUSH STATUS;
+--error ER_CANT_CREATE_THREAD
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_partial_launch_failure_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 24;
+SET SESSION debug_dbug= @save_debug_dbug;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+
+--echo # Q6 worker THD initialization failures cancel sibling workers.
+SET SESSION debug_dbug='d,pq_fail_worker_thd_init';
+FLUSH STATUS;
+--error ER_UNKNOWN_ERROR
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_worker_thd_failure_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 24;
+SET SESSION debug_dbug= @save_debug_dbug;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+
+--echo # Q6 scalar aggregate mid-scan worker errors cancel sibling workers.
+SET SESSION debug_dbug='d,pq_fail_worker_mid_scan';
+FLUSH STATUS;
+--error ER_UNKNOWN_ERROR
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_mid_scan_failure_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 24;
+SET SESSION debug_dbug= @save_debug_dbug;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+
+--echo # Q6 scalar aggregate last-worker mid-scan errors also release resources.
+SET SESSION debug_dbug='d,pq_fail_last_worker_mid_scan';
+FLUSH STATUS;
+--error ER_UNKNOWN_ERROR
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_last_worker_mid_scan_failure_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 24;
+SET SESSION debug_dbug= @save_debug_dbug;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+
+--echo #
+--echo # Q6 worker open failures preserve non-KILL diagnostics.
+--echo #
+
+connect (pq_q6_mdl_leader, localhost, root,,test);
+connect (pq_q6_mdl_ddl, localhost, root,,test);
+
+connection pq_q6_mdl_leader;
+SET debug_sync= 'after_pq_create_snapshot SIGNAL pq_q6_mdl_snapshot WAIT_FOR pq_q6_mdl_release';
+--send SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_mdl_worker_error_revenue FROM lineitem_q6 WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01' AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 24
+
+connection pq_q6_mdl_ddl;
+SET debug_sync= 'now WAIT_FOR pq_q6_mdl_snapshot TIMEOUT 30';
+--send ALTER TABLE lineitem_q6 ADD COLUMN pq_q6_mdl_guard INT DEFAULT 0
+
+connection default;
+let $wait_condition= SELECT COUNT(*) = 1 FROM information_schema.processlist WHERE state = 'Waiting for table metadata lock' AND info LIKE 'ALTER TABLE lineitem_q6 ADD COLUMN pq_q6_mdl_guard%';
+--source include/wait_condition.inc
+SET debug_sync= 'now SIGNAL pq_q6_mdl_release';
+
+connection pq_q6_mdl_leader;
+--error ER_LOCK_WAIT_TIMEOUT
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+SET debug_sync= 'RESET';
+disconnect pq_q6_mdl_leader;
+
+connection pq_q6_mdl_ddl;
+--reap
+ALTER TABLE lineitem_q6 DROP COLUMN pq_q6_mdl_guard;
+disconnect pq_q6_mdl_ddl;
+
+connection default;
+SET debug_sync= 'RESET';
+--echo # Q6 explicit PQ errors on setup/admission failure when retry/fallback is disabled.
+SET GLOBAL parallel_memory_limit= 0;
+
+SET parallel_fail_retry= OFF;
+--disable_abort_on_error ONCE
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_no_fail_retry_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 24;
+--let $q6_no_fail_retry_errno= $mysql_errno
+SET parallel_fail_retry= ON;
+SET GLOBAL parallel_memory_limit= 104857600;
+--let $assert_text= Q6 fail-retry disabled admission failure should return ER_UNKNOWN_ERROR
+--let $assert_cond= $q6_no_fail_retry_errno = 1105
+--source include/assert.inc
+
+SET GLOBAL parallel_memory_limit= 0;
+SET parallel_graceful_fallback= OFF;
+--disable_abort_on_error ONCE
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_no_graceful_fallback_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 24;
+--let $q6_no_graceful_fallback_errno= $mysql_errno
+SET parallel_graceful_fallback= ON;
+SET GLOBAL parallel_memory_limit= 104857600;
+--let $assert_text= Q6 graceful-fallback disabled admission failure should return ER_UNKNOWN_ERROR
+--let $assert_cond= $q6_no_graceful_fallback_errno = 1105
+--source include/assert.inc
+
+SET SESSION debug_dbug= @save_debug_dbug;
+SET parallel_fail_retry= @save_parallel_fail_retry;
+SET parallel_graceful_fallback= @save_parallel_graceful_fallback;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET debug_sync= 'RESET';
+
+DROP TABLE lineitem_q6;

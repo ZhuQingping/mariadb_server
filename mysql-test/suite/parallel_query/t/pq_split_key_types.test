@@ -1,0 +1,439 @@
+--source include/have_innodb.inc
+
+--echo #
+--echo # Parallel Query split-key type coverage.
+--echo #
+
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_pq_support_features_switch= @@pq_support_features_switch;
+SET @save_optimizer_trace= @@optimizer_trace;
+SET @save_optimizer_switch= @@optimizer_switch;
+
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on';
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+SET pq_support_features_switch= 'simple_aggregate=on,count_distinct=on';
+SET optimizer_trace= 1;
+
+CREATE TABLE lineitem_no_pk (
+  l_orderkey INT NOT NULL,
+  l_shipdate DATE NOT NULL,
+  l_quantity INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO lineitem_no_pk VALUES
+  (1, '1980-01-02', 10),
+  (2, '1981-01-02', 20);
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS no_pk_trace_count
+FROM lineitem_no_pk
+WHERE l_shipdate > '1980-01-01';
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+DROP TABLE lineitem_no_pk;
+
+CREATE TABLE lineitem_varchar_pk (
+  l_orderkey VARCHAR(10) NOT NULL PRIMARY KEY,
+  l_shipdate DATE NOT NULL,
+  l_quantity INT NOT NULL,
+  KEY idx_varchar_shipdate (l_shipdate)
+) ENGINE=InnoDB;
+INSERT INTO lineitem_varchar_pk VALUES
+  ('a1', '1980-01-02', 10),
+  ('a2', '1981-01-02', 20);
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS varchar_pk_trace_count
+FROM lineitem_varchar_pk
+WHERE l_shipdate > '1980-01-01';
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS varchar_pk_secondary_trace_count
+FROM lineitem_varchar_pk FORCE INDEX (idx_varchar_shipdate)
+WHERE l_shipdate > '1980-01-01';
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+DROP TABLE lineitem_varchar_pk;
+
+CREATE TABLE lineitem_timestamp_pk (
+  l_shipts TIMESTAMP NOT NULL PRIMARY KEY,
+  l_orderkey INT NOT NULL,
+  l_quantity INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO lineitem_timestamp_pk VALUES
+  ('1980-01-02 00:00:00', 1, 10),
+  ('1981-01-02 12:30:00', 2, 20);
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS timestamp_pk_trace_count
+FROM lineitem_timestamp_pk;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+DROP TABLE lineitem_timestamp_pk;
+
+CREATE TABLE lineitem_timestamp6_pk (
+  l_shipts TIMESTAMP(6) NOT NULL PRIMARY KEY,
+  l_orderkey INT NOT NULL,
+  l_quantity INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO lineitem_timestamp6_pk VALUES
+  ('1980-01-02 00:00:00.000000', 1, 10),
+  ('1981-01-02 12:30:00.123456', 2, 20);
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS timestamp6_pk_trace_count
+FROM lineitem_timestamp6_pk;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+DROP TABLE lineitem_timestamp6_pk;
+
+CREATE TABLE lineitem_date_pk (
+  l_shipdate DATE NOT NULL PRIMARY KEY,
+  l_orderkey INT NOT NULL,
+  l_quantity DECIMAL(15,2) NOT NULL,
+  l_extendedprice DECIMAL(15,2) NOT NULL,
+  l_discount DECIMAL(15,2) NOT NULL,
+  l_tax DECIMAL(15,2) NOT NULL,
+  l_returnflag CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+  l_linestatus CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO lineitem_date_pk VALUES
+  ('1980-01-02', 1, 10.00, 100.00, 0.05, 0.01, 'N', 'O'),
+  ('1981-01-02', 2, 20.00, 200.00, 0.06, 0.02, 'N', 'O'),
+  ('1985-09-09', 3, 30.00, 300.00, 0.07, 0.03, 'R', 'F'),
+  ('1992-07-15', 4, 40.00, 400.00, 0.08, 0.04, 'R', 'F');
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS date_pk_count
+FROM lineitem_date_pk
+WHERE l_shipdate > '1980-01-01';
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_quantity) AS date_pk_sum
+FROM lineitem_date_pk
+WHERE l_shipdate > '1980-01-01';
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_shipdate, l_orderkey, l_quantity
+FROM lineitem_date_pk
+WHERE l_shipdate > '1980-01-01'
+ORDER BY l_shipdate
+LIMIT 3;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_quantity, COUNT(*) AS date_pk_group_count
+FROM lineitem_date_pk
+WHERE l_shipdate > '1980-01-01'
+GROUP BY l_quantity
+ORDER BY l_quantity;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ SUM(l_extendedprice * l_discount) AS date_pk_q6_serial_revenue
+FROM lineitem_date_pk
+WHERE l_shipdate >= DATE '1980-01-01'
+  AND l_shipdate < DATE '1990-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 35;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS date_pk_q6_revenue
+FROM lineitem_date_pk
+WHERE l_shipdate >= DATE '1980-01-01'
+  AND l_shipdate < DATE '1990-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 35;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+--let $date_pk_q6_serial= `SELECT /*+ NO_PQ */ SUM(l_extendedprice * l_discount) FROM lineitem_date_pk WHERE l_shipdate >= DATE '1980-01-01' AND l_shipdate < DATE '1990-01-01' AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 35`
+--let $date_pk_q6_pq= `SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) FROM lineitem_date_pk WHERE l_shipdate >= DATE '1980-01-01' AND l_shipdate < DATE '1990-01-01' AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 35`
+--let $assert_text= DATE split-key Q6 serial and PQ results must match
+--let $assert_cond= $date_pk_q6_serial <=> $date_pk_q6_pq
+--source include/assert.inc
+
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ l_returnflag, l_linestatus,
+       SUM(l_quantity) AS sum_qty,
+       SUM(l_extendedprice) AS sum_base_price,
+       SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price,
+       SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,
+       AVG(l_quantity) AS avg_qty,
+       AVG(l_extendedprice) AS avg_price,
+       AVG(l_discount) AS avg_disc,
+       COUNT(*) AS count_order
+FROM lineitem_date_pk
+WHERE l_shipdate <= DATE '1992-07-15'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       SUM(l_quantity) AS sum_qty,
+       SUM(l_extendedprice) AS sum_base_price,
+       SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price,
+       SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,
+       AVG(l_quantity) AS avg_qty,
+       AVG(l_extendedprice) AS avg_price,
+       AVG(l_discount) AS avg_disc,
+       COUNT(*) AS count_order
+FROM lineitem_date_pk
+WHERE l_shipdate <= DATE '1992-07-15'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+--let $date_pk_q1_serial= `SELECT GROUP_CONCAT(CONCAT_WS('|', l_returnflag, l_linestatus, sum_qty, sum_base_price, sum_disc_price, sum_charge, avg_qty, avg_price, avg_disc, count_order) ORDER BY l_returnflag, l_linestatus SEPARATOR ';') FROM (SELECT /*+ NO_PQ */ l_returnflag, l_linestatus, SUM(l_quantity) AS sum_qty, SUM(l_extendedprice) AS sum_base_price, SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price, SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge, AVG(l_quantity) AS avg_qty, AVG(l_extendedprice) AS avg_price, AVG(l_discount) AS avg_disc, COUNT(*) AS count_order FROM lineitem_date_pk WHERE l_shipdate <= DATE '1992-07-15' GROUP BY l_returnflag, l_linestatus) AS q`
+--let $date_pk_q1_pq= `SELECT GROUP_CONCAT(CONCAT_WS('|', l_returnflag, l_linestatus, sum_qty, sum_base_price, sum_disc_price, sum_charge, avg_qty, avg_price, avg_disc, count_order) ORDER BY l_returnflag, l_linestatus SEPARATOR ';') FROM (SELECT /*+ PQ(4) */ l_returnflag, l_linestatus, SUM(l_quantity) AS sum_qty, SUM(l_extendedprice) AS sum_base_price, SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price, SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge, AVG(l_quantity) AS avg_qty, AVG(l_extendedprice) AS avg_price, AVG(l_discount) AS avg_disc, COUNT(*) AS count_order FROM lineitem_date_pk WHERE l_shipdate <= DATE '1992-07-15' GROUP BY l_returnflag, l_linestatus) AS q`
+--let $assert_text= DATE split-key Q1 serial and PQ grouped results must match
+--let $assert_cond= "$date_pk_q1_serial" = "$date_pk_q1_pq"
+--source include/assert.inc
+DROP TABLE lineitem_date_pk;
+
+CREATE TABLE lineitem_datetime_pk (
+  l_shipdt DATETIME(6) NOT NULL PRIMARY KEY,
+  l_orderkey INT NOT NULL,
+  l_quantity DECIMAL(15,2) NOT NULL,
+  l_extendedprice DECIMAL(15,2) NOT NULL,
+  l_discount DECIMAL(15,2) NOT NULL,
+  l_tax DECIMAL(15,2) NOT NULL,
+  l_returnflag CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+  l_linestatus CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO lineitem_datetime_pk VALUES
+  ('1980-01-02 00:00:00.000000', 1, 10.00, 100.00, 0.05, 0.01, 'N', 'O'),
+  ('1980-01-02 00:00:00.500000', 2, 20.00, 200.00, 0.06, 0.02, 'N', 'O'),
+  ('1981-01-02 12:30:00.123456', 3, 30.00, 300.00, 0.07, 0.03, 'R', 'F'),
+  ('1992-07-15 23:59:59.999999', 4, 40.00, 400.00, 0.08, 0.04, 'R', 'F');
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS datetime_pk_count
+FROM lineitem_datetime_pk
+WHERE l_shipdt > '1980-01-02 00:00:00.000000';
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_quantity) AS datetime_pk_sum
+FROM lineitem_datetime_pk
+WHERE l_shipdt > '1980-01-02 00:00:00.000000';
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_shipdt, l_orderkey, l_quantity
+FROM lineitem_datetime_pk
+WHERE l_shipdt > '1980-01-02 00:00:00.000000'
+ORDER BY l_shipdt
+LIMIT 3;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_quantity, COUNT(*) AS datetime_pk_group_count
+FROM lineitem_datetime_pk
+WHERE l_shipdt > '1980-01-02 00:00:00.000000'
+GROUP BY l_quantity
+ORDER BY l_quantity;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ SUM(l_extendedprice * l_discount) AS datetime_pk_q6_serial_revenue
+FROM lineitem_datetime_pk
+WHERE l_shipdt >= TIMESTAMP '1980-01-02 00:00:00.000000'
+  AND l_shipdt < TIMESTAMP '1990-01-01 00:00:00.000000'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 35;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS datetime_pk_q6_revenue
+FROM lineitem_datetime_pk
+WHERE l_shipdt >= TIMESTAMP '1980-01-02 00:00:00.000000'
+  AND l_shipdt < TIMESTAMP '1990-01-01 00:00:00.000000'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 35;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+--let $datetime_pk_q6_serial= `SELECT /*+ NO_PQ */ SUM(l_extendedprice * l_discount) FROM lineitem_datetime_pk WHERE l_shipdt >= TIMESTAMP '1980-01-02 00:00:00.000000' AND l_shipdt < TIMESTAMP '1990-01-01 00:00:00.000000' AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 35`
+--let $datetime_pk_q6_pq= `SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) FROM lineitem_datetime_pk WHERE l_shipdt >= TIMESTAMP '1980-01-02 00:00:00.000000' AND l_shipdt < TIMESTAMP '1990-01-01 00:00:00.000000' AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 35`
+--let $assert_text= DATETIME split-key Q6 serial and PQ results must match
+--let $assert_cond= $datetime_pk_q6_serial <=> $datetime_pk_q6_pq
+--source include/assert.inc
+
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ l_returnflag, l_linestatus,
+       SUM(l_quantity) AS sum_qty,
+       SUM(l_extendedprice) AS sum_base_price,
+       SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price,
+       SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,
+       AVG(l_quantity) AS avg_qty,
+       AVG(l_extendedprice) AS avg_price,
+       AVG(l_discount) AS avg_disc,
+       COUNT(*) AS count_order
+FROM lineitem_datetime_pk
+WHERE l_shipdt <= TIMESTAMP '1992-07-15 23:59:59.999999'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       SUM(l_quantity) AS sum_qty,
+       SUM(l_extendedprice) AS sum_base_price,
+       SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price,
+       SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,
+       AVG(l_quantity) AS avg_qty,
+       AVG(l_extendedprice) AS avg_price,
+       AVG(l_discount) AS avg_disc,
+       COUNT(*) AS count_order
+FROM lineitem_datetime_pk
+WHERE l_shipdt <= TIMESTAMP '1992-07-15 23:59:59.999999'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+--let $datetime_pk_q1_serial= `SELECT GROUP_CONCAT(CONCAT_WS('|', l_returnflag, l_linestatus, sum_qty, sum_base_price, sum_disc_price, sum_charge, avg_qty, avg_price, avg_disc, count_order) ORDER BY l_returnflag, l_linestatus SEPARATOR ';') FROM (SELECT /*+ NO_PQ */ l_returnflag, l_linestatus, SUM(l_quantity) AS sum_qty, SUM(l_extendedprice) AS sum_base_price, SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price, SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge, AVG(l_quantity) AS avg_qty, AVG(l_extendedprice) AS avg_price, AVG(l_discount) AS avg_disc, COUNT(*) AS count_order FROM lineitem_datetime_pk WHERE l_shipdt <= TIMESTAMP '1992-07-15 23:59:59.999999' GROUP BY l_returnflag, l_linestatus) AS q`
+--let $datetime_pk_q1_pq= `SELECT GROUP_CONCAT(CONCAT_WS('|', l_returnflag, l_linestatus, sum_qty, sum_base_price, sum_disc_price, sum_charge, avg_qty, avg_price, avg_disc, count_order) ORDER BY l_returnflag, l_linestatus SEPARATOR ';') FROM (SELECT /*+ PQ(4) */ l_returnflag, l_linestatus, SUM(l_quantity) AS sum_qty, SUM(l_extendedprice) AS sum_base_price, SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price, SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge, AVG(l_quantity) AS avg_qty, AVG(l_extendedprice) AS avg_price, AVG(l_discount) AS avg_disc, COUNT(*) AS count_order FROM lineitem_datetime_pk WHERE l_shipdt <= TIMESTAMP '1992-07-15 23:59:59.999999' GROUP BY l_returnflag, l_linestatus) AS q`
+--let $assert_text= DATETIME split-key Q1 serial and PQ grouped results must match
+--let $assert_cond= "$datetime_pk_q1_serial" = "$datetime_pk_q1_pq"
+--source include/assert.inc
+DROP TABLE lineitem_datetime_pk;
+
+CREATE TABLE lineitem_time_pk (
+  l_shiptime TIME NOT NULL PRIMARY KEY,
+  l_orderkey INT NOT NULL,
+  l_quantity DECIMAL(15,2) NOT NULL,
+  l_extendedprice DECIMAL(15,2) NOT NULL,
+  l_discount DECIMAL(15,2) NOT NULL,
+  l_tax DECIMAL(15,2) NOT NULL,
+  l_returnflag CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+  l_linestatus CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO lineitem_time_pk VALUES
+  ('-838:59:59', 1, 10.00, 100.00, 0.05, 0.01, 'N', 'O'),
+  ('-00:00:01', 2, 20.00, 200.00, 0.06, 0.02, 'N', 'O'),
+  ('00:00:00', 3, 30.00, 300.00, 0.07, 0.03, 'R', 'F'),
+  ('00:00:01', 4, 40.00, 400.00, 0.08, 0.04, 'R', 'F'),
+  ('838:59:59', 5, 50.00, 500.00, 0.09, 0.05, 'A', 'F');
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS time_pk_count
+FROM lineitem_time_pk;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_quantity) AS time_pk_sum
+FROM lineitem_time_pk;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS time_pk_predicate_count
+FROM lineitem_time_pk
+WHERE l_shiptime > TIME '00:00:00';
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_shiptime, l_orderkey, l_quantity
+FROM lineitem_time_pk
+ORDER BY l_shiptime
+LIMIT 5;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ SUM(l_extendedprice * l_discount) AS time_pk_q6_serial_revenue
+FROM lineitem_time_pk
+WHERE l_shiptime >= TIME '-00:00:01'
+  AND l_shiptime < TIME '00:00:01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 35;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS time_pk_q6_revenue
+FROM lineitem_time_pk
+WHERE l_shiptime >= TIME '-00:00:01'
+  AND l_shiptime < TIME '00:00:01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 35;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+--let $time_pk_q6_serial= `SELECT /*+ NO_PQ */ SUM(l_extendedprice * l_discount) FROM lineitem_time_pk WHERE l_shiptime >= TIME '-00:00:01' AND l_shiptime < TIME '00:00:01' AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 35`
+--let $time_pk_q6_pq= `SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) FROM lineitem_time_pk WHERE l_shiptime >= TIME '-00:00:01' AND l_shiptime < TIME '00:00:01' AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 35`
+--let $assert_text= TIME split-key Q6 serial and PQ results must match
+--let $assert_cond= $time_pk_q6_serial <=> $time_pk_q6_pq
+--source include/assert.inc
+
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ l_returnflag, l_linestatus,
+       SUM(l_quantity) AS sum_qty,
+       SUM(l_extendedprice) AS sum_base_price,
+       SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price,
+       SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,
+       AVG(l_quantity) AS avg_qty,
+       AVG(l_extendedprice) AS avg_price,
+       AVG(l_discount) AS avg_disc,
+       COUNT(*) AS count_order
+FROM lineitem_time_pk
+WHERE l_shiptime <= TIME '00:00:01'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       SUM(l_quantity) AS sum_qty,
+       SUM(l_extendedprice) AS sum_base_price,
+       SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price,
+       SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,
+       AVG(l_quantity) AS avg_qty,
+       AVG(l_extendedprice) AS avg_price,
+       AVG(l_discount) AS avg_disc,
+       COUNT(*) AS count_order
+FROM lineitem_time_pk
+WHERE l_shiptime <= TIME '00:00:01'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+--let $time_pk_q1_serial= `SELECT GROUP_CONCAT(CONCAT_WS('|', l_returnflag, l_linestatus, sum_qty, sum_base_price, sum_disc_price, sum_charge, avg_qty, avg_price, avg_disc, count_order) ORDER BY l_returnflag, l_linestatus SEPARATOR ';') FROM (SELECT /*+ NO_PQ */ l_returnflag, l_linestatus, SUM(l_quantity) AS sum_qty, SUM(l_extendedprice) AS sum_base_price, SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price, SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge, AVG(l_quantity) AS avg_qty, AVG(l_extendedprice) AS avg_price, AVG(l_discount) AS avg_disc, COUNT(*) AS count_order FROM lineitem_time_pk WHERE l_shiptime <= TIME '00:00:01' GROUP BY l_returnflag, l_linestatus) AS q`
+--let $time_pk_q1_pq= `SELECT GROUP_CONCAT(CONCAT_WS('|', l_returnflag, l_linestatus, sum_qty, sum_base_price, sum_disc_price, sum_charge, avg_qty, avg_price, avg_disc, count_order) ORDER BY l_returnflag, l_linestatus SEPARATOR ';') FROM (SELECT /*+ PQ(4) */ l_returnflag, l_linestatus, SUM(l_quantity) AS sum_qty, SUM(l_extendedprice) AS sum_base_price, SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price, SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge, AVG(l_quantity) AS avg_qty, AVG(l_extendedprice) AS avg_price, AVG(l_discount) AS avg_disc, COUNT(*) AS count_order FROM lineitem_time_pk WHERE l_shiptime <= TIME '00:00:01' GROUP BY l_returnflag, l_linestatus) AS q`
+--let $assert_text= TIME split-key Q1 serial and PQ grouped results must match
+--let $assert_cond= "$time_pk_q1_serial" = "$time_pk_q1_pq"
+--source include/assert.inc
+DROP TABLE lineitem_time_pk;
+
+CREATE TABLE lineitem_time6_pk (
+  l_shiptime TIME(6) NOT NULL PRIMARY KEY,
+  l_orderkey INT NOT NULL,
+  l_quantity INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO lineitem_time6_pk VALUES
+  ('-00:00:00.000001', 1, 10),
+  ('00:00:00.000000', 2, 20),
+  ('00:00:00.000001', 3, 30),
+  ('12:30:00.123456', 4, 40);
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS time6_pk_count
+FROM lineitem_time6_pk;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_quantity) AS time6_pk_sum
+FROM lineitem_time6_pk;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS time6_pk_between_count
+FROM lineitem_time6_pk
+WHERE l_shiptime BETWEEN TIME '-00:00:00.000001' AND TIME '00:00:00.000001';
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_shiptime, l_orderkey, l_quantity
+FROM lineitem_time6_pk
+ORDER BY l_shiptime
+LIMIT 4;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_quantity, COUNT(*) AS time6_pk_group_count
+FROM lineitem_time6_pk
+WHERE l_shiptime BETWEEN TIME '-00:00:00.000001' AND TIME '00:00:00.000001'
+GROUP BY l_quantity
+ORDER BY l_quantity;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+DROP TABLE lineitem_time6_pk;
+
+SET optimizer_trace= @save_optimizer_trace;
+SET optimizer_switch= @save_optimizer_switch;
+SET pq_support_features_switch= @save_pq_support_features_switch;
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;

@@ -1,0 +1,362 @@
+#
+# InnoDB PQ B-tree descriptor key-shape boundaries on 16K pages.
+#
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_optimizer_trace= @@optimizer_trace;
+SET @save_optimizer_switch= @@optimizer_switch;
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on';
+SET optimizer_trace= 1;
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+CREATE TABLE pq_btree_descriptor_bigint_t (
+id BIGINT NOT NULL,
+payload VARBINARY(768) NOT NULL,
+PRIMARY KEY (id)
+) ENGINE=InnoDB STATS_PERSISTENT=1;
+INSERT INTO pq_btree_descriptor_bigint_t
+SELECT CAST(seq AS SIGNED) * 10000000 - 163840000000,
+REPEAT(CHAR(65 + MOD(seq, 26)), 768)
+FROM seq_1_to_32768;
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(64) */ COUNT(*) AS descriptor_bigint_count_result
+FROM pq_btree_descriptor_bigint_t
+WHERE id > -163840000000;
+descriptor_bigint_count_result
+32768
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].scan_provider') AS bigint_scan_provider
+FROM information_schema.optimizer_trace;
+bigint_scan_provider
+["innodb_clustered_primary"]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_available') AS bigint_btree_descriptor_available
+FROM information_schema.optimizer_trace;
+bigint_btree_descriptor_available
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_boundary_available') AS bigint_btree_descriptor_boundary_available
+FROM information_schema.optimizer_trace;
+bigint_btree_descriptor_boundary_available
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_split_used') AS bigint_btree_descriptor_split_used
+FROM information_schema.optimizer_trace;
+bigint_btree_descriptor_split_used
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_execution_used') AS bigint_btree_descriptor_execution_used
+FROM information_schema.optimizer_trace;
+bigint_btree_descriptor_execution_used
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_rejected_reason') AS bigint_btree_descriptor_rejected_reason
+FROM information_schema.optimizer_trace;
+bigint_btree_descriptor_rejected_reason
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(64) */ COUNT(*) AS descriptor_bigint_range_count_result
+FROM pq_btree_descriptor_bigint_t
+WHERE id > -81920000000 AND id < 81930000000;
+descriptor_bigint_range_count_result
+16384
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_scan_start_available') AS bigint_range_scan_start_available
+FROM information_schema.optimizer_trace;
+bigint_range_scan_start_available
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_scan_end_available') AS bigint_range_scan_end_available
+FROM information_schema.optimizer_trace;
+bigint_range_scan_end_available
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_split_used') AS bigint_range_btree_descriptor_split_used
+FROM information_schema.optimizer_trace;
+bigint_range_btree_descriptor_split_used
+[true]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(64) */ COUNT(*) AS descriptor_bigint_empty_range_count_result
+FROM pq_btree_descriptor_bigint_t
+WHERE id > -163829000000 AND id < -163821000000;
+descriptor_bigint_empty_range_count_result
+0
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_scan_start_available') AS bigint_empty_range_scan_start_available
+FROM information_schema.optimizer_trace;
+bigint_empty_range_scan_start_available
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_scan_end_available') AS bigint_empty_range_scan_end_available
+FROM information_schema.optimizer_trace;
+bigint_empty_range_scan_end_available
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_split_used') AS bigint_empty_range_btree_descriptor_split_used
+FROM information_schema.optimizer_trace;
+bigint_empty_range_btree_descriptor_split_used
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_execution_used') AS bigint_empty_range_btree_descriptor_execution_used
+FROM information_schema.optimizer_trace;
+bigint_empty_range_btree_descriptor_execution_used
+[true]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+CREATE TABLE pq_btree_descriptor_ubigint_t (
+id BIGINT UNSIGNED NOT NULL,
+payload VARBINARY(768) NOT NULL,
+PRIMARY KEY (id)
+) ENGINE=InnoDB STATS_PERSISTENT=1;
+INSERT INTO pq_btree_descriptor_ubigint_t
+SELECT seq, REPEAT(CHAR(65 + MOD(seq, 26)), 768)
+FROM seq_1_to_32768;
+INSERT INTO pq_btree_descriptor_ubigint_t VALUES
+(9223372036854775808, REPEAT('U', 768)),
+(9223372036854775809, REPEAT('V', 768)),
+(18446744073709551614, REPEAT('W', 768)),
+(18446744073709551615, REPEAT('X', 768));
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(64) */ COUNT(*) AS descriptor_ubigint_count_result
+FROM pq_btree_descriptor_ubigint_t
+WHERE id > 0;
+descriptor_ubigint_count_result
+32772
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].scan_provider') AS ubigint_scan_provider
+FROM information_schema.optimizer_trace;
+ubigint_scan_provider
+["innodb_clustered_primary"]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_available') AS ubigint_btree_descriptor_available
+FROM information_schema.optimizer_trace;
+ubigint_btree_descriptor_available
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_boundary_available') AS ubigint_btree_descriptor_boundary_available
+FROM information_schema.optimizer_trace;
+ubigint_btree_descriptor_boundary_available
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_split_used') AS ubigint_btree_descriptor_split_used
+FROM information_schema.optimizer_trace;
+ubigint_btree_descriptor_split_used
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_execution_used') AS ubigint_btree_descriptor_execution_used
+FROM information_schema.optimizer_trace;
+ubigint_btree_descriptor_execution_used
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_rejected_reason') AS ubigint_btree_descriptor_rejected_reason
+FROM information_schema.optimizer_trace;
+ubigint_btree_descriptor_rejected_reason
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(64) */ COUNT(*) AS descriptor_ubigint_high_domain_count_result
+FROM pq_btree_descriptor_ubigint_t
+WHERE id >= 9223372036854775808;
+descriptor_ubigint_high_domain_count_result
+4
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].scan_provider') AS ubigint_high_domain_scan_provider
+FROM information_schema.optimizer_trace;
+ubigint_high_domain_scan_provider
+["innodb_clustered_primary"]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_available') AS ubigint_high_domain_btree_descriptor_available
+FROM information_schema.optimizer_trace;
+ubigint_high_domain_btree_descriptor_available
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_scan_start_available') AS ubigint_high_domain_scan_start_available
+FROM information_schema.optimizer_trace;
+ubigint_high_domain_scan_start_available
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_execution_used') AS ubigint_high_domain_btree_descriptor_execution_used
+FROM information_schema.optimizer_trace;
+ubigint_high_domain_btree_descriptor_execution_used
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_rejected_reason') AS ubigint_high_domain_btree_descriptor_rejected_reason
+FROM information_schema.optimizer_trace;
+ubigint_high_domain_btree_descriptor_rejected_reason
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(64) */ COUNT(*) AS descriptor_ubigint_bounded_high_count_result
+FROM pq_btree_descriptor_ubigint_t
+WHERE id > 9223372036854775808 AND id < 18446744073709551615;
+descriptor_ubigint_bounded_high_count_result
+2
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].scan_provider') AS ubigint_bounded_high_scan_provider
+FROM information_schema.optimizer_trace;
+ubigint_bounded_high_scan_provider
+["innodb_clustered_primary"]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_available') AS ubigint_bounded_high_btree_descriptor_available
+FROM information_schema.optimizer_trace;
+ubigint_bounded_high_btree_descriptor_available
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_scan_start_available') AS ubigint_bounded_high_scan_start_available
+FROM information_schema.optimizer_trace;
+ubigint_bounded_high_scan_start_available
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_scan_end_available') AS ubigint_bounded_high_scan_end_available
+FROM information_schema.optimizer_trace;
+ubigint_bounded_high_scan_end_available
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_split_used') AS ubigint_bounded_high_btree_descriptor_split_used
+FROM information_schema.optimizer_trace;
+ubigint_bounded_high_btree_descriptor_split_used
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_execution_used') AS ubigint_bounded_high_btree_descriptor_execution_used
+FROM information_schema.optimizer_trace;
+ubigint_bounded_high_btree_descriptor_execution_used
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_rejected_reason') AS ubigint_bounded_high_btree_descriptor_rejected_reason
+FROM information_schema.optimizer_trace;
+ubigint_bounded_high_btree_descriptor_rejected_reason
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+CREATE TABLE pq_btree_descriptor_composite_t (
+id INT NOT NULL,
+part_no INT NOT NULL,
+payload VARBINARY(768) NOT NULL,
+PRIMARY KEY (id, part_no)
+) ENGINE=InnoDB STATS_PERSISTENT=1;
+INSERT INTO pq_btree_descriptor_composite_t
+SELECT seq, 1, REPEAT(CHAR(65 + MOD(seq, 26)), 768)
+FROM seq_1_to_32768;
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(64) */ COUNT(*) AS descriptor_composite_count_result
+FROM pq_btree_descriptor_composite_t
+WHERE id > 0;
+descriptor_composite_count_result
+32768
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].scan_provider') AS composite_scan_provider
+FROM information_schema.optimizer_trace;
+composite_scan_provider
+["innodb_clustered_primary"]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_available') AS composite_btree_descriptor_available
+FROM information_schema.optimizer_trace;
+composite_btree_descriptor_available
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_split_used') AS composite_btree_descriptor_split_used
+FROM information_schema.optimizer_trace;
+composite_btree_descriptor_split_used
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_execution_used') AS composite_btree_descriptor_execution_used
+FROM information_schema.optimizer_trace;
+composite_btree_descriptor_execution_used
+[true]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_rejected_reason') AS composite_btree_descriptor_rejected_reason
+FROM information_schema.optimizer_trace;
+composite_btree_descriptor_rejected_reason
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+CREATE TABLE pq_btree_descriptor_composite_mixed_t (
+id INT NOT NULL,
+code CHAR(4) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+payload VARBINARY(768) NOT NULL,
+PRIMARY KEY (id, code)
+) ENGINE=InnoDB STATS_PERSISTENT=1;
+INSERT INTO pq_btree_descriptor_composite_mixed_t
+SELECT seq, LPAD(CONV(MOD(seq, 4096), 10, 16), 4, '0'),
+REPEAT(CHAR(65 + MOD(seq, 26)), 768)
+FROM seq_1_to_32768;
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(64) */ COUNT(*) AS descriptor_composite_mixed_count_result
+FROM pq_btree_descriptor_composite_mixed_t
+WHERE id > 0;
+descriptor_composite_mixed_count_result
+32768
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].scan_provider') AS composite_mixed_scan_provider
+FROM information_schema.optimizer_trace;
+composite_mixed_scan_provider
+["innodb_clustered_primary"]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_available') AS composite_mixed_btree_descriptor_available
+FROM information_schema.optimizer_trace;
+composite_mixed_btree_descriptor_available
+[false]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_split_used') AS composite_mixed_btree_descriptor_split_used
+FROM information_schema.optimizer_trace;
+composite_mixed_btree_descriptor_split_used
+[false]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_execution_used') AS composite_mixed_btree_descriptor_execution_used
+FROM information_schema.optimizer_trace;
+composite_mixed_btree_descriptor_execution_used
+[false]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].btree_descriptor_rejected_reason') AS composite_mixed_btree_descriptor_rejected_reason
+FROM information_schema.optimizer_trace;
+composite_mixed_btree_descriptor_rejected_reason
+["unsupported_primary_key_shape"]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+SET optimizer_trace= @save_optimizer_trace;
+SET optimizer_switch= @save_optimizer_switch;
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;
+DROP TABLE pq_btree_descriptor_composite_mixed_t;
+DROP TABLE pq_btree_descriptor_composite_t;
+DROP TABLE pq_btree_descriptor_ubigint_t;
+DROP TABLE pq_btree_descriptor_bigint_t;

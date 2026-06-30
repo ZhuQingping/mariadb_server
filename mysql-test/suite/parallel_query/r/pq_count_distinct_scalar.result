@@ -1,0 +1,247 @@
+#
+# Parallel Query scalar COUNT(DISTINCT) coverage.
+#
+CREATE TABLE lineitem_count_distinct (
+l_orderkey INT NOT NULL PRIMARY KEY,
+l_shipdate DATE NOT NULL,
+l_quantity INT NULL,
+s_fixed CHAR(4) CHARACTER SET latin1 COLLATE latin1_bin NULL,
+s_nopad VARCHAR(8) CHARACTER SET latin1 COLLATE latin1_nopad_bin NULL,
+s_pad VARCHAR(8) CHARACTER SET latin1 COLLATE latin1_bin NULL,
+b_fixed BINARY(4) NULL,
+b_var VARBINARY(8) NULL
+) ENGINE=InnoDB;
+INSERT INTO lineitem_count_distinct VALUES
+(1, '1980-01-02', 10, 'aa', 'aa', 'aa', X'6161', X'6161'),
+(2, '1980-01-03', 20, 'bb', 'aa ', 'aa ', X'6262', X'616120'),
+(75, '1980-01-04', 10, 'aa', 'aa', 'aa', X'6161', X'6161'),
+(76, '1980-01-05', 30, 'cc', 'bb', 'bb', X'6363', X'6262'),
+(150, '1980-01-06', NULL, NULL, NULL, NULL, NULL, NULL),
+(151, '1980-01-07', 20, 'bb', 'aa ', 'aa ', X'6262', X'616120'),
+(152, '1979-12-31', 40, 'zz', 'zz', 'zz', X'7A7A', X'7A7A');
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_pq_support_features_switch= @@pq_support_features_switch;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_optimizer_switch= @@optimizer_switch;
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on';
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+SET pq_support_features_switch= 'simple_aggregate=on,count_distinct=on';
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ COUNT(DISTINCT l_quantity) AS distinct_quantity_serial_count
+FROM lineitem_count_distinct
+WHERE l_shipdate > '1980-01-01';
+distinct_quantity_serial_count
+3
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+SET pq_support_features_switch= 'simple_aggregate=on,count_distinct=off';
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(DISTINCT l_quantity) AS distinct_quantity_switch_off_count
+FROM lineitem_count_distinct
+WHERE l_shipdate > '1980-01-01';
+distinct_quantity_switch_off_count
+3
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+SET pq_support_features_switch= 'simple_aggregate=on,count_distinct=on';
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(DISTINCT l_quantity) AS distinct_quantity_count
+FROM lineitem_count_distinct
+WHERE l_shipdate > '1980-01-01';
+distinct_quantity_count
+3
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ COUNT(DISTINCT l_quantity + 1) AS distinct_quantity_expr_serial_count
+FROM lineitem_count_distinct
+WHERE l_shipdate > '1980-01-01';
+distinct_quantity_expr_serial_count
+3
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(DISTINCT l_quantity + 1) AS distinct_quantity_expr_count
+FROM lineitem_count_distinct
+WHERE l_shipdate > '1980-01-01';
+distinct_quantity_expr_count
+3
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+EXPLAIN FORMAT=JSON SELECT /*+ PQ(4) */ COUNT(DISTINCT l_quantity + 1) AS distinct_quantity_expr_count
+FROM lineitem_count_distinct
+WHERE l_shipdate > '1980-01-01';
+EXPLAIN
+{
+  "query_block": {
+    "select_id": 1,
+    "cost": #,
+    "nested_loop": [
+      {
+        "parallel_execute": {
+          "parallel_degree": 4,
+          "divided_table": "lineitem_count_distinct",
+          "cut_table": "lineitem_count_distinct",
+          "table": {
+            "table_name": "<gather1>",
+            "access_type": "ALL",
+            "rows": #
+          }
+        }
+      },
+      {
+        "table": {
+          "table_name": "lineitem_count_distinct",
+          "access_type": "ALL",
+          "loops": 1,
+          "rows": #,
+          "cost": #,
+          "filtered": 100,
+          "attached_condition": "lineitem_count_distinct.l_shipdate > '1980-01-01'"
+        }
+      }
+    ]
+  }
+}
+ANALYZE FORMAT=JSON SELECT /*+ PQ(4) */ COUNT(DISTINCT l_quantity + 1) AS distinct_quantity_expr_count
+FROM lineitem_count_distinct
+WHERE l_shipdate > '1980-01-01';
+ANALYZE
+{
+  "query_optimization": {
+    "r_total_time_ms": #
+  },
+  "query_block": {
+    "select_id": 1,
+    "cost": #,
+    "r_loops": 1,
+    "r_total_time_ms": #,
+    "nested_loop": [
+      {
+        "parallel_execute": {
+          "parallel_degree": 4,
+          "divided_table": "lineitem_count_distinct",
+          "cut_table": "lineitem_count_distinct",
+          "table": {
+            "table_name": "<gather1>",
+            "access_type": "ALL",
+            "rows": 7
+          }
+        }
+      },
+      {
+        "table": {
+          "table_name": "lineitem_count_distinct",
+          "access_type": "ALL",
+          "loops": 1,
+          "r_loops": 0,
+          "rows": 7,
+          "r_rows": null,
+          "cost": #,
+          "r_table_time_ms": #,
+          "r_other_time_ms": #,
+          "r_engine_stats": {
+            "pages_accessed": #
+          },
+          "filtered": 100,
+          "r_total_filtered": null,
+          "attached_condition": "lineitem_count_distinct.l_shipdate > '1980-01-01'",
+          "r_filtered": null
+        }
+      }
+    ]
+  }
+}
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(DISTINCT l_quantity + (l_orderkey MOD 2)) AS distinct_quantity_two_field_expr_count
+FROM lineitem_count_distinct
+WHERE l_shipdate > '1980-01-01';
+distinct_quantity_two_field_expr_count
+4
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(DISTINCT IF(l_quantity IS NULL, NULL, l_quantity + 1)) AS distinct_quantity_expr_null_count
+FROM lineitem_count_distinct
+WHERE l_shipdate > '1980-01-01';
+distinct_quantity_expr_null_count
+3
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(DISTINCT s_fixed) AS distinct_fixed_string_count
+FROM lineitem_count_distinct
+WHERE l_shipdate > '1980-01-01';
+distinct_fixed_string_count
+3
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(DISTINCT s_nopad) AS distinct_nopad_string_count
+FROM lineitem_count_distinct
+WHERE l_shipdate > '1980-01-01';
+distinct_nopad_string_count
+3
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(DISTINCT b_fixed) AS distinct_fixed_binary_count
+FROM lineitem_count_distinct
+WHERE l_shipdate > '1980-01-01';
+distinct_fixed_binary_count
+3
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(DISTINCT b_var) AS distinct_varbinary_count
+FROM lineitem_count_distinct
+WHERE l_shipdate > '1980-01-01';
+distinct_varbinary_count
+3
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(DISTINCT s_pad) AS distinct_pad_string_count
+FROM lineitem_count_distinct
+WHERE l_shipdate > '1980-01-01';
+distinct_pad_string_count
+2
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(DISTINCT CONCAT(l_quantity, '')) AS distinct_quantity_string_expr_count
+FROM lineitem_count_distinct
+WHERE l_shipdate > '1980-01-01';
+distinct_quantity_string_expr_count
+3
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+SET pq_support_features_switch= 'simple_aggregate=on,count_distinct=off';
+SET optimizer_switch= @save_optimizer_switch;
+SET pq_support_features_switch= @save_pq_support_features_switch;
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;
+DROP TABLE lineitem_count_distinct;

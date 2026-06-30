@@ -1,0 +1,1487 @@
+#
+# Parallel Query projection field type coverage.
+#
+CREATE TABLE lineitem (
+l_orderkey INT NOT NULL PRIMARY KEY,
+l_shipdate DATE NOT NULL,
+l_quantity INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO lineitem VALUES
+(1, '1979-12-31', 10),
+(2, '1980-01-01', 20),
+(3, '1980-01-02', 30),
+(4, '1981-05-10', 40),
+(5, '1992-07-15', 50),
+(6, '1978-03-20', 60),
+(7, '1980-06-01', 70),
+(8, '1985-09-09', 80);
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_optimizer_switch= @@optimizer_switch;
+SET @save_optimizer_trace= @@optimizer_trace;
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on';
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+SET optimizer_trace=1;
+#
+# Nullable raw field projection keeps NULL state on the PQ path.
+#
+CREATE TABLE lineitem_nullable (
+l_orderkey INT NOT NULL PRIMARY KEY,
+l_shipdate DATE NOT NULL,
+l_comment VARCHAR(32) NULL
+) ENGINE=InnoDB;
+INSERT INTO lineitem_nullable VALUES
+(1, '1979-12-31', 'old'),
+(3, '1980-01-02', 'ok'),
+(4, '1981-05-10', NULL);
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, l_comment
+FROM lineitem_nullable
+WHERE l_shipdate > '1980-01-01';
+l_orderkey	l_comment
+3	ok
+4	NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS string_eq_count
+FROM lineitem_nullable
+WHERE l_comment = 'ok';
+string_eq_count
+1
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, l_comment
+FROM lineitem_nullable
+WHERE l_comment = 'ok';
+l_orderkey	l_comment
+3	ok
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS string_like_count
+FROM lineitem_nullable
+WHERE l_comment LIKE 'o%';
+string_like_count
+2
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS string_ne_count
+FROM lineitem_nullable
+WHERE l_comment != 'ok';
+string_ne_count
+1
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS string_in_count
+FROM lineitem_nullable
+WHERE l_comment IN ('ok', 'old', NULL);
+string_in_count
+2
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, l_comment
+FROM lineitem_nullable
+WHERE l_comment LIKE '%k';
+l_orderkey	l_comment
+3	ok
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS string_not_like_count
+FROM lineitem_nullable
+WHERE l_comment NOT LIKE '%k';
+string_not_like_count
+1
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, l_comment
+FROM lineitem_nullable
+WHERE l_comment NOT LIKE '%k';
+l_orderkey	l_comment
+1	old
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS comment_is_null_count
+FROM lineitem_nullable
+WHERE l_comment IS NULL;
+comment_is_null_count
+1
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, l_comment
+FROM lineitem_nullable
+WHERE l_comment IS NULL;
+l_orderkey	l_comment
+4	NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS comment_is_not_null_count
+FROM lineitem_nullable
+WHERE l_comment IS NOT NULL;
+comment_is_not_null_count
+2
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, l_comment
+FROM lineitem_nullable
+WHERE l_comment IS NOT NULL;
+l_orderkey	l_comment
+1	old
+3	ok
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS and_is_null_count
+FROM lineitem_nullable
+WHERE l_shipdate > '1980-01-01' AND l_comment IS NULL;
+and_is_null_count
+1
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, l_comment
+FROM lineitem_nullable
+WHERE l_shipdate > '1980-01-01' AND l_comment IS NOT NULL;
+l_orderkey	l_comment
+3	ok
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS string_gt_count
+FROM lineitem_nullable
+WHERE l_comment > 'm';
+string_gt_count
+2
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, l_comment
+FROM lineitem_nullable
+WHERE l_comment <= 'ok';
+l_orderkey	l_comment
+3	ok
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, l_comment
+FROM lineitem_nullable
+ORDER BY l_comment, l_orderkey;
+l_orderkey	l_comment
+4	NULL
+3	ok
+1	old
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_projection_order"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+CREATE TABLE lineitem_binary_order (
+l_orderkey INT NOT NULL PRIMARY KEY,
+sort_key VARBINARY(4) NULL,
+payload INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO lineitem_binary_order VALUES
+(1, X'62', 10),
+(2, X'41', 20),
+(3, NULL, 30),
+(4, X'6161', 40),
+(5, X'61', 50);
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, HEX(sort_key) AS sort_hex, payload
+FROM lineitem_binary_order
+ORDER BY sort_key, l_orderkey;
+l_orderkey	sort_hex	payload
+3	NULL	30
+2	41	20
+5	61	50
+4	6161	40
+1	62	10
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, HEX(sort_key) AS sort_hex
+FROM lineitem_binary_order
+ORDER BY sort_key DESC, l_orderkey
+LIMIT 3;
+l_orderkey	sort_hex
+1	62
+4	6161
+5	61
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+CREATE TABLE lineitem_blob_projection (
+l_orderkey INT NOT NULL PRIMARY KEY,
+payload BLOB NULL
+) ENGINE=InnoDB;
+INSERT INTO lineitem_blob_projection VALUES
+(1, X'616263'),
+(2, NULL),
+(3, X'7A7A');
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, payload
+FROM lineitem_blob_projection
+ORDER BY l_orderkey;
+l_orderkey	payload
+1	abc
+2	NULL
+3	zz
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, HEX(payload) AS payload_hex
+FROM lineitem_blob_projection
+ORDER BY l_orderkey;
+l_orderkey	payload_hex
+1	616263
+2	NULL
+3	7A7A
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS blob_predicate_count
+FROM lineitem_blob_projection
+WHERE payload = X'7A7A';
+blob_predicate_count
+1
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ payload, COUNT(*) AS blob_group_count
+FROM lineitem_blob_projection
+GROUP BY payload
+ORDER BY payload;
+payload	blob_group_count
+NULL	1
+abc	1
+zz	1
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+CREATE TABLE lineitem_geometry_projection (
+l_orderkey INT NOT NULL PRIMARY KEY,
+g GEOMETRY NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO lineitem_geometry_projection VALUES
+(1, ST_GeomFromText('POINT(0 0)')),
+(2, ST_GeomFromText('POINT(1 1)')),
+(3, ST_GeomFromText('POINT(2 2)'));
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, ST_AsText(g) AS g_wkt
+FROM lineitem_geometry_projection
+ORDER BY l_orderkey;
+l_orderkey	g_wkt
+1	POINT(0 0)
+2	POINT(1 1)
+3	POINT(2 2)
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS geometry_predicate_count
+FROM lineitem_geometry_projection
+WHERE ST_Equals(g, ST_GeomFromText('POINT(1 1)'));
+geometry_predicate_count
+1
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+CREATE TABLE lineitem_text_projection (
+l_orderkey INT NOT NULL PRIMARY KEY,
+txt TEXT NULL
+) ENGINE=InnoDB;
+INSERT INTO lineitem_text_projection VALUES
+(1, 'alpha'),
+(2, NULL),
+(3, 'xyz');
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, txt
+FROM lineitem_text_projection
+ORDER BY l_orderkey;
+l_orderkey	txt
+1	alpha
+2	NULL
+3	xyz
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS text_like_count
+FROM lineitem_text_projection
+WHERE txt LIKE 'x%';
+text_like_count
+1
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ txt, COUNT(*) AS text_group_count
+FROM lineitem_text_projection
+GROUP BY txt
+ORDER BY txt;
+txt	text_group_count
+NULL	1
+alpha	1
+xyz	1
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+CREATE TABLE lineitem_fulltext_projection (
+l_orderkey INT NOT NULL PRIMARY KEY,
+doc TEXT NOT NULL,
+FULLTEXT KEY ft_doc (doc)
+) ENGINE=InnoDB;
+INSERT INTO lineitem_fulltext_projection VALUES
+(1, 'alpha bravo'),
+(2, 'charlie delta'),
+(3, 'alpha echo');
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey,
+MATCH(doc) AGAINST('+alpha' IN BOOLEAN MODE) > 0 AS ft_match
+FROM lineitem_fulltext_projection
+ORDER BY l_orderkey;
+l_orderkey	ft_match
+1	1
+2	0
+3	1
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS fulltext_predicate_count
+FROM lineitem_fulltext_projection
+WHERE MATCH(doc) AGAINST('+alpha' IN BOOLEAN MODE) > 0;
+fulltext_predicate_count
+2
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+CREATE TABLE lineitem_json_projection (
+l_orderkey INT NOT NULL PRIMARY KEY,
+j JSON NULL
+) ENGINE=InnoDB;
+INSERT INTO lineitem_json_projection VALUES
+(1, '{"a":1}'),
+(2, NULL),
+(3, '{"a":3,"b":"x"}');
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, j
+FROM lineitem_json_projection
+ORDER BY l_orderkey;
+l_orderkey	j
+1	{"a":1}
+2	NULL
+3	{"a":3,"b":"x"}
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, JSON_EXTRACT(j, '$.a') AS a_value
+FROM lineitem_json_projection
+ORDER BY l_orderkey;
+l_orderkey	a_value
+1	1
+2	NULL
+3	3
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, JSON_VALID(j) AS j_valid
+FROM lineitem_json_projection
+ORDER BY l_orderkey;
+l_orderkey	j_valid
+1	1
+2	NULL
+3	1
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_projection"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey,
+JSON_TYPE(j) AS j_type,
+JSON_UNQUOTE(JSON_EXTRACT(j, '$.b')) AS b_unquoted,
+JSON_DEPTH(j) AS j_depth,
+JSON_QUOTE(CAST(l_orderkey AS CHAR)) AS orderkey_json
+FROM lineitem_json_projection
+ORDER BY l_orderkey;
+l_orderkey	j_type	b_unquoted	j_depth	orderkey_json
+1	OBJECT	NULL	2	"1"
+2	NULL	NULL	NULL	"2"
+3	OBJECT	x	2	"3"
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_projection"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS json_contains_path_count
+FROM lineitem_json_projection
+WHERE JSON_CONTAINS_PATH(j, 'one', '$.a') = 1;
+json_contains_path_count
+2
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_predicate_or_expression"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS json_length_predicate_count
+FROM lineitem_json_projection
+WHERE JSON_LENGTH(j) > 0;
+json_length_predicate_count
+2
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_predicate_or_expression"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+SET optimizer_trace=1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey,
+JSON_VALUE(JSON_OBJECT('a', l_orderkey), '$.a') AS json_value_a,
+JSON_QUERY(JSON_OBJECT('a', l_orderkey), '$') IS NOT NULL AS json_query_guard
+FROM lineitem
+ORDER BY l_orderkey
+LIMIT 1;
+l_orderkey	json_value_a	json_query_guard
+1	1	1
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_projection"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS json_path_predicate_count
+FROM lineitem
+WHERE JSON_EXISTS(JSON_OBJECT('a', l_orderkey), '$.a') = 1
+AND JSON_OVERLAPS(JSON_OBJECT('a', l_orderkey),
+JSON_OBJECT('a', l_orderkey)) = 1
+AND JSON_SEARCH(JSON_ARRAY(l_orderkey), 'one',
+CAST(l_orderkey AS CHAR)) IS NOT NULL;
+json_path_predicate_count
+8
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_predicate_or_expression"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+#
+# Generated columns stay on the serial path for raw-field PQ surfaces.
+#
+CREATE TABLE lineitem_generated_projection (
+l_orderkey INT NOT NULL PRIMARY KEY,
+price INT NOT NULL,
+quantity INT NOT NULL,
+v_nullable INT AS (IF(price = 10, NULL, price * quantity)) VIRTUAL,
+v_total INT AS (price * quantity) VIRTUAL,
+p_total INT AS (price + quantity) PERSISTENT
+) ENGINE=InnoDB;
+INSERT INTO lineitem_generated_projection (l_orderkey, price, quantity) VALUES
+(1, 10, 2),
+(2, 20, 3),
+(3, 30, 4);
+SET optimizer_trace=1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, v_total
+FROM lineitem_generated_projection
+ORDER BY l_orderkey;
+l_orderkey	v_total
+1	20
+2	60
+3	120
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_projection"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, p_total
+FROM lineitem_generated_projection
+ORDER BY l_orderkey;
+l_orderkey	p_total
+1	12
+2	23
+3	34
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_projection"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(v_total) AS generated_sum
+FROM lineitem_generated_projection;
+generated_sum
+200
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_aggregate_expression"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(v_total) AS generated_virtual_count
+FROM lineitem_generated_projection;
+generated_virtual_count
+3
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_aggregate_expression"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(p_total) AS generated_persistent_count
+FROM lineitem_generated_projection;
+generated_persistent_count
+3
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_aggregate_expression"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ v_total, COUNT(*) AS generated_group_count
+FROM lineitem_generated_projection
+GROUP BY v_total
+ORDER BY v_total;
+v_total	generated_group_count
+20	1
+60	1
+120	1
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_group_projection"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, COUNT(v_total) AS generated_group_virtual_count
+FROM lineitem_generated_projection
+GROUP BY l_orderkey
+ORDER BY l_orderkey;
+l_orderkey	generated_group_virtual_count
+1	1
+2	1
+3	1
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_aggregate_expression"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, COUNT(p_total) AS generated_group_persistent_count
+FROM lineitem_generated_projection
+GROUP BY l_orderkey
+ORDER BY l_orderkey;
+l_orderkey	generated_group_persistent_count
+1	1
+2	1
+3	1
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_aggregate_expression"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS generated_predicate_count
+FROM lineitem_generated_projection
+WHERE v_total > 30;
+generated_predicate_count
+2
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_predicate_or_expression"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS generated_null_predicate_count
+FROM lineitem_generated_projection
+WHERE v_nullable IS NULL;
+generated_null_predicate_count
+1
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_predicate_or_expression"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+#
+# Byte-aligned BIT projection keeps raw field values on the PQ path.
+#
+CREATE TABLE lineitem_bit (
+l_orderkey INT NOT NULL PRIMARY KEY,
+b8 BIT(8) NOT NULL,
+b16 BIT(16) NOT NULL,
+b64 BIT(64) NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO lineitem_bit VALUES
+(1, b'00000001', b'0000000000000010',
+b'0000000000000000000000000000000000000000000000000000000000000011'),
+(2, b'11111111', b'0000000011111111',
+b'0000000000000000000000000000000000000000000000000000000011111111'),
+(3, b'00001111', b'0000111100001111',
+b'0000000000000000000000000000000000000000000000000000111100001111'),
+(4, b'11110000', b'1111000011110000',
+b'0000000000000000000000000000000000000000000000001111000011110000');
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, b8 + 0 AS b8_num,
+b16 + 0 AS b16_num, b64 + 0 AS b64_num
+FROM lineitem_bit
+ORDER BY l_orderkey;
+l_orderkey	b8_num	b16_num	b64_num
+1	1	2	3
+2	255	255	255
+3	15	3855	3855
+4	240	61680	61680
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+CREATE TABLE lineitem_bit_unaligned (
+l_orderkey INT NOT NULL PRIMARY KEY,
+b1 BIT(1) NOT NULL,
+b7 BIT(7) NOT NULL,
+b9 BIT(9) NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO lineitem_bit_unaligned VALUES
+(1, b'1', b'0000001', b'000000001'),
+(2, b'1', b'1111111', b'111111111'),
+(3, b'0', b'0001111', b'000001111'),
+(4, b'1', b'1110000', b'111100000'),
+(5, b'1', b'0000001', b'100000000');
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, b1 + 0 AS b1_num,
+b7 + 0 AS b7_num, b9 + 0 AS b9_num
+FROM lineitem_bit_unaligned
+ORDER BY l_orderkey;
+l_orderkey	b1_num	b7_num	b9_num
+1	1	1	1
+2	1	127	511
+3	0	15	15
+4	1	112	480
+5	1	1	256
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, HEX(b1) AS b1_hex,
+HEX(b7) AS b7_hex, HEX(b9) AS b9_hex
+FROM lineitem_bit_unaligned
+ORDER BY l_orderkey;
+l_orderkey	b1_hex	b7_hex	b9_hex
+1	1	1	1
+2	1	7F	1FF
+3	0	F	F
+4	1	70	1E0
+5	1	1	100
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(b1) AS count_b1
+FROM lineitem_bit_unaligned;
+count_b1
+5
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(b7) AS count_b7
+FROM lineitem_bit_unaligned;
+count_b7
+5
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(b9) AS count_b9
+FROM lineitem_bit_unaligned;
+count_b9
+5
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+CREATE TABLE lineitem_bit_minmax (
+l_orderkey INT NOT NULL PRIMARY KEY,
+b8 BIT(8) NULL,
+b16 BIT(16) NULL
+) ENGINE=InnoDB;
+INSERT INTO lineitem_bit_minmax VALUES
+(1, b'01000001', b'0100000101111010'),
+(2, b'01111010', b'0111101001111010'),
+(3, b'01101101', NULL),
+(4, NULL, b'0100000101000001');
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ MIN(b8) AS min_b8
+FROM lineitem_bit_minmax;
+min_b8
+65
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ MAX(b8) AS max_b8
+FROM lineitem_bit_minmax;
+max_b8
+122
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ MIN(b16) AS min_b16
+FROM lineitem_bit_minmax;
+min_b16
+16705
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ MAX(b16) AS max_b16
+FROM lineitem_bit_minmax;
+max_b16
+31354
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ MIN(b8) AS min_b8_all_null
+FROM lineitem_bit_minmax
+WHERE b8 IS NULL;
+min_b8_all_null
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(b8) AS sum_b8
+FROM lineitem_bit_minmax;
+sum_b8
+296
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ AVG(b8) AS avg_b8
+FROM lineitem_bit_minmax;
+avg_b8
+98.6667
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ AVG(b16) AS avg_b16
+FROM lineitem_bit_minmax;
+avg_b16
+21607.0000
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+#
+# COUNT(field) counts non-NULL field values on the PQ path.
+#
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(l_comment) AS nullable_comment_count
+FROM lineitem_nullable
+WHERE l_shipdate > '1980-01-01';
+nullable_comment_count
+1
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(CONCAT(l_comment, '!')) AS nullable_comment_expr_count
+FROM lineitem_nullable
+WHERE l_shipdate > '1980-01-01';
+nullable_comment_expr_count
+1
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+#
+# Unaligned BIT remains constrained except for supported MIN/MAX paths.
+#
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, b9 + 0 AS b9_num
+FROM lineitem_bit_unaligned
+ORDER BY b9;
+l_orderkey	b9_num
+1	1
+3	15
+5	256
+4	480
+2	511
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_projection_order"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(b9) AS sum_b9
+FROM lineitem_bit_unaligned;
+sum_b9
+1263
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_aggregate_expression"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ MIN(b9) AS min_b9
+FROM lineitem_bit_unaligned;
+min_b9
+1
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ MAX(b9) AS max_b9
+FROM lineitem_bit_unaligned;
+max_b9
+511
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ MAX(b9) AS max_b9_having
+FROM lineitem_bit_unaligned
+HAVING MAX(b9) = b'111111111';
+max_b9_having
+511
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+CREATE TABLE lineitem_bit_unaligned_grouped (
+l_orderkey INT NOT NULL PRIMARY KEY,
+g INT NOT NULL,
+b9 BIT(9) NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO lineitem_bit_unaligned_grouped VALUES
+(1, 1, b'000000001'),
+(2, 1, b'100000000'),
+(3, 1, b'000001111'),
+(4, 2, b'111111111'),
+(5, 2, b'111100000');
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ g, MIN(b9) AS min_b9, MAX(b9) AS max_b9
+FROM lineitem_bit_unaligned_grouped
+GROUP BY g
+ORDER BY g;
+g	min_b9	max_b9
+1	1	256
+2	480	511
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, MIN(b9) AS min_b9_by_orderkey
+FROM lineitem_bit_unaligned
+GROUP BY l_orderkey
+ORDER BY l_orderkey;
+l_orderkey	min_b9_by_orderkey
+1	1
+2	511
+3	15
+4	480
+5	256
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ AVG(b9) AS avg_b9
+FROM lineitem_bit_unaligned;
+avg_b9
+252.6000
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_aggregate_expression"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ b9 + 0 AS b9_num, COUNT(*) AS bit_group_count
+FROM lineitem_bit_unaligned
+GROUP BY b9
+ORDER BY b9_num;
+b9_num	bit_group_count
+1	1
+15	1
+256	1
+480	1
+511	1
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_group_collation"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, b9 + 0 AS b9_num
+FROM lineitem_bit_unaligned
+WHERE b9 = b'000001111'
+ORDER BY l_orderkey;
+l_orderkey	b9_num
+3	15
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_predicate_or_expression"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+#
+# Unsupported projection field type trace diagnostics.
+#
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, payload
+FROM lineitem_blob_projection
+ORDER BY l_orderkey;
+l_orderkey	payload
+1	abc
+2	NULL
+3	zz
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_projection"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, HEX(payload) AS payload_hex
+FROM lineitem_blob_projection
+ORDER BY l_orderkey;
+l_orderkey	payload_hex
+1	616263
+2	NULL
+3	7A7A
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_projection"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS blob_predicate_count
+FROM lineitem_blob_projection
+WHERE payload = X'7A7A';
+blob_predicate_count
+1
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_predicate_or_expression"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ payload, COUNT(*) AS blob_group_count
+FROM lineitem_blob_projection
+GROUP BY payload
+ORDER BY payload;
+payload	blob_group_count
+NULL	1
+abc	1
+zz	1
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_group_collation"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, ST_AsText(g) AS g_wkt
+FROM lineitem_geometry_projection
+ORDER BY l_orderkey;
+l_orderkey	g_wkt
+1	POINT(0 0)
+2	POINT(1 1)
+3	POINT(2 2)
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_projection"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS geometry_predicate_count
+FROM lineitem_geometry_projection
+WHERE ST_Equals(g, ST_GeomFromText('POINT(1 1)'));
+geometry_predicate_count
+1
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_predicate_or_expression"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey,
+ST_Distance(g, ST_GeomFromText('POINT(0 0)')) AS g_distance
+FROM lineitem_geometry_projection
+ORDER BY l_orderkey;
+l_orderkey	g_distance
+1	0
+2	1.4142135623730951
+3	2.8284271247461903
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_projection"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS geometry_distance_predicate_count
+FROM lineitem_geometry_projection
+WHERE ST_Distance(g, ST_GeomFromText('POINT(0 0)')) > 0;
+geometry_distance_predicate_count
+2
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_predicate_or_expression"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, txt
+FROM lineitem_text_projection
+ORDER BY l_orderkey;
+l_orderkey	txt
+1	alpha
+2	NULL
+3	xyz
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_projection"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS text_like_count
+FROM lineitem_text_projection
+WHERE txt LIKE 'x%';
+text_like_count
+1
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_predicate_or_expression"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ txt, COUNT(*) AS text_group_count
+FROM lineitem_text_projection
+GROUP BY txt
+ORDER BY txt;
+txt	text_group_count
+NULL	1
+alpha	1
+xyz	1
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_group_collation"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey,
+MATCH(doc) AGAINST('+alpha' IN BOOLEAN MODE) > 0 AS ft_match
+FROM lineitem_fulltext_projection
+ORDER BY l_orderkey;
+l_orderkey	ft_match
+1	1
+2	0
+3	1
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_projection"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS fulltext_predicate_count
+FROM lineitem_fulltext_projection
+WHERE MATCH(doc) AGAINST('+alpha' IN BOOLEAN MODE) > 0;
+fulltext_predicate_count
+2
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_predicate_or_expression"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, j
+FROM lineitem_json_projection
+ORDER BY l_orderkey;
+l_orderkey	j
+1	{"a":1}
+2	NULL
+3	{"a":3,"b":"x"}
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_projection"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, JSON_EXTRACT(j, '$.a') AS a_value
+FROM lineitem_json_projection
+ORDER BY l_orderkey;
+l_orderkey	a_value
+1	1
+2	NULL
+3	3
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_projection"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, b9 + 0 AS b9_num
+FROM lineitem_bit_unaligned
+ORDER BY l_orderkey;
+l_orderkey	b9_num
+1	1
+2	511
+3	15
+4	480
+5	256
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET optimizer_switch= @save_optimizer_switch;
+SET optimizer_trace= @save_optimizer_trace;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+DROP TABLE lineitem_generated_projection;
+DROP TABLE lineitem_json_projection;
+DROP TABLE lineitem_fulltext_projection;
+DROP TABLE lineitem_text_projection;
+DROP TABLE lineitem_geometry_projection;
+DROP TABLE lineitem_blob_projection;
+DROP TABLE lineitem_binary_order;
+DROP TABLE lineitem_bit_unaligned_grouped;
+DROP TABLE lineitem_bit_unaligned;
+DROP TABLE lineitem_bit_minmax;
+DROP TABLE lineitem_bit;
+DROP TABLE lineitem_nullable;
+DROP TABLE lineitem;

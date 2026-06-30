@@ -1,0 +1,50 @@
+SET @start_global_value= @@global.force_parallel_execute;
+SET @start_value= @@session.force_parallel_execute;
+SHOW GLOBAL VARIABLES LIKE 'force_parallel_execute';
+Variable_name	Value
+force_parallel_execute	OFF
+SHOW SESSION VARIABLES LIKE 'force_parallel_execute';
+Variable_name	Value
+force_parallel_execute	OFF
+SELECT * FROM information_schema.global_variables
+WHERE variable_name='force_parallel_execute';
+VARIABLE_NAME	VARIABLE_VALUE
+FORCE_PARALLEL_EXECUTE	OFF
+SELECT * FROM information_schema.session_variables
+WHERE variable_name='force_parallel_execute';
+VARIABLE_NAME	VARIABLE_VALUE
+FORCE_PARALLEL_EXECUTE	OFF
+SET @@session.force_parallel_execute= DEFAULT;
+SELECT @@session.force_parallel_execute;
+@@session.force_parallel_execute
+0
+SET @@session.force_parallel_execute= ON;
+SELECT @@session.force_parallel_execute;
+@@session.force_parallel_execute
+1
+SET @@session.force_parallel_execute= OFF;
+SELECT @@session.force_parallel_execute;
+@@session.force_parallel_execute
+0
+SET @@global.force_parallel_execute= ON;
+SELECT @@global.force_parallel_execute;
+@@global.force_parallel_execute
+1
+SET @@global.force_parallel_execute= OFF;
+SELECT @@global.force_parallel_execute;
+@@global.force_parallel_execute
+0
+SET @@session.force_parallel_execute= 2;
+ERROR 42000: Variable 'force_parallel_execute' can't be set to the value of '2'
+SET @@session.force_parallel_execute= 'invalid';
+ERROR 42000: Variable 'force_parallel_execute' can't be set to the value of 'invalid'
+SET @@local.force_parallel_execute= ON;
+SELECT @@local.force_parallel_execute = @@session.force_parallel_execute;
+@@local.force_parallel_execute = @@session.force_parallel_execute
+1
+SET force_parallel_execute= OFF;
+SELECT @@force_parallel_execute;
+@@force_parallel_execute
+0
+SET @@global.force_parallel_execute= @start_global_value;
+SET @@session.force_parallel_execute= @start_value;

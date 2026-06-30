@@ -1,0 +1,236 @@
+--source include/have_innodb.inc
+
+--echo #
+--echo # Parallel Query TIMESTAMP boundary coverage.
+--echo #
+
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_pq_support_features_switch= @@pq_support_features_switch;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_optimizer_trace= @@optimizer_trace;
+SET @save_optimizer_switch= @@optimizer_switch;
+SET @save_time_zone= @@time_zone;
+
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on';
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+SET pq_support_features_switch= 'simple_aggregate=on,count_distinct=on,correlated_subquery=on,hash_join_spill_to_disk=on,insert_select=on';
+
+--echo #
+--echo # TIMESTAMP predicates fall back because worker THDs do not clone session time zone.
+--echo #
+
+CREATE TABLE lineitem_ts (
+  l_orderkey INT NOT NULL PRIMARY KEY,
+  l_shipts TIMESTAMP NOT NULL,
+  l_quantity INT NOT NULL
+) ENGINE=InnoDB;
+
+SET time_zone= '+00:00';
+INSERT INTO lineitem_ts VALUES
+  (1, '1979-12-31 23:00:00', 10),
+  (2, '1980-01-01 01:00:00', 20),
+  (3, '1980-01-02 00:00:00', 30);
+
+SET time_zone= '+05:30';
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS timestamp_count
+FROM lineitem_ts
+WHERE l_shipts > '1980-01-01 00:00:00';
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ MIN(l_shipts) AS min_shipts
+FROM lineitem_ts;
+SELECT /*+ PQ(4) */ MIN(l_shipts) AS min_shipts
+FROM lineitem_ts;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SQL_CALC_FOUND_ROWS MIN(l_shipts) AS min_shipts_found_rows
+FROM lineitem_ts;
+SELECT FOUND_ROWS() AS found_rows_after_timestamp_min;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ MAX(l_shipts) AS max_shipts
+FROM lineitem_ts;
+SELECT /*+ PQ(4) */ MAX(l_shipts) AS max_shipts
+FROM lineitem_ts;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ MIN(l_shipts) AS min_shipts_quantity
+FROM lineitem_ts
+WHERE l_quantity >= 20;
+SELECT /*+ PQ(4) */ MIN(l_shipts) AS min_shipts_quantity
+FROM lineitem_ts
+WHERE l_quantity >= 20;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ MAX(l_shipts) AS max_shipts_quantity
+FROM lineitem_ts
+WHERE l_quantity <= 20;
+SELECT /*+ PQ(4) */ MAX(l_shipts) AS max_shipts_quantity
+FROM lineitem_ts
+WHERE l_quantity <= 20;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ l_orderkey, l_shipts
+FROM lineitem_ts
+ORDER BY l_orderkey;
+SELECT /*+ PQ(4) */ l_orderkey, l_shipts
+FROM lineitem_ts
+ORDER BY l_orderkey;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+CREATE TABLE lineitem_ts6 (
+  l_orderkey INT NOT NULL PRIMARY KEY,
+  l_shipts TIMESTAMP(6) NOT NULL,
+  l_quantity INT NOT NULL
+) ENGINE=InnoDB;
+
+SET time_zone= '+00:00';
+INSERT INTO lineitem_ts6 VALUES
+  (1, '1980-01-01 00:00:00.000001', 10),
+  (2, '1980-01-01 00:00:00.000002', 20),
+  (3, '1980-01-02 00:00:00.123456', 30);
+
+SET time_zone= '+05:30';
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ MIN(l_shipts) AS min_shipts6
+FROM lineitem_ts6;
+SELECT /*+ PQ(4) */ MIN(l_shipts) AS min_shipts6
+FROM lineitem_ts6;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ MAX(l_shipts) AS max_shipts6
+FROM lineitem_ts6;
+SELECT /*+ PQ(4) */ MAX(l_shipts) AS max_shipts6
+FROM lineitem_ts6;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ l_orderkey, l_shipts
+FROM lineitem_ts6
+ORDER BY l_orderkey;
+SELECT /*+ PQ(4) */ l_orderkey, l_shipts
+FROM lineitem_ts6
+ORDER BY l_orderkey;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+DROP TABLE lineitem_ts6;
+SET time_zone= '+05:30';
+SET optimizer_trace= 1;
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS timestamp_trace_count
+FROM lineitem_ts
+WHERE l_shipts > '1980-01-01 00:00:00';
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, l_quantity
+FROM lineitem_ts
+WHERE l_shipts > '1980-01-01 00:00:00'
+ORDER BY l_orderkey;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_shipts, COUNT(*) AS timestamp_group_count
+FROM lineitem_ts
+GROUP BY l_shipts
+ORDER BY l_shipts;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, l_quantity
+FROM lineitem_ts
+ORDER BY l_shipts
+LIMIT 2;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, l_shipts
+FROM lineitem_ts
+ORDER BY l_shipts
+LIMIT 2;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+CREATE TABLE lineitem_ts_q1_q6 (
+  l_orderkey INT NOT NULL,
+  l_linenumber INT NOT NULL,
+  l_shipts TIMESTAMP NOT NULL,
+  l_returnflag CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+  l_linestatus CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+  l_quantity DECIMAL(15,2) NOT NULL,
+  l_extendedprice DECIMAL(15,2) NOT NULL,
+  l_discount DECIMAL(15,2) NOT NULL,
+  l_tax DECIMAL(15,2) NOT NULL,
+  PRIMARY KEY (l_orderkey, l_linenumber)
+) ENGINE=InnoDB;
+
+SET time_zone= '+00:00';
+INSERT INTO lineitem_ts_q1_q6 VALUES
+  (1, 1, '1998-09-01 00:00:00', 'A', 'F', 10.00, 100.00, 0.05, 0.10),
+  (2, 1, '1998-09-01 12:00:00', 'A', 'F', 20.00, 200.00, 0.06, 0.08),
+  (3, 1, '1998-09-02 00:00:00', 'N', 'O', 30.00, 300.00, 0.07, 0.04),
+  (4, 1, '1998-09-03 00:00:00', 'R', 'F', 40.00, 400.00, 0.08, 0.02);
+
+SET time_zone= '+05:30';
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_timestamp_revenue
+FROM lineitem_ts_q1_q6
+WHERE l_shipts >= TIMESTAMP '1998-09-01 00:00:00'
+  AND l_shipts < TIMESTAMP '1998-09-03 00:00:00'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 35;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       COUNT(*) AS count_order,
+       SUM(l_quantity) AS sum_qty
+FROM lineitem_ts_q1_q6
+WHERE l_shipts >= TIMESTAMP '1998-09-01 00:00:00'
+  AND l_shipts < TIMESTAMP '1998-09-03 00:00:00'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+DROP TABLE lineitem_ts_q1_q6;
+
+SET optimizer_trace= @save_optimizer_trace;
+SET optimizer_switch= @save_optimizer_switch;
+SET pq_support_features_switch= @save_pq_support_features_switch;
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;
+SET time_zone= @save_time_zone;
+
+DROP TABLE lineitem_ts;

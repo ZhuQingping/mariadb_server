@@ -1,0 +1,115 @@
+--source include/have_innodb.inc
+--source include/have_debug_sync.inc
+
+--echo #
+--echo # Parallel Query MVCC primary-key update boundaries.
+--echo #
+
+CREATE TABLE pq_mvcc_pk_update (
+  id INT NOT NULL PRIMARY KEY,
+  shipdate DATE NOT NULL,
+  quantity INT NOT NULL
+) ENGINE=InnoDB;
+
+INSERT INTO pq_mvcc_pk_update VALUES
+  (1, '1980-01-02', 10),
+  (2, '1980-01-03', 20),
+  (3, '1980-01-04', 30),
+  (4, '1980-01-05', 40),
+  (5, '1980-01-06', 50),
+  (6, '1980-01-07', 60),
+  (7, '1980-01-08', 70),
+  (8, '1980-01-09', 80);
+
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_optimizer_switch= @@optimizer_switch;
+SET @save_transaction_isolation= @@transaction_isolation;
+
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on';
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+
+connect (pq_mvcc_reader, localhost, root,,test);
+connection pq_mvcc_reader;
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+SET optimizer_switch= 'parallel_query=on';
+
+--echo # REPEATABLE READ workers keep the leader snapshot across PK movement.
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+FLUSH STATUS;
+SET debug_sync= 'after_pq_create_snapshot SIGNAL pq_mvcc_pk_rr_snapshot WAIT_FOR pq_mvcc_pk_rr_release';
+--send SELECT /*+ PQ(4) */ id AS rr_snapshot_id FROM pq_mvcc_pk_update WHERE shipdate > DATE '1980-01-01' ORDER BY id
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_mvcc_pk_rr_snapshot TIMEOUT 30';
+UPDATE pq_mvcc_pk_update SET id= 100 WHERE id= 2;
+DELETE FROM pq_mvcc_pk_update WHERE id= 3;
+INSERT INTO pq_mvcc_pk_update VALUES (9, '1980-01-10', 90);
+SET debug_sync= 'now SIGNAL pq_mvcc_pk_rr_release';
+
+connection pq_mvcc_reader;
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+
+connection default;
+SELECT id AS rr_current_id
+FROM pq_mvcc_pk_update
+WHERE shipdate > DATE '1980-01-01'
+ORDER BY id;
+
+TRUNCATE TABLE pq_mvcc_pk_update;
+INSERT INTO pq_mvcc_pk_update VALUES
+  (1, '1980-01-02', 10),
+  (2, '1980-01-03', 20),
+  (3, '1980-01-04', 30),
+  (4, '1980-01-05', 40),
+  (5, '1980-01-06', 50),
+  (6, '1980-01-07', 60),
+  (7, '1980-01-08', 70),
+  (8, '1980-01-09', 80);
+
+connection pq_mvcc_reader;
+--echo # READ COMMITTED workers keep the leader statement snapshot across PK movement.
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+FLUSH STATUS;
+SET debug_sync= 'after_pq_create_snapshot SIGNAL pq_mvcc_pk_rc_snapshot WAIT_FOR pq_mvcc_pk_rc_release';
+--send SELECT /*+ PQ(4) */ id AS rc_snapshot_id FROM pq_mvcc_pk_update WHERE shipdate > DATE '1980-01-01' ORDER BY id
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_mvcc_pk_rc_snapshot TIMEOUT 30';
+UPDATE pq_mvcc_pk_update SET id= 100 WHERE id= 2;
+DELETE FROM pq_mvcc_pk_update WHERE id= 3;
+INSERT INTO pq_mvcc_pk_update VALUES (9, '1980-01-10', 90);
+SET debug_sync= 'now SIGNAL pq_mvcc_pk_rc_release';
+
+connection pq_mvcc_reader;
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+disconnect pq_mvcc_reader;
+
+connection default;
+SELECT id AS rc_current_id
+FROM pq_mvcc_pk_update
+WHERE shipdate > DATE '1980-01-01'
+ORDER BY id;
+
+SET debug_sync= 'RESET';
+SET SESSION transaction_isolation= @save_transaction_isolation;
+SET optimizer_switch= @save_optimizer_switch;
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;
+
+DROP TABLE pq_mvcc_pk_update;

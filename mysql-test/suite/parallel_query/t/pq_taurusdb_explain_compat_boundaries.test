@@ -1,0 +1,107 @@
+--source include/have_innodb.inc
+
+--echo #
+--echo # TaurusDB EXPLAIN compatibility boundaries for MariaDB PQ v1.
+--echo #
+
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_optimizer_switch= @@optimizer_switch;
+
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on';
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+
+CREATE TABLE lineitem_pq_explain_boundary (
+  l_orderkey INT NOT NULL,
+  l_linenumber INT NOT NULL,
+  l_shipdate DATE NOT NULL,
+  l_quantity DECIMAL(15,2) NOT NULL,
+  l_extendedprice DECIMAL(15,2) NOT NULL,
+  l_discount DECIMAL(15,2) NOT NULL,
+  PRIMARY KEY (l_orderkey, l_linenumber),
+  KEY idx_pq_explain_shipdate (l_shipdate)
+) ENGINE=InnoDB;
+
+INSERT INTO lineitem_pq_explain_boundary VALUES
+  (1, 1, '1993-12-31', 10.00, 100.00, 0.06),
+  (2, 1, '1994-01-01', 12.00, 200.00, 0.05),
+  (3, 1, '1994-06-15', 23.00, 300.00, 0.06),
+  (4, 1, '1994-12-31', 24.00, 400.00, 0.07),
+  (5, 1, '1995-01-01', 20.00, 500.00, 0.06);
+
+--echo # Traditional EXPLAIN exposes the current MariaDB gather node.
+--replace_column 9 #
+EXPLAIN SELECT /*+ PQ(4) */
+       SUM(l_extendedprice * l_discount) AS revenue
+FROM lineitem_pq_explain_boundary FORCE INDEX(idx_pq_explain_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 24;
+
+--echo # JSON EXPLAIN exposes parallel_execute for the current gather shape.
+--replace_regex /"rows": [0-9]+/"rows": #/ /"cost": [0-9.]+/"cost": #/
+EXPLAIN FORMAT=JSON SELECT /*+ PQ(4) */
+       SUM(l_extendedprice * l_discount) AS revenue
+FROM lineitem_pq_explain_boundary FORCE INDEX(idx_pq_explain_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 24;
+
+--echo # MariaDB ANALYZE FORMAT=JSON is supported at gather/plan level.
+--replace_regex /"r_total_time_ms": [0-9.]+/"r_total_time_ms": #/ /"r_table_time_ms": [0-9.]+/"r_table_time_ms": #/ /"r_other_time_ms": [0-9.]+/"r_other_time_ms": #/ /"cost": [0-9.]+/"cost": #/ /"pages_accessed": [0-9]+/"pages_accessed": #/
+ANALYZE FORMAT=JSON SELECT /*+ PQ(4) */
+       SUM(l_extendedprice * l_discount) AS revenue
+FROM lineitem_pq_explain_boundary FORCE INDEX(idx_pq_explain_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 24;
+
+--echo # The same query executes on the current PQ path.
+FLUSH STATUS;
+SELECT /*+ PQ(4) */
+       SUM(l_extendedprice * l_discount) AS revenue
+FROM lineitem_pq_explain_boundary FORCE INDEX(idx_pq_explain_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 24;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # MariaDB does not claim MySQL/TaurusDB EXPLAIN FORMAT=TREE parity.
+--error ER_UNKNOWN_EXPLAIN_FORMAT
+EXPLAIN FORMAT=TREE SELECT /*+ PQ(4) */
+       SUM(l_extendedprice * l_discount) AS revenue
+FROM lineitem_pq_explain_boundary FORCE INDEX(idx_pq_explain_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 24;
+
+--echo # MariaDB uses ANALYZE SELECT/ANALYZE FORMAT=JSON, not MySQL EXPLAIN ANALYZE worker timing.
+--error ER_PARSE_ERROR
+EXPLAIN ANALYZE SELECT /*+ PQ(4) */
+       SUM(l_extendedprice * l_discount) AS revenue
+FROM lineitem_pq_explain_boundary FORCE INDEX(idx_pq_explain_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 24;
+
+SET optimizer_switch= @save_optimizer_switch;
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;
+
+DROP TABLE lineitem_pq_explain_boundary;

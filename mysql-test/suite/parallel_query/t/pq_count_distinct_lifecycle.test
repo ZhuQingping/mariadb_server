@@ -1,0 +1,191 @@
+--source include/have_innodb.inc
+--source include/have_debug_sync.inc
+
+--echo #
+--echo # COUNT(DISTINCT) PQ lifecycle coverage.
+--echo #
+
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_pq_support_features_switch= @@pq_support_features_switch;
+SET @save_transaction_isolation= @@transaction_isolation;
+
+SET GLOBAL parallel_max_threads= 16;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET pq_support_features_switch= 'simple_aggregate=on,count_distinct=on';
+
+CREATE TABLE pq_cd_scalar_lifecycle (
+  id INT NOT NULL PRIMARY KEY,
+  shipdate DATE NOT NULL,
+  qty INT NULL
+) ENGINE=InnoDB;
+
+INSERT INTO pq_cd_scalar_lifecycle VALUES
+  (1, '1980-01-02', 10),
+  (2, '1980-01-03', 20),
+  (75, '1980-01-04', 10),
+  (76, '1980-01-05', 30),
+  (150, '1980-01-06', NULL),
+  (151, '1980-01-07', 20),
+  (152, '1979-12-31', 40);
+
+CREATE TABLE pq_cd_group_lifecycle (
+  id INT NOT NULL PRIMARY KEY,
+  shipdate DATE NOT NULL,
+  returnflag CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+  linestatus CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+  qty INT NULL
+) ENGINE=InnoDB;
+
+INSERT INTO pq_cd_group_lifecycle VALUES
+  (1, '1998-09-01', 'A', 'F', 10),
+  (2, '1998-09-01', 'A', 'F', 20),
+  (75, '1998-09-01', 'A', 'F', 10),
+  (76, '1998-09-01', 'N', 'O', 30),
+  (150, '1998-09-01', 'A', 'F', NULL),
+  (151, '1998-09-01', 'N', 'O', 30),
+  (152, '1998-09-01', 'N', 'O', 40),
+  (153, '1998-09-03', 'R', 'F', 50);
+
+--echo #
+--echo # Scalar COUNT(DISTINCT) uses the statement snapshot after worker cloning.
+--echo #
+
+connect (pq_cd_scalar_reader, localhost, root,,test);
+connect (pq_cd_scalar_writer, localhost, root,,test);
+
+connection pq_cd_scalar_reader;
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+SET pq_support_features_switch= 'simple_aggregate=on,count_distinct=on';
+SET debug_sync= 'after_pq_create_snapshot SIGNAL pq_cd_scalar_snapshot WAIT_FOR pq_cd_scalar_release';
+--send SELECT /*+ PQ(4) */ COUNT(DISTINCT qty) AS scalar_cd_snapshot_count FROM pq_cd_scalar_lifecycle WHERE shipdate > '1980-01-01'
+
+connection pq_cd_scalar_writer;
+SET debug_sync= 'now WAIT_FOR pq_cd_scalar_snapshot TIMEOUT 30';
+INSERT INTO pq_cd_scalar_lifecycle VALUES (200, '1980-01-08', 40);
+UPDATE pq_cd_scalar_lifecycle
+SET shipdate= '1980-01-09', qty= 50
+WHERE id= 152;
+DELETE FROM pq_cd_scalar_lifecycle WHERE id= 1;
+SET debug_sync= 'now SIGNAL pq_cd_scalar_release';
+
+connection pq_cd_scalar_reader;
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+disconnect pq_cd_scalar_reader;
+
+connection pq_cd_scalar_writer;
+SELECT COUNT(DISTINCT qty) AS scalar_cd_current_count
+FROM pq_cd_scalar_lifecycle
+WHERE shipdate > '1980-01-01';
+disconnect pq_cd_scalar_writer;
+
+connection default;
+SET debug_sync= 'RESET';
+
+--echo #
+--echo # Grouped COUNT(DISTINCT) uses the statement snapshot after worker cloning.
+--echo #
+
+connect (pq_cd_group_reader, localhost, root,,test);
+connect (pq_cd_group_writer, localhost, root,,test);
+
+connection pq_cd_group_reader;
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+SET pq_support_features_switch= 'simple_aggregate=on,count_distinct=on';
+SET debug_sync= 'after_pq_create_snapshot SIGNAL pq_cd_group_snapshot WAIT_FOR pq_cd_group_release';
+--send SELECT /*+ PQ(4) */ returnflag, linestatus, COUNT(DISTINCT qty) AS grouped_cd_snapshot_count FROM pq_cd_group_lifecycle WHERE shipdate <= DATE '1998-09-02' GROUP BY returnflag, linestatus ORDER BY returnflag, linestatus
+
+connection pq_cd_group_writer;
+SET debug_sync= 'now WAIT_FOR pq_cd_group_snapshot TIMEOUT 30';
+INSERT INTO pq_cd_group_lifecycle VALUES (154, '1998-09-01', 'A', 'F', 60);
+UPDATE pq_cd_group_lifecycle
+SET shipdate= '1998-09-01', returnflag= 'N', linestatus= 'O', qty= 70
+WHERE id= 153;
+DELETE FROM pq_cd_group_lifecycle WHERE id= 1;
+SET debug_sync= 'now SIGNAL pq_cd_group_release';
+
+connection pq_cd_group_reader;
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+disconnect pq_cd_group_reader;
+
+connection pq_cd_group_writer;
+SELECT returnflag, linestatus,
+       COUNT(DISTINCT qty) AS grouped_cd_current_count
+FROM pq_cd_group_lifecycle
+WHERE shipdate <= DATE '1998-09-02'
+GROUP BY returnflag, linestatus
+ORDER BY returnflag, linestatus;
+disconnect pq_cd_group_writer;
+
+connection default;
+SET debug_sync= 'RESET';
+
+--echo #
+--echo # Scalar COUNT(DISTINCT) releases resources after materialized-ready KILL.
+--echo #
+
+connect (pq_cd_scalar_kill_leader, localhost, root,,test);
+--let $pq_cd_scalar_kill_leader_id= `SELECT CONNECTION_ID()`
+SET pq_support_features_switch= 'simple_aggregate=on,count_distinct=on';
+SET debug_sync= 'after_pq_materialized_result_ready SIGNAL pq_cd_scalar_ready WAIT_FOR pq_cd_scalar_kill_release';
+--send SELECT /*+ PQ(4) */ COUNT(DISTINCT qty) AS scalar_cd_killed_count FROM pq_cd_scalar_lifecycle WHERE shipdate > '1980-01-01'
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_cd_scalar_ready TIMEOUT 30';
+--disable_query_log
+--eval KILL QUERY $pq_cd_scalar_kill_leader_id
+--enable_query_log
+SET debug_sync= 'now SIGNAL pq_cd_scalar_kill_release';
+
+connection pq_cd_scalar_kill_leader;
+--error ER_QUERY_INTERRUPTED
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+disconnect pq_cd_scalar_kill_leader;
+
+connection default;
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+SET debug_sync= 'RESET';
+
+--echo #
+--echo # Grouped COUNT(DISTINCT) releases resources after materialized-ready KILL.
+--echo #
+
+connect (pq_cd_group_kill_leader, localhost, root,,test);
+--let $pq_cd_group_kill_leader_id= `SELECT CONNECTION_ID()`
+SET pq_support_features_switch= 'simple_aggregate=on,count_distinct=on';
+SET debug_sync= 'after_pq_materialized_result_ready SIGNAL pq_cd_group_ready WAIT_FOR pq_cd_group_kill_release';
+--send SELECT /*+ PQ(4) */ returnflag, linestatus, COUNT(DISTINCT qty) AS grouped_cd_killed_count FROM pq_cd_group_lifecycle WHERE shipdate <= DATE '1998-09-02' GROUP BY returnflag, linestatus ORDER BY returnflag, linestatus
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_cd_group_ready TIMEOUT 30';
+--disable_query_log
+--eval KILL QUERY $pq_cd_group_kill_leader_id
+--enable_query_log
+SET debug_sync= 'now SIGNAL pq_cd_group_kill_release';
+
+connection pq_cd_group_kill_leader;
+--error ER_QUERY_INTERRUPTED
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+disconnect pq_cd_group_kill_leader;
+
+connection default;
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+SET debug_sync= 'RESET';
+
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET pq_support_features_switch= @save_pq_support_features_switch;
+SET SESSION transaction_isolation= @save_transaction_isolation;
+
+DROP TABLE pq_cd_group_lifecycle;
+DROP TABLE pq_cd_scalar_lifecycle;

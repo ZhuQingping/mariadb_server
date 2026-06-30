@@ -1,0 +1,793 @@
+#
+# Grouped expression and shape trace boundaries cover unsafe functions,
+# predicate expressions, ROLLUP, HAVING, and ORDER BY variants.
+#
+SET @save_optimizer_trace= @@optimizer_trace;
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_pq_support_features_switch= @@pq_support_features_switch;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_optimizer_switch= @@optimizer_switch;
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on';
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+SET pq_support_features_switch= 'simple_aggregate=on,count_distinct=on';
+SET optimizer_trace= 'enabled=on';
+CREATE TABLE lineitem_q1_group (
+l_orderkey INT NOT NULL,
+l_linenumber INT NOT NULL,
+l_shipdate DATE NOT NULL,
+l_returnflag CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+l_linestatus CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+l_quantity DECIMAL(15,2) NOT NULL,
+l_extendedprice DECIMAL(15,2) NOT NULL,
+l_discount DECIMAL(15,2) NOT NULL,
+l_tax DECIMAL(15,2) NOT NULL,
+l_nullable_quantity DECIMAL(15,2) NULL,
+l_comment BLOB NOT NULL,
+PRIMARY KEY (l_orderkey, l_linenumber)
+) ENGINE=InnoDB;
+INSERT INTO lineitem_q1_group VALUES
+(1, 1, '1998-09-01', 'A', 'F', 10.00, 100.00, 0.05, 0.10, NULL, 'aa'),
+(2, 1, '1998-09-02', 'A', 'F', 20.00, 200.00, 0.10, 0.08, NULL, 'bbb'),
+(3, 1, '1998-09-03', 'A', 'F', 30.00, 300.00, 0.02, 0.04, NULL, 'cccc'),
+(4, 1, '1998-08-30', 'N', 'O', 40.00, 400.00, 0.07, 0.05, 40.00, 'dd'),
+(5, 1, '1998-08-31', 'N', 'O', 50.00, 500.00, 0.06, 0.03, NULL, 'eee'),
+(6, 1, '1998-07-15', 'R', 'F', 60.00, 600.00, 0.08, 0.07, 60.00, 'ffff');
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+SUM(SLEEP(0)) AS sleep_group_sum
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	sleep_group_sum
+A	F	0
+N	O	0
+R	F	0
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_side_effect_function"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+SUM(RAND() < -1) AS rand_group_sum
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	rand_group_sum
+A	F	0
+N	O	0
+R	F	0
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_nondeterministic_function"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+SUM(SYSDATE() IS NULL) AS sysdate_group_sum
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	sysdate_group_sum
+A	F	0
+N	O	0
+R	F	0
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_time_function"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+BIT_AND(l_orderkey) AS bit_and_orderkey
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	bit_and_orderkey
+A	F	0
+N	O	4
+R	F	6
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_aggregate_expression"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+BIT_OR(l_orderkey) AS bit_or_orderkey
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	bit_or_orderkey
+A	F	3
+N	O	5
+R	F	6
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_aggregate_expression"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+BIT_XOR(l_orderkey) AS bit_xor_orderkey
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	bit_xor_orderkey
+A	F	3
+N	O	1
+R	F	6
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_aggregate_expression"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ l_returnflag, l_linestatus,
+COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING AVG(l_quantity) > 10
+ORDER BY AVG(l_quantity), l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	count_order
+A	F	2
+N	O	2
+R	F	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+  AND l_quantity + 1 > 30
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	count_order
+N	O	2
+R	F	1
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_predicate_or_expression"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ l_returnflag, l_linestatus,
+COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING SUM(l_extendedprice * (1 - l_discount)) > 500
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	count_order
+N	O	2
+R	F	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING SUM(l_extendedprice * (1 - l_discount)) > 500
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	count_order
+N	O	2
+R	F	1
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING MIN(l_shipdate) <= DATE '1998-08-30'
+ORDER BY MIN(l_shipdate), l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	count_order
+R	F	1
+N	O	2
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING SUM(RAND() < -1) >= 0
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	count_order
+A	F	2
+N	O	2
+R	F	1
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_grouped_having"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING SUM(l_extendedprice * (1 - l_discount)) > 500
+ORDER BY SUM(l_extendedprice * (1 - l_discount)), l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	count_order
+R	F	1
+N	O	2
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus WITH ROLLUP;
+l_returnflag	l_linestatus	count_order
+A	F	2
+A	NULL	2
+N	O	2
+N	NULL	2
+R	F	1
+R	NULL	1
+NULL	NULL	5
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_group_rollup"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ l_returnflag, l_linestatus,
+COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING SUM(l_quantity) > 10
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	count_order
+A	F	2
+N	O	2
+R	F	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING SUM(l_quantity) > 10
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	count_order
+A	F	2
+N	O	2
+R	F	1
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING SUM(l_quantity) > 10
+ORDER BY SUM(l_quantity), l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	count_order
+A	F	2
+R	F	1
+N	O	2
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ l_returnflag, l_linestatus
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING COUNT(*) > 1
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus
+A	F
+N	O
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING COUNT(*) > 1
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus
+A	F
+N	O
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING MAX(l_extendedprice) >= 500
+ORDER BY MAX(l_extendedprice) DESC, l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	count_order
+R	F	1
+N	O	2
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING COUNT(l_quantity) = 2
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus
+A	F
+N	O
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ l_returnflag, l_linestatus
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING COUNT(l_nullable_quantity) = 0
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus
+A	F
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING COUNT(l_nullable_quantity) = 0
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus
+A	F
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING SUM(l_nullable_quantity) IS NULL
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus
+A	F
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING COUNT(1 + 0) > 1
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus
+A	F
+N	O
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_aggregate_expression"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING AVG(l_quantity) > 10
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	count_order
+A	F	2
+N	O	2
+R	F	1
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING AVG(l_quantity) > 10
+ORDER BY AVG(l_quantity), l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	count_order
+A	F	2
+N	O	2
+R	F	1
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING AVG(l_quantity + 1) > 10
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	count_order
+A	F	2
+N	O	2
+R	F	1
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_grouped_having"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ l_returnflag, l_linestatus,
+COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING MIN(l_shipdate) <= DATE '1998-08-30'
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	count_order
+N	O	2
+R	F	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING MIN(l_shipdate) <= DATE '1998-08-30'
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	count_order
+N	O	2
+R	F	1
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING MAX(l_extendedprice) >= 500
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	count_order
+N	O	2
+R	F	1
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING AVG(l_nullable_quantity) IS NULL
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus
+A	F
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING SUM(l_quantity) > (SELECT 1 FROM lineitem_q1_group
+WHERE l_orderkey = 1 AND l_linenumber = 1)
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	count_order
+A	F	2
+N	O	2
+R	F	1
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 2,
+        "chosen": false,
+        "reason": "zero_result_or_const_table"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING count_order > 1
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	count_order
+A	F	2
+N	O	2
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_linestatus, l_returnflag;
+l_returnflag	l_linestatus	count_order
+A	F	2
+R	F	1
+N	O	2
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_group_order"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ l_returnflag, l_linestatus,
+COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY count_order DESC, l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	count_order
+A	F	2
+N	O	2
+R	F	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY count_order DESC, l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	count_order
+A	F	2
+N	O	2
+R	F	1
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ l_returnflag, l_linestatus,
+SUM(l_quantity) AS sum_qty
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY sum_qty ASC, l_returnflag;
+l_returnflag	l_linestatus	sum_qty
+A	F	30.00
+R	F	60.00
+N	O	90.00
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+SUM(l_quantity) AS sum_qty
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY sum_qty ASC, l_returnflag;
+l_returnflag	l_linestatus	sum_qty
+A	F	30.00
+R	F	60.00
+N	O	90.00
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+AVG(l_quantity) AS avg_qty
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY avg_qty ASC, l_returnflag;
+l_returnflag	l_linestatus	avg_qty
+A	F	15.000000
+N	O	45.000000
+R	F	60.000000
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+SET optimizer_trace= @save_optimizer_trace;
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET pq_support_features_switch= @save_pq_support_features_switch;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET optimizer_switch= @save_optimizer_switch;
+DROP TABLE lineitem_q1_group;

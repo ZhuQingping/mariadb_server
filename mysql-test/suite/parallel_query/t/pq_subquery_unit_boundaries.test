@@ -1,0 +1,482 @@
+--source include/have_innodb.inc
+
+--echo #
+--echo # Parallel Query subquery and unit boundary coverage.
+--echo #
+
+CREATE TABLE lineitem (
+  l_orderkey INT NOT NULL PRIMARY KEY,
+  l_shipdate DATE NOT NULL,
+  l_quantity INT NOT NULL
+) ENGINE=InnoDB;
+
+INSERT INTO lineitem VALUES
+  (1, '1979-12-31', 10),
+  (2, '1980-01-01', 20),
+  (3, '1980-01-02', 30),
+  (4, '1981-05-10', 40),
+  (5, '1992-07-15', 50),
+  (6, '1978-03-20', 60),
+  (7, '1980-06-01', 70),
+  (8, '1985-09-09', 80);
+
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_pq_support_features_switch= @@pq_support_features_switch;
+SET @save_optimizer_trace= @@optimizer_trace;
+SET @save_optimizer_switch= @@optimizer_switch;
+SET @save_transaction_isolation= @@transaction_isolation;
+
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on';
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+SET optimizer_trace= 1;
+
+SET pq_support_features_switch= 'simple_aggregate=on';
+
+FLUSH STATUS;
+SELECT (SELECT /*+ PQ(4) */ COUNT(*)
+        FROM lineitem
+        WHERE l_shipdate > '1980-01-01') AS scalar_subquery_trace_count;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT (SELECT /*+ PQ(4) */ SUM(l_quantity)
+        FROM lineitem
+        WHERE l_shipdate > '1980-01-01') AS scalar_subquery_trace_sum;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_quantity + (SELECT 1)) AS scalar_subquery_arg_sum
+FROM lineitem
+WHERE l_shipdate > '1980-01-01';
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_quantity + (SELECT AVG(l_quantity)
+                                      FROM lineitem
+                                      WHERE l_orderkey < 0)) AS scalar_subquery_arg_empty_sum
+FROM lineitem
+WHERE l_shipdate > '1980-01-01';
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_quantity + (SELECT l_quantity
+                                      FROM lineitem
+                                      WHERE l_orderkey IN (1, 2))) AS scalar_subquery_arg_no_match_sum
+FROM lineitem
+WHERE l_shipdate > '2099-01-01';
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+--error ER_SUBQUERY_NO_1_ROW
+SELECT /*+ PQ(4) */ SUM(l_quantity + (SELECT l_quantity
+                                      FROM lineitem
+                                      WHERE l_orderkey IN (1, 2))) AS scalar_subquery_arg_multirow_sum
+FROM lineitem
+WHERE l_shipdate > '1980-01-01';
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_quantity + (SELECT 1)) AS scalar_subquery_arg_read_committed_sum
+FROM lineitem
+WHERE l_shipdate > '1980-01-01';
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_quantity + (SELECT lineitem.l_orderkey)) AS scalar_subquery_arg_dependent_sum
+FROM lineitem
+WHERE l_shipdate > '1980-01-01';
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_quantity + (SELECT 1 UNION SELECT 1)) AS scalar_subquery_arg_union_sum
+FROM lineitem
+WHERE l_shipdate > '1980-01-01';
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_shipdate,
+       SUM(l_quantity + (SELECT 1)) AS grouped_scalar_subquery_arg_sum
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+GROUP BY l_shipdate
+ORDER BY l_shipdate;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_shipdate,
+       SUM(l_quantity + (SELECT 1)) AS grouped_scalar_subquery_sum,
+       AVG(l_quantity + (SELECT 1)) AS grouped_scalar_subquery_avg,
+       COUNT(*) AS grouped_scalar_subquery_count
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+GROUP BY l_shipdate
+ORDER BY l_shipdate;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_shipdate,
+       SUM(l_quantity + (SELECT 1)) AS grouped_scalar_subquery_sum,
+       AVG(l_quantity + (SELECT 1)) AS grouped_scalar_subquery_avg,
+       COUNT(*) AS grouped_scalar_subquery_count
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+GROUP BY l_shipdate
+ORDER BY l_shipdate;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey,
+       (SELECT COUNT(*) FROM lineitem WHERE l_quantity > 0) AS projection_scalar_count
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+ORDER BY l_orderkey
+LIMIT 3;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey,
+       (SELECT COUNT(*) FROM lineitem WHERE l_quantity > 0) AS projection_scalar_read_committed
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+ORDER BY l_orderkey
+LIMIT 3;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey,
+       l_quantity + (SELECT 1) AS projection_scalar_expression
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+ORDER BY l_orderkey
+LIMIT 3;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey,
+       (SELECT lineitem.l_orderkey) AS projection_scalar_dependent
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+ORDER BY l_orderkey
+LIMIT 3;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, l_quantity
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+ORDER BY (SELECT 1), l_orderkey
+LIMIT 2;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, l_quantity
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+ORDER BY (SELECT 1) + l_quantity DESC, l_orderkey
+LIMIT 2;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, l_quantity
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+ORDER BY (SELECT 1) + l_quantity DESC, l_orderkey
+LIMIT 2;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, l_quantity
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+ORDER BY (SELECT lineitem.l_orderkey) + l_quantity DESC, l_orderkey
+LIMIT 2;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, l_quantity
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+ORDER BY (SELECT 1 UNION SELECT 1) + l_quantity DESC, l_orderkey
+LIMIT 2;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+--replace_column 9 #
+EXPLAIN SELECT /*+ PQ(4) */ COUNT(*) AS scalar_predicate_explain_count
+FROM lineitem
+WHERE l_quantity > (SELECT AVG(l_quantity) FROM lineitem);
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS scalar_predicate_count
+FROM lineitem
+WHERE l_quantity > (SELECT AVG(l_quantity) FROM lineitem);
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS scalar_predicate_reversed_count
+FROM lineitem
+WHERE (SELECT AVG(l_quantity) FROM lineitem) < l_quantity;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS scalar_predicate_between_count
+FROM lineitem
+WHERE l_quantity BETWEEN (SELECT MIN(l_quantity) FROM lineitem)
+                     AND (SELECT AVG(l_quantity) FROM lineitem);
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS scalar_predicate_empty_count
+FROM lineitem
+WHERE l_quantity > (SELECT AVG(l_quantity)
+                    FROM lineitem
+                    WHERE l_orderkey < 0);
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS scalar_predicate_uncacheable_count
+FROM lineitem
+WHERE l_quantity > (SELECT RAND() FROM lineitem AS li_rand LIMIT 1);
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+--error ER_SUBQUERY_NO_1_ROW
+SELECT /*+ PQ(4) */ COUNT(*) AS scalar_predicate_multirow_count
+FROM lineitem
+WHERE l_quantity > (SELECT l_quantity
+                    FROM lineitem
+                    WHERE l_orderkey IN (1, 2));
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS scalar_predicate_read_committed_count
+FROM lineitem
+WHERE l_quantity > (SELECT AVG(l_quantity) FROM lineitem);
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+
+FLUSH STATUS;
+SELECT l_orderkey,
+       (SELECT /*+ PQ(4) */ COUNT(*)
+        FROM lineitem AS li2
+        WHERE li2.l_quantity > lineitem.l_quantity) AS dependent_scalar_count
+FROM lineitem
+WHERE l_orderkey= 3;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS dependent_scalar_predicate_count
+FROM lineitem
+WHERE l_quantity > (SELECT AVG(li2.l_quantity)
+                    FROM lineitem AS li2
+                    WHERE li2.l_orderkey < lineitem.l_orderkey);
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT d.derived_count
+FROM (
+  SELECT /*+ PQ(4) */ COUNT(*) AS derived_count
+  FROM lineitem
+  WHERE l_shipdate > '1980-01-01'
+) AS d;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT d.derived_sum
+FROM (
+  SELECT /*+ PQ(4) */ SUM(l_quantity) AS derived_sum
+  FROM lineitem
+  WHERE l_shipdate > '1980-01-01'
+) AS d;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT COUNT(*) AS derived_table_trace_count
+FROM (
+  SELECT /*+ PQ(4) */ l_orderkey
+  FROM lineitem
+  WHERE l_shipdate > '1980-01-01'
+  GROUP BY l_orderkey
+) AS d
+WHERE d.l_orderkey > 0;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT d.l_orderkey, d.derived_group_count
+FROM (
+  SELECT /*+ PQ(4) */ l_orderkey, COUNT(*) AS derived_group_count
+  FROM lineitem
+  WHERE l_shipdate > '1980-01-01'
+  GROUP BY l_orderkey
+) AS d
+ORDER BY d.l_orderkey
+LIMIT 3;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+WITH cte AS (
+  SELECT /*+ PQ(4) */ l_orderkey
+  FROM lineitem
+  WHERE l_shipdate > '1980-01-01'
+  GROUP BY l_orderkey
+)
+SELECT COUNT(*) AS cte_trace_count FROM cte;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+WITH RECURSIVE cte(n) AS (
+  SELECT 1
+  UNION ALL
+  SELECT n + 1 FROM cte WHERE n < 3
+)
+SELECT /*+ PQ(4) */ SUM(l_quantity) AS recursive_cte_sum
+FROM lineitem
+WHERE l_orderkey IN (SELECT n FROM cte);
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS union_trace_count
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+UNION ALL
+SELECT /*+ PQ(4) */ COUNT(*) AS union_trace_count
+FROM lineitem
+WHERE l_quantity > 0;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_quantity) AS union_sum_trace
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+UNION ALL
+SELECT /*+ PQ(4) */ SUM(l_quantity * 2) AS union_sum_trace
+FROM lineitem
+WHERE l_quantity > 0;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey
+FROM lineitem
+WHERE l_quantity > 20
+INTERSECT
+SELECT l_orderkey
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+ORDER BY l_orderkey;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+EXCEPT
+SELECT l_orderkey
+FROM lineitem
+WHERE l_quantity > 70
+ORDER BY l_orderkey;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+SET SESSION transaction_isolation= @save_transaction_isolation;
+SET optimizer_trace= @save_optimizer_trace;
+SET optimizer_switch= @save_optimizer_switch;
+SET pq_support_features_switch= @save_pq_support_features_switch;
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;
+
+DROP TABLE lineitem;

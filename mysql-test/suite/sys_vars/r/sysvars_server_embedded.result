@@ -1082,6 +1082,16 @@ NUMERIC_BLOCK_SIZE	1
 ENUM_VALUE_LIST	NULL
 READ_ONLY	NO
 COMMAND_LINE_ARGUMENT	REQUIRED
+VARIABLE_NAME	FORCE_PARALLEL_EXECUTE
+VARIABLE_SCOPE	SESSION
+VARIABLE_TYPE	BOOLEAN
+VARIABLE_COMMENT	Force parallel query execution in the current session when the statement is eligible
+NUMERIC_MIN_VALUE	NULL
+NUMERIC_MAX_VALUE	NULL
+NUMERIC_BLOCK_SIZE	NULL
+ENUM_VALUE_LIST	OFF,ON
+READ_ONLY	NO
+COMMAND_LINE_ARGUMENT	OPTIONAL
 VARIABLE_NAME	FOREIGN_KEY_CHECKS
 VARIABLE_SCOPE	SESSION
 VARIABLE_TYPE	BOOLEAN
@@ -2699,7 +2709,7 @@ VARIABLE_COMMENT	Fine-tune the optimizer behavior
 NUMERIC_MIN_VALUE	NULL
 NUMERIC_MAX_VALUE	NULL
 NUMERIC_BLOCK_SIZE	NULL
-ENUM_VALUE_LIST	index_merge,index_merge_union,index_merge_sort_union,index_merge_intersection,index_merge_sort_intersection,index_condition_pushdown,derived_merge,derived_with_keys,firstmatch,loosescan,duplicateweedout,materialization,in_to_exists,semijoin,partial_match_rowid_merge,partial_match_table_scan,subquery_cache,mrr,mrr_cost_based,mrr_sort_keys,outer_join_with_cache,semijoin_with_cache,join_cache_incremental,join_cache_hashed,join_cache_bka,optimize_join_buffer_size,table_elimination,extended_keys,exists_to_in,orderby_uses_equalities,condition_pushdown_for_derived,split_materialized,condition_pushdown_for_subquery,rowid_filter,condition_pushdown_from_having,not_null_range_scan,hash_join_cardinality,cset_narrowing,sargable_casefold,reorder_outer_joins,default
+ENUM_VALUE_LIST	index_merge,index_merge_union,index_merge_sort_union,index_merge_intersection,index_merge_sort_intersection,index_condition_pushdown,derived_merge,derived_with_keys,firstmatch,loosescan,duplicateweedout,materialization,in_to_exists,semijoin,partial_match_rowid_merge,partial_match_table_scan,subquery_cache,mrr,mrr_cost_based,mrr_sort_keys,outer_join_with_cache,semijoin_with_cache,join_cache_incremental,join_cache_hashed,join_cache_bka,optimize_join_buffer_size,table_elimination,extended_keys,exists_to_in,orderby_uses_equalities,condition_pushdown_for_derived,split_materialized,condition_pushdown_for_subquery,rowid_filter,condition_pushdown_from_having,not_null_range_scan,hash_join_cardinality,cset_narrowing,sargable_casefold,reorder_outer_joins,parallel_query,default
 READ_ONLY	NO
 COMMAND_LINE_ARGUMENT	REQUIRED
 VARIABLE_NAME	OPTIMIZER_TRACE
@@ -2738,6 +2748,146 @@ VARIABLE_TYPE	DOUBLE
 VARIABLE_COMMENT	Cost of checking the row against the WHERE clause. Increasing this will have the optimizer to prefer plans with less row combinations
 NUMERIC_MIN_VALUE	0
 NUMERIC_MAX_VALUE	100000
+NUMERIC_BLOCK_SIZE	NULL
+ENUM_VALUE_LIST	NULL
+READ_ONLY	NO
+COMMAND_LINE_ARGUMENT	REQUIRED
+VARIABLE_NAME	OP_OVER_PQ_OFFSET_THRESHOLD
+VARIABLE_SCOPE	SESSION
+VARIABLE_TYPE	BIGINT UNSIGNED
+VARIABLE_COMMENT	TaurusDB-compatible minimum OFFSET threshold where offset pushdown may take precedence over Parallel Query. The current MariaDB PQ v1 uses this threshold for bounded ORDER BY projection PQ; larger OFFSET values remain on the serial fallback path
+NUMERIC_MIN_VALUE	0
+NUMERIC_MAX_VALUE	18446744073709551615
+NUMERIC_BLOCK_SIZE	1
+ENUM_VALUE_LIST	NULL
+READ_ONLY	NO
+COMMAND_LINE_ARGUMENT	REQUIRED
+VARIABLE_NAME	PARALLEL_BATCH_MAX_MEM_SIZE
+VARIABLE_SCOPE	SESSION
+VARIABLE_TYPE	BIGINT UNSIGNED
+VARIABLE_COMMENT	Maximum memory size in bytes for the TaurusDB parallel query batch buffer. The current MariaDB PQ MVP exposes this control variable before the full batch message protocol is ported
+NUMERIC_MIN_VALUE	0
+NUMERIC_MAX_VALUE	18446744073709551615
+NUMERIC_BLOCK_SIZE	1
+ENUM_VALUE_LIST	NULL
+READ_ONLY	NO
+COMMAND_LINE_ARGUMENT	REQUIRED
+VARIABLE_NAME	PARALLEL_BATCH_MAX_SLOT
+VARIABLE_SCOPE	SESSION
+VARIABLE_TYPE	BIGINT UNSIGNED
+VARIABLE_COMMENT	Maximum slot count for the TaurusDB parallel query batch buffer manager. The current MariaDB PQ MVP exposes this control variable before the full batch message protocol is ported
+NUMERIC_MIN_VALUE	0
+NUMERIC_MAX_VALUE	1024
+NUMERIC_BLOCK_SIZE	1
+ENUM_VALUE_LIST	NULL
+READ_ONLY	NO
+COMMAND_LINE_ARGUMENT	REQUIRED
+VARIABLE_NAME	PARALLEL_COST_THRESHOLD
+VARIABLE_SCOPE	SESSION
+VARIABLE_TYPE	BIGINT UNSIGNED
+VARIABLE_COMMENT	TaurusDB-compatible Parallel Query optimizer cost threshold. The current MariaDB PQ v1 exposes this control variable before the full TaurusDB cost model is ported
+NUMERIC_MIN_VALUE	0
+NUMERIC_MAX_VALUE	18446744073709551615
+NUMERIC_BLOCK_SIZE	1
+ENUM_VALUE_LIST	NULL
+READ_ONLY	NO
+COMMAND_LINE_ARGUMENT	REQUIRED
+VARIABLE_NAME	PARALLEL_DEFAULT_DOP
+VARIABLE_SCOPE	SESSION
+VARIABLE_TYPE	BIGINT UNSIGNED
+VARIABLE_COMMENT	Default degree of parallelism for eligible parallel queries
+NUMERIC_MIN_VALUE	0
+NUMERIC_MAX_VALUE	1024
+NUMERIC_BLOCK_SIZE	1
+ENUM_VALUE_LIST	NULL
+READ_ONLY	NO
+COMMAND_LINE_ARGUMENT	REQUIRED
+VARIABLE_NAME	PARALLEL_FAIL_RETRY
+VARIABLE_SCOPE	SESSION
+VARIABLE_TYPE	BOOLEAN
+VARIABLE_COMMENT	TaurusDB-compatible switch controlling whether Parallel Query setup failures may retry without PQ. The current MariaDB PQ v1 exposes this control variable before the full TaurusDB retry mechanism is ported
+NUMERIC_MIN_VALUE	NULL
+NUMERIC_MAX_VALUE	NULL
+NUMERIC_BLOCK_SIZE	NULL
+ENUM_VALUE_LIST	OFF,ON
+READ_ONLY	NO
+COMMAND_LINE_ARGUMENT	OPTIONAL
+VARIABLE_NAME	PARALLEL_GRACEFUL_FALLBACK
+VARIABLE_SCOPE	SESSION
+VARIABLE_TYPE	BOOLEAN
+VARIABLE_COMMENT	Allow TaurusDB-style graceful fallback from Parallel Query setup failures. The current MariaDB PQ v1 fallback remains bounded to the implemented fast paths
+NUMERIC_MIN_VALUE	NULL
+NUMERIC_MAX_VALUE	NULL
+NUMERIC_BLOCK_SIZE	NULL
+ENUM_VALUE_LIST	OFF,ON
+READ_ONLY	NO
+COMMAND_LINE_ARGUMENT	OPTIONAL
+VARIABLE_NAME	PARALLEL_LIMIT_NO_ORDER_BY
+VARIABLE_SCOPE	SESSION
+VARIABLE_TYPE	BOOLEAN
+VARIABLE_COMMENT	TaurusDB-compatible switch controlling whether LIMIT without ORDER BY may use Parallel Query. The current MariaDB PQ v1 still follows its bounded LIMIT/ORDER eligibility checks
+NUMERIC_MIN_VALUE	NULL
+NUMERIC_MAX_VALUE	NULL
+NUMERIC_BLOCK_SIZE	NULL
+ENUM_VALUE_LIST	OFF,ON
+READ_ONLY	NO
+COMMAND_LINE_ARGUMENT	OPTIONAL
+VARIABLE_NAME	PARALLEL_MAX_THREADS
+VARIABLE_SCOPE	GLOBAL
+VARIABLE_TYPE	BIGINT UNSIGNED
+VARIABLE_COMMENT	Maximum number of concurrently running parallel query worker threads
+NUMERIC_MIN_VALUE	0
+NUMERIC_MAX_VALUE	18446744073709551615
+NUMERIC_BLOCK_SIZE	1
+ENUM_VALUE_LIST	NULL
+READ_ONLY	NO
+COMMAND_LINE_ARGUMENT	REQUIRED
+VARIABLE_NAME	PARALLEL_MEMORY_LIMIT
+VARIABLE_SCOPE	GLOBAL
+VARIABLE_TYPE	BIGINT UNSIGNED
+VARIABLE_COMMENT	Global memory admission limit for parallel query worker execution. The current MariaDB PQ MVP reserves an estimated worker budget and falls back to serial execution when the limit would be exceeded
+NUMERIC_MIN_VALUE	0
+NUMERIC_MAX_VALUE	18446744073709551615
+NUMERIC_BLOCK_SIZE	4096
+ENUM_VALUE_LIST	NULL
+READ_ONLY	NO
+COMMAND_LINE_ARGUMENT	REQUIRED
+VARIABLE_NAME	PARALLEL_QUEUE_TIMEOUT
+VARIABLE_SCOPE	SESSION
+VARIABLE_TYPE	BIGINT UNSIGNED
+VARIABLE_COMMENT	Queue timeout in milliseconds for parallel query worker admission when parallel_max_threads is exhausted. A value of 0 disables waiting
+NUMERIC_MIN_VALUE	0
+NUMERIC_MAX_VALUE	18446744073709551615
+NUMERIC_BLOCK_SIZE	1
+ENUM_VALUE_LIST	NULL
+READ_ONLY	NO
+COMMAND_LINE_ARGUMENT	REQUIRED
+VARIABLE_NAME	PARALLEL_ROWS_THRESHOLD
+VARIABLE_SCOPE	SESSION
+VARIABLE_TYPE	BIGINT UNSIGNED
+VARIABLE_COMMENT	TaurusDB-compatible Parallel Query row-count threshold. The current MariaDB PQ v1 exposes this control variable before the full TaurusDB cost model is ported
+NUMERIC_MIN_VALUE	0
+NUMERIC_MAX_VALUE	18446744073709551615
+NUMERIC_BLOCK_SIZE	1
+ENUM_VALUE_LIST	NULL
+READ_ONLY	NO
+COMMAND_LINE_ARGUMENT	REQUIRED
+VARIABLE_NAME	PARALLEL_SETUP_COST
+VARIABLE_SCOPE	SESSION
+VARIABLE_TYPE	DOUBLE
+VARIABLE_COMMENT	TaurusDB-compatible fixed setup cost for Parallel Query cost modeling. The current MariaDB PQ v1 exposes this control variable before the full TaurusDB cost model is ported
+NUMERIC_MIN_VALUE	0
+NUMERIC_MAX_VALUE	1.797693134862316e308
+NUMERIC_BLOCK_SIZE	NULL
+ENUM_VALUE_LIST	NULL
+READ_ONLY	NO
+COMMAND_LINE_ARGUMENT	REQUIRED
+VARIABLE_NAME	PARALLEL_TUPLE_COST
+VARIABLE_SCOPE	SESSION
+VARIABLE_TYPE	DOUBLE
+VARIABLE_COMMENT	TaurusDB-compatible per-row transfer cost for Parallel Query cost modeling. The current MariaDB PQ v1 exposes this control variable before the full TaurusDB cost model is ported
+NUMERIC_MIN_VALUE	0
+NUMERIC_MAX_VALUE	1.797693134862316e308
 NUMERIC_BLOCK_SIZE	NULL
 ENUM_VALUE_LIST	NULL
 READ_ONLY	NO
@@ -3211,6 +3361,56 @@ NUMERIC_MAX_VALUE	65535
 NUMERIC_BLOCK_SIZE	1
 ENUM_VALUE_LIST	NULL
 READ_ONLY	YES
+COMMAND_LINE_ARGUMENT	REQUIRED
+VARIABLE_NAME	PQ_HASH_JOIN_MAX_HASH_TABLE_REFILLS
+VARIABLE_SCOPE	SESSION
+VARIABLE_TYPE	BIGINT UNSIGNED
+VARIABLE_COMMENT	TaurusDB-compatible upper limit of estimated hash table refills before disabling Parallel Query when parallel hash join spill to disk is unavailable. The current MariaDB PQ v1 exposes this control variable before parallel hash join is ported
+NUMERIC_MIN_VALUE	1
+NUMERIC_MAX_VALUE	18446744073709551615
+NUMERIC_BLOCK_SIZE	1
+ENUM_VALUE_LIST	NULL
+READ_ONLY	NO
+COMMAND_LINE_ARGUMENT	OPTIONAL
+VARIABLE_NAME	PQ_MASTER_ENABLE
+VARIABLE_SCOPE	GLOBAL
+VARIABLE_TYPE	BOOLEAN
+VARIABLE_COMMENT	Global Parallel Query master switch. The current MariaDB PQ v1 exposes this TaurusDB-compatible control variable; execution eligibility remains governed by the v1 fast-path checks
+NUMERIC_MIN_VALUE	NULL
+NUMERIC_MAX_VALUE	NULL
+NUMERIC_BLOCK_SIZE	NULL
+ENUM_VALUE_LIST	OFF,ON
+READ_ONLY	NO
+COMMAND_LINE_ARGUMENT	OPTIONAL
+VARIABLE_NAME	PQ_MSG_QUEUE_SIZE
+VARIABLE_SCOPE	SESSION
+VARIABLE_TYPE	BIGINT UNSIGNED
+VARIABLE_COMMENT	Parallel query message queue size in bytes. The current MariaDB PQ MVP exposes this TaurusDB-compatible setting before the full message queue protocol is ported
+NUMERIC_MIN_VALUE	1048576
+NUMERIC_MAX_VALUE	1073741824
+NUMERIC_BLOCK_SIZE	1
+ENUM_VALUE_LIST	NULL
+READ_ONLY	NO
+COMMAND_LINE_ARGUMENT	REQUIRED
+VARIABLE_NAME	PQ_MSG_QUEUE_SPIN_LOCK
+VARIABLE_SCOPE	SESSION
+VARIABLE_TYPE	BIGINT UNSIGNED
+VARIABLE_COMMENT	Spin count used by the TaurusDB parallel query message queue protocol. The current MariaDB PQ MVP exposes this setting for compatibility
+NUMERIC_MIN_VALUE	100
+NUMERIC_MAX_VALUE	18446744073709551615
+NUMERIC_BLOCK_SIZE	1
+ENUM_VALUE_LIST	NULL
+READ_ONLY	NO
+COMMAND_LINE_ARGUMENT	REQUIRED
+VARIABLE_NAME	PQ_SUPPORT_FEATURES_SWITCH
+VARIABLE_SCOPE	SESSION
+VARIABLE_TYPE	FLAGSET
+VARIABLE_COMMENT	TaurusDB-compatible Parallel Query feature switch. The current MariaDB PQ v1 exposes the control surface while unsupported feature bits remain constrained by v1 eligibility checks
+NUMERIC_MIN_VALUE	NULL
+NUMERIC_MAX_VALUE	NULL
+NUMERIC_BLOCK_SIZE	NULL
+ENUM_VALUE_LIST	simple_aggregate,count_distinct,correlated_subquery,hash_join_spill_to_disk,insert_select,default
+READ_ONLY	NO
 COMMAND_LINE_ARGUMENT	REQUIRED
 VARIABLE_NAME	PRELOAD_BUFFER_SIZE
 VARIABLE_SCOPE	SESSION

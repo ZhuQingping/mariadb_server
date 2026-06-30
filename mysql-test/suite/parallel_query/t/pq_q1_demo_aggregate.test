@@ -1,0 +1,153 @@
+--source include/have_innodb.inc
+
+--echo #
+--echo # Parallel Query Q1 demo aggregate coverage.
+--echo #
+
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_optimizer_switch= @@optimizer_switch;
+
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on';
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+
+CREATE TABLE lineitem (
+  l_orderkey INT NOT NULL,
+  l_linenumber INT NOT NULL,
+  l_shipdate DATE NOT NULL,
+  l_returnflag CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+  l_linestatus CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+  l_quantity DECIMAL(15,2) NOT NULL,
+  l_extendedprice DECIMAL(15,2) NOT NULL,
+  l_discount DECIMAL(15,2) NOT NULL,
+  l_tax DECIMAL(15,2) NOT NULL,
+  PRIMARY KEY (l_orderkey, l_linenumber)
+) ENGINE=InnoDB;
+
+INSERT INTO lineitem VALUES
+  (1, 1, '1998-09-01', 'A', 'F', 10.00, 100.00, 0.05, 0.10),
+  (2, 1, '1998-09-02', 'A', 'F', 20.00, 200.00, 0.10, 0.08),
+  (3, 1, '1998-09-03', 'A', 'F', 30.00, 300.00, 0.02, 0.04),
+  (4, 1, '1998-08-30', 'N', 'O', 40.00, 400.00, 0.07, 0.05),
+  (5, 1, '1998-08-31', 'N', 'O', 50.00, 500.00, 0.06, 0.03),
+  (6, 1, '1998-07-15', 'R', 'F', 60.00, 600.00, 0.08, 0.07);
+
+--echo # Q1 demo EXPLAIN exposes the gather plan.
+--replace_column 9 #
+EXPLAIN SELECT /*+ PQ(4) */
+       l_returnflag,
+       l_linestatus,
+       SUM(l_quantity) AS sum_qty,
+       SUM(l_extendedprice) AS sum_base_price,
+       SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price,
+       SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,
+       AVG(l_quantity) AS avg_qty,
+       AVG(l_extendedprice) AS avg_price,
+       AVG(l_discount) AS avg_disc,
+       COUNT(*) AS count_order
+FROM lineitem
+WHERE l_shipdate <= DATE '1998-12-01' - INTERVAL '90' DAY
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+
+--replace_regex /"rows": [0-9]+/"rows": #/ /"cost": [0-9.]+/"cost": #/
+EXPLAIN FORMAT=JSON SELECT /*+ PQ(4) */
+       l_returnflag,
+       l_linestatus,
+       SUM(l_quantity) AS sum_qty,
+       SUM(l_extendedprice) AS sum_base_price,
+       SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price,
+       SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,
+       AVG(l_quantity) AS avg_qty,
+       AVG(l_extendedprice) AS avg_price,
+       AVG(l_discount) AS avg_disc,
+       COUNT(*) AS count_order
+FROM lineitem
+WHERE l_shipdate <= DATE '1998-12-01' - INTERVAL '90' DAY
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+
+--echo # Serial Q1 baseline.
+FLUSH STATUS;
+SELECT /*+ NO_PQ */
+       l_returnflag,
+       l_linestatus,
+       SUM(l_quantity) AS sum_qty,
+       SUM(l_extendedprice) AS sum_base_price,
+       SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price,
+       SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,
+       AVG(l_quantity) AS avg_qty,
+       AVG(l_extendedprice) AS avg_price,
+       AVG(l_discount) AS avg_disc,
+       COUNT(*) AS count_order
+FROM lineitem
+WHERE l_shipdate <= DATE '1998-12-01' - INTERVAL '90' DAY
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # PQ Q1 demo path: worker grouped aggregation and leader merge.
+FLUSH STATUS;
+SELECT /*+ PQ(4) */
+       l_returnflag,
+       l_linestatus,
+       SUM(l_quantity) AS sum_qty,
+       SUM(l_extendedprice) AS sum_base_price,
+       SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price,
+       SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,
+       AVG(l_quantity) AS avg_qty,
+       AVG(l_extendedprice) AS avg_price,
+       AVG(l_discount) AS avg_disc,
+       COUNT(*) AS count_order
+FROM lineitem
+WHERE l_shipdate <= DATE '1998-12-01' - INTERVAL '90' DAY
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # PQ Q1 demo path also accepts the default utf8mb4 UCA collation used by SF10 imports.
+CREATE TABLE lineitem_utf8 (
+  l_orderkey INT NOT NULL,
+  l_linenumber INT NOT NULL,
+  l_shipdate DATE NOT NULL,
+  l_returnflag CHAR(1) CHARACTER SET utf8mb4 COLLATE utf8mb4_uca1400_ai_ci NOT NULL,
+  l_linestatus CHAR(1) CHARACTER SET utf8mb4 COLLATE utf8mb4_uca1400_ai_ci NOT NULL,
+  l_quantity DECIMAL(15,2) NOT NULL,
+  l_extendedprice DECIMAL(15,2) NOT NULL,
+  l_discount DECIMAL(15,2) NOT NULL,
+  l_tax DECIMAL(15,2) NOT NULL,
+  PRIMARY KEY (l_orderkey, l_linenumber)
+) ENGINE=InnoDB;
+
+INSERT INTO lineitem_utf8 SELECT * FROM lineitem;
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */
+       l_returnflag,
+       l_linestatus,
+       SUM(l_quantity) AS sum_qty,
+       COUNT(*) AS count_order
+FROM lineitem_utf8
+WHERE l_shipdate <= DATE '1998-12-01' - INTERVAL '90' DAY
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+--let $assert_text= Q1 utf8mb4 group-by collation should use parallel query
+--let $assert_cond= [SHOW SESSION STATUS WHERE Variable_name="Parallel_query_count", Value, 1] = 1
+--source include/assert.inc
+
+DROP TABLE lineitem_utf8;
+DROP TABLE lineitem;
+
+SET optimizer_switch= @save_optimizer_switch;
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;

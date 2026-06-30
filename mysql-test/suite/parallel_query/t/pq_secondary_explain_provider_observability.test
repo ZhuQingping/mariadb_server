@@ -1,0 +1,119 @@
+--source include/have_innodb.inc
+
+--echo #
+--echo # Parallel Query secondary provider EXPLAIN and runtime observability.
+--echo #
+
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_optimizer_trace= @@optimizer_trace;
+SET @save_optimizer_switch= @@optimizer_switch;
+
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on,index_condition_pushdown=off';
+SET optimizer_trace= 1;
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+
+CREATE TABLE pq_secondary_observe (
+  id INT NOT NULL,
+  line_no INT NOT NULL,
+  shipdate DATE NOT NULL,
+  qty DECIMAL(15,2) NOT NULL,
+  extendedprice DECIMAL(15,2) NOT NULL,
+  discount DECIMAL(15,2) NOT NULL,
+  PRIMARY KEY (id, line_no),
+  KEY idx_shipdate (shipdate)
+) ENGINE=InnoDB;
+
+INSERT INTO pq_secondary_observe VALUES
+  (1, 1, '1993-12-31', 10.00, 100.00, 0.06),
+  (2, 1, '1994-01-01', 12.00, 200.00, 0.05),
+  (3, 1, '1994-02-15', 18.00, 250.00, 0.06),
+  (4, 1, '1994-06-15', 23.00, 300.00, 0.06),
+  (5, 1, '1994-12-31', 24.00, 400.00, 0.07),
+  (6, 1, '1995-01-01', 20.00, 500.00, 0.06);
+
+--echo # JSON EXPLAIN exposes gather for covering secondary projection.
+--replace_regex /"rows": [0-9]+/"rows": #/ /"cost": [0-9.]+/"cost": #/
+EXPLAIN FORMAT=JSON SELECT /*+ PQ(4) */ shipdate AS covering_shipdate
+FROM pq_secondary_observe FORCE INDEX(idx_shipdate)
+WHERE shipdate >= DATE '1994-01-01'
+  AND shipdate < DATE '1995-01-01'
+ORDER BY shipdate;
+
+--echo # ANALYZE FORMAT=JSON exposes gather for non-covering secondary projection.
+--replace_regex /"r_total_time_ms": [0-9.]+/"r_total_time_ms": #/ /"r_table_time_ms": [0-9.]+/"r_table_time_ms": #/ /"r_other_time_ms": [0-9.]+/"r_other_time_ms": #/ /"cost": [0-9.]+/"cost": #/ /"pages_accessed": [0-9]+/"pages_accessed": #/
+ANALYZE FORMAT=JSON SELECT /*+ PQ(4) */ qty AS noncovering_qty
+FROM pq_secondary_observe FORCE INDEX(idx_shipdate)
+WHERE shipdate >= DATE '1994-01-01'
+  AND shipdate < DATE '1995-01-01'
+ORDER BY shipdate, qty;
+
+--echo # Runtime trace identifies the covering secondary native provider.
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ shipdate AS covering_shipdate
+FROM pq_secondary_observe FORCE INDEX(idx_shipdate)
+WHERE shipdate >= DATE '1994-01-01'
+  AND shipdate < DATE '1995-01-01'
+ORDER BY shipdate;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS covering_projection_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_available') AS covering_projection_handler_available
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # Runtime trace identifies the non-covering secondary native provider.
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ qty AS noncovering_qty
+FROM pq_secondary_observe FORCE INDEX(idx_shipdate)
+WHERE shipdate >= DATE '1994-01-01'
+  AND shipdate < DATE '1995-01-01'
+ORDER BY shipdate, qty;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS noncovering_projection_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_available') AS noncovering_projection_handler_available
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--echo # Runtime trace identifies the non-covering secondary scalar aggregate native provider.
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(extendedprice * discount) AS noncovering_revenue
+FROM pq_secondary_observe FORCE INDEX(idx_shipdate)
+WHERE shipdate >= DATE '1994-01-01'
+  AND shipdate < DATE '1995-01-01';
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS noncovering_aggregate_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_available') AS noncovering_aggregate_handler_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].btree_descriptor_rejected_reason') AS noncovering_aggregate_descriptor_rejected_reason
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+SET optimizer_trace= @save_optimizer_trace;
+SET optimizer_switch= @save_optimizer_switch;
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;
+
+DROP TABLE pq_secondary_observe;

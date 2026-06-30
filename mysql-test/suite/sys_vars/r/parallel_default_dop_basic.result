@@ -1,0 +1,46 @@
+SET @start_global_value= @@global.parallel_default_dop;
+SET @start_value= @@session.parallel_default_dop;
+SHOW GLOBAL VARIABLES LIKE 'parallel_default_dop';
+Variable_name	Value
+parallel_default_dop	4
+SHOW SESSION VARIABLES LIKE 'parallel_default_dop';
+Variable_name	Value
+parallel_default_dop	4
+SELECT * FROM information_schema.global_variables
+WHERE variable_name='parallel_default_dop';
+VARIABLE_NAME	VARIABLE_VALUE
+PARALLEL_DEFAULT_DOP	4
+SELECT * FROM information_schema.session_variables
+WHERE variable_name='parallel_default_dop';
+VARIABLE_NAME	VARIABLE_VALUE
+PARALLEL_DEFAULT_DOP	4
+SET @@session.parallel_default_dop= DEFAULT;
+SELECT @@session.parallel_default_dop;
+@@session.parallel_default_dop
+4
+SET @@session.parallel_default_dop= 8;
+SELECT @@session.parallel_default_dop;
+@@session.parallel_default_dop
+8
+SET @@global.parallel_default_dop= 16;
+SELECT @@global.parallel_default_dop;
+@@global.parallel_default_dop
+16
+SET @@session.parallel_default_dop= 0;
+SELECT @@session.parallel_default_dop;
+@@session.parallel_default_dop
+0
+SET @@session.parallel_default_dop= 1.1;
+ERROR 42000: Incorrect argument type to variable 'parallel_default_dop'
+SET @@session.parallel_default_dop= 'invalid';
+ERROR 42000: Incorrect argument type to variable 'parallel_default_dop'
+SET @@local.parallel_default_dop= 4;
+SELECT @@local.parallel_default_dop = @@session.parallel_default_dop;
+@@local.parallel_default_dop = @@session.parallel_default_dop
+1
+SET parallel_default_dop= 6;
+SELECT @@parallel_default_dop;
+@@parallel_default_dop
+6
+SET @@global.parallel_default_dop= @start_global_value;
+SET @@session.parallel_default_dop= @start_value;

@@ -1,0 +1,83 @@
+--source include/have_innodb.inc
+
+--echo #
+--echo # InnoDB PQ B-tree descriptor observability boundaries.
+--echo #
+
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_optimizer_trace= @@optimizer_trace;
+SET @save_optimizer_switch= @@optimizer_switch;
+
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on';
+SET optimizer_trace= 1;
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+
+CREATE TABLE pq_btree_descriptor_t (
+  id INT NOT NULL,
+  payload CHAR(64) NOT NULL,
+  PRIMARY KEY (id)
+) ENGINE=InnoDB;
+
+INSERT INTO pq_btree_descriptor_t VALUES
+  (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'),
+  (5, 'e'), (6, 'f'), (7, 'g'), (8, 'h');
+
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS descriptor_count_result
+FROM pq_btree_descriptor_t
+WHERE id > 0;
+
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].scan_provider') AS scan_provider
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].handler_scan_available') AS handler_scan_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].record_buffer_available') AS record_buffer_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].worker_scan_api') AS worker_scan_api
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].vfd_used') AS vfd_used
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].btree_descriptor_available') AS btree_descriptor_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].btree_descriptor_count') IS NOT NULL AS btree_descriptor_count_visible
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].btree_descriptor_scan_start_available') AS btree_descriptor_scan_start_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].btree_descriptor_scan_end_available') AS btree_descriptor_scan_end_available
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].btree_descriptor_split_used') AS btree_descriptor_split_used
+FROM information_schema.optimizer_trace;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].btree_descriptor_execution_used') AS btree_descriptor_execution_used
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+SET optimizer_trace= @save_optimizer_trace;
+SET optimizer_switch= @save_optimizer_switch;
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;
+
+DROP TABLE pq_btree_descriptor_t;

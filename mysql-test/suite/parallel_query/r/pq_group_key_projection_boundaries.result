@@ -1,0 +1,91 @@
+#
+# Q1 grouped key projection boundaries cover VARCHAR padding,
+# grouping by non-Q1 keys, and grouped ORDER BY LIMIT.
+#
+CREATE TABLE lineitem_q1_group (
+l_orderkey INT NOT NULL,
+l_linenumber INT NOT NULL,
+l_shipdate DATE NOT NULL,
+l_returnflag CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+l_linestatus CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+l_quantity DECIMAL(15,2) NOT NULL,
+l_extendedprice DECIMAL(15,2) NOT NULL,
+l_discount DECIMAL(15,2) NOT NULL,
+l_tax DECIMAL(15,2) NOT NULL,
+l_comment BLOB NOT NULL,
+PRIMARY KEY (l_orderkey, l_linenumber)
+) ENGINE=InnoDB;
+INSERT INTO lineitem_q1_group VALUES
+(1, 1, '1998-09-01', 'A', 'F', 10.00, 100.00, 0.05, 0.10, 'aa'),
+(2, 1, '1998-09-02', 'A', 'F', 20.00, 200.00, 0.10, 0.08, 'bbb'),
+(3, 1, '1998-09-03', 'A', 'F', 30.00, 300.00, 0.02, 0.04, 'cccc'),
+(4, 1, '1998-08-30', 'N', 'O', 40.00, 400.00, 0.07, 0.05, 'dd'),
+(5, 1, '1998-08-31', 'N', 'O', 50.00, 500.00, 0.06, 0.03, 'eee'),
+(6, 1, '1998-07-15', 'R', 'F', 60.00, 600.00, 0.08, 0.07, 'ffff');
+CREATE TABLE lineitem_q1_varchar_pad_group (
+l_orderkey INT NOT NULL PRIMARY KEY,
+l_shipdate DATE NOT NULL,
+l_returnflag VARCHAR(4) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+l_quantity INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO lineitem_q1_varchar_pad_group VALUES
+(1, '1998-09-01', 'A', 10),
+(2, '1998-09-01', 'A ', 20),
+(3, '1998-09-01', 'B', 30);
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, COUNT(*) AS count_order, SUM(l_quantity) AS sum_qty
+FROM lineitem_q1_varchar_pad_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag
+ORDER BY l_returnflag;
+l_returnflag	count_order	sum_qty
+A	2	30
+B	1	30
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_orderkey
+ORDER BY l_orderkey;
+l_orderkey	count_order
+1	1
+2	1
+4	1
+5	1
+6	1
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_shipdate, COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_shipdate
+ORDER BY l_shipdate;
+l_shipdate	count_order
+1998-07-15	1
+1998-08-30	1
+1998-08-31	1
+1998-09-01	1
+1998-09-02	1
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus, COUNT(*) AS count_order
+FROM lineitem_q1_group
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus
+LIMIT 2;
+l_returnflag	l_linestatus	count_order
+A	F	2
+N	O	2
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+DROP TABLE lineitem_q1_varchar_pad_group;
+DROP TABLE lineitem_q1_group;

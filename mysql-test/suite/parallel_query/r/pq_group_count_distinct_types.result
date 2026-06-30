@@ -1,0 +1,52 @@
+#
+# Grouped COUNT(DISTINCT) supports raw-copy-safe temporal, decimal,
+# and byte-aligned BIT field payloads.
+#
+SET @save_pq_support_features_switch= @@pq_support_features_switch;
+SET pq_support_features_switch= 'simple_aggregate=on,count_distinct=on';
+CREATE TABLE lineitem_group_distinct_types (
+l_orderkey INT NOT NULL PRIMARY KEY,
+l_shipdate DATE NOT NULL,
+l_returnflag CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+l_linestatus CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+d DECIMAL(10,2) NULL,
+dt DATE NULL,
+ts DATETIME(6) NULL,
+tm TIME(6) NULL,
+b8 BIT(8) NULL,
+s_fixed CHAR(4) CHARACTER SET latin1 COLLATE latin1_bin NULL,
+s_nopad VARCHAR(8) CHARACTER SET latin1 COLLATE latin1_nopad_bin NULL,
+b_fixed BINARY(4) NULL,
+b_var VARBINARY(8) NULL
+) ENGINE=InnoDB;
+INSERT INTO lineitem_group_distinct_types VALUES
+(1, '1998-09-01', 'A', 'F', 10.10, '2020-01-01', '2020-01-01 01:00:00.123456', '-00:00:01.000001', b'10101010', 'aa', 'aa', X'6161', X'6161'),
+(2, '1998-09-01', 'A', 'F', 20.20, '2020-01-02', '2020-01-02 02:00:00.123456', '00:00:00.000000', b'11110000', 'bb', 'aa ', X'6262', X'616120'),
+(75, '1998-09-01', 'A', 'F', 10.10, '2020-01-01', '2020-01-01 01:00:00.123456', '-00:00:01.000001', b'10101010', 'aa', 'aa', X'6161', X'6161'),
+(76, '1998-09-01', 'N', 'O', 30.30, '2020-02-01', '2020-02-01 03:00:00.123456', '12:34:56.123456', b'00001111', 'cc', 'cc', X'6363', X'6363'),
+(150, '1998-09-01', 'A', 'F', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+(151, '1998-09-01', 'N', 'O', 30.30, '2020-02-01', '2020-02-01 03:00:00.123456', '12:34:56.123456', b'00001111', 'cc', 'cc ', X'6363', X'636320'),
+(152, '1998-09-01', 'N', 'O', 40.40, '2020-02-02', '2020-02-02 04:00:00.123456', '23:59:59.999999', b'01010101', 'dd', 'dd', X'6464', X'6464');
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+COUNT(DISTINCT d) AS distinct_decimal_count,
+COUNT(DISTINCT dt) AS distinct_date_count,
+COUNT(DISTINCT ts) AS distinct_datetime_count,
+COUNT(DISTINCT tm) AS distinct_time_count,
+COUNT(DISTINCT b8) AS distinct_bit_count,
+COUNT(DISTINCT s_fixed) AS distinct_fixed_string_count,
+COUNT(DISTINCT s_nopad) AS distinct_nopad_string_count,
+COUNT(DISTINCT b_fixed) AS distinct_fixed_binary_count,
+COUNT(DISTINCT b_var) AS distinct_varbinary_count
+FROM lineitem_group_distinct_types
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+l_returnflag	l_linestatus	distinct_decimal_count	distinct_date_count	distinct_datetime_count	distinct_time_count	distinct_bit_count	distinct_fixed_string_count	distinct_nopad_string_count	distinct_fixed_binary_count	distinct_varbinary_count
+A	F	2	2	2	2	2	2	2	2	2
+N	O	2	2	2	2	2	2	3	2	3
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+SET pq_support_features_switch= @save_pq_support_features_switch;
+DROP TABLE lineitem_group_distinct_types;

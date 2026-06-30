@@ -1,0 +1,304 @@
+--source include/have_innodb.inc
+--source include/have_debug_sync.inc
+
+--echo #
+--echo # parallel_queue_timeout waits across projection, Q6, and Q1 worker paths.
+--echo #
+
+SET @save_parallel_queue_timeout= @@parallel_queue_timeout;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+
+SET GLOBAL parallel_max_threads= 64;
+
+CREATE TABLE lineitem (
+  l_orderkey INT NOT NULL PRIMARY KEY,
+  l_shipdate DATE NOT NULL,
+  l_quantity INT NOT NULL
+) ENGINE=InnoDB;
+
+INSERT INTO lineitem VALUES
+  (1, '1979-12-31', 10),
+  (2, '1980-01-01', 20),
+  (3, '1980-01-02', 30),
+  (4, '1981-05-10', 40),
+  (5, '1992-07-15', 50),
+  (6, '1978-03-20', 60),
+  (7, '1980-06-01', 70),
+  (8, '1985-09-09', 80);
+
+CREATE TABLE lineitem_q6 (
+  l_orderkey INT NOT NULL,
+  l_linenumber INT NOT NULL,
+  l_shipdate DATE NOT NULL,
+  l_quantity DECIMAL(15,2) NOT NULL,
+  l_extendedprice DECIMAL(15,2) NOT NULL,
+  l_discount DECIMAL(15,2) NOT NULL,
+  PRIMARY KEY (l_orderkey, l_linenumber),
+  KEY idx_q6_shipdate (l_shipdate)
+) ENGINE=InnoDB;
+
+INSERT INTO lineitem_q6 VALUES
+  (1, 1, '1993-12-31', 10.00, 100.00, 0.06),
+  (2, 1, '1994-01-01', 12.00, 200.00, 0.05),
+  (3, 1, '1994-06-15', 23.00, 300.00, 0.06),
+  (3, 2, '1994-06-16', 18.00, 1000.00, 0.06),
+  (4, 1, '1994-12-31', 24.00, 400.00, 0.07),
+  (5, 1, '1995-01-01', 20.00, 500.00, 0.06),
+  (6, 1, '1994-03-20', 20.00, 600.00, 0.04),
+  (7, 1, '1994-08-08', 21.00, 700.00, 0.08),
+  (8, 1, '1994-09-09', 22.00, 800.00, 0.07);
+
+CREATE TABLE lineitem_q1_group (
+  l_orderkey INT NOT NULL,
+  l_linenumber INT NOT NULL,
+  l_shipdate DATE NOT NULL,
+  l_returnflag CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+  l_linestatus CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+  l_quantity DECIMAL(15,2) NOT NULL,
+  l_extendedprice DECIMAL(15,2) NOT NULL,
+  l_discount DECIMAL(15,2) NOT NULL,
+  l_tax DECIMAL(15,2) NOT NULL,
+  l_comment BLOB NOT NULL,
+  PRIMARY KEY (l_orderkey, l_linenumber)
+) ENGINE=InnoDB;
+
+INSERT INTO lineitem_q1_group VALUES
+  (1, 1, '1998-09-01', 'A', 'F', 10.00, 100.00, 0.05, 0.10, 'aa'),
+  (2, 1, '1998-09-02', 'A', 'F', 20.00, 200.00, 0.10, 0.08, 'bbb'),
+  (3, 1, '1998-09-03', 'A', 'F', 30.00, 300.00, 0.02, 0.04, 'cccc'),
+  (4, 1, '1998-08-30', 'N', 'O', 40.00, 400.00, 0.07, 0.05, 'dd'),
+  (5, 1, '1998-08-31', 'N', 'O', 50.00, 500.00, 0.06, 0.03, 'eee'),
+  (6, 1, '1998-07-15', 'R', 'F', 60.00, 600.00, 0.08, 0.07, 'ffff');
+
+SET GLOBAL parallel_max_threads= 4;
+connect (pq_queue_holder, localhost, root,,test);
+connect (pq_queue_waiter, localhost, root,,test);
+
+connection pq_queue_holder;
+SET debug_sync= 'after_pq_thread_reserve SIGNAL pq_projection_queue_reserved WAIT_FOR pq_projection_queue_release';
+--send SELECT /*+ PQ(4) */ COUNT(*) AS pq_projection_queue_holder_count FROM lineitem WHERE l_shipdate > '1980-01-01'
+
+connection pq_queue_waiter;
+SET parallel_queue_timeout= 5000;
+SET debug_sync= 'before_pq_thread_wait SIGNAL pq_projection_queue_waiting';
+--send SELECT /*+ PQ(4) */ l_orderkey, l_quantity FROM lineitem WHERE l_shipdate > '1980-01-01' ORDER BY l_orderkey LIMIT 2
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_projection_queue_reserved TIMEOUT 30';
+SET debug_sync= 'now WAIT_FOR pq_projection_queue_waiting TIMEOUT 30';
+SET debug_sync= 'now SIGNAL pq_projection_queue_release';
+
+connection pq_queue_holder;
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+
+connection pq_queue_waiter;
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+
+connection pq_queue_holder;
+SET debug_sync= 'after_pq_thread_reserve SIGNAL pq_q6_queue_reserved WAIT_FOR pq_q6_queue_release';
+--send SELECT /*+ PQ(4) */ COUNT(*) AS pq_q6_queue_holder_count FROM lineitem WHERE l_shipdate > '1980-01-01'
+
+connection pq_queue_waiter;
+SET debug_sync= 'before_pq_thread_wait SIGNAL pq_q6_queue_waiting';
+--send SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_queue_wait_revenue FROM lineitem_q6 WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01' AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 24
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_q6_queue_reserved TIMEOUT 30';
+SET debug_sync= 'now WAIT_FOR pq_q6_queue_waiting TIMEOUT 30';
+SET debug_sync= 'now SIGNAL pq_q6_queue_release';
+
+connection pq_queue_holder;
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+
+connection pq_queue_waiter;
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+
+connection pq_queue_holder;
+SET debug_sync= 'after_pq_thread_reserve SIGNAL pq_q1_queue_reserved WAIT_FOR pq_q1_queue_release';
+--send SELECT /*+ PQ(4) */ COUNT(*) AS pq_q1_queue_holder_count FROM lineitem WHERE l_shipdate > '1980-01-01'
+
+connection pq_queue_waiter;
+SET debug_sync= 'before_pq_thread_wait SIGNAL pq_q1_queue_waiting';
+--send SELECT /*+ PQ(4) */ l_returnflag, l_linestatus, COUNT(*) AS count_order, SUM(l_quantity) AS sum_qty FROM lineitem_q1_group WHERE l_shipdate <= DATE '1998-09-02' GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_q1_queue_reserved TIMEOUT 30';
+SET debug_sync= 'now WAIT_FOR pq_q1_queue_waiting TIMEOUT 30';
+SET debug_sync= 'now SIGNAL pq_q1_queue_release';
+
+connection pq_queue_holder;
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+disconnect pq_queue_holder;
+
+connection pq_queue_waiter;
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+SET parallel_queue_timeout= 0;
+disconnect pq_queue_waiter;
+
+connection default;
+SET debug_sync= 'RESET';
+SET GLOBAL parallel_max_threads= 64;
+
+--echo #
+--echo # Positive parallel_queue_timeout expires when worker capacity stays unavailable.
+--echo #
+
+SET GLOBAL parallel_max_threads= 4;
+SET @pq_queue_positive_timeout_refused_before= (
+  SELECT CAST(VARIABLE_VALUE AS UNSIGNED)
+  FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+  WHERE VARIABLE_NAME= 'PQ_THREADS_REFUSED'
+);
+
+connect (pq_queue_timeout_holder, localhost, root,,test);
+connect (pq_queue_timeout_waiter, localhost, root,,test);
+
+connection pq_queue_timeout_holder;
+SET debug_sync= 'after_pq_thread_reserve SIGNAL pq_positive_timeout_reserved WAIT_FOR pq_positive_timeout_release';
+--send SELECT /*+ PQ(4) */ COUNT(*) AS pq_positive_timeout_holder_count FROM lineitem WHERE l_shipdate > '1980-01-01'
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_positive_timeout_reserved TIMEOUT 30';
+SET @pq_positive_timeout_held_memory= (
+  SELECT CAST(VARIABLE_VALUE AS UNSIGNED)
+  FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+  WHERE VARIABLE_NAME= 'PQ_MEMORY_USED'
+);
+
+connection pq_queue_timeout_waiter;
+SET parallel_queue_timeout= 1;
+SET debug_sync= 'before_pq_thread_wait SIGNAL pq_positive_timeout_waiting';
+--send SELECT /*+ PQ(4) */ l_orderkey, l_quantity FROM lineitem WHERE l_shipdate > '1980-01-01' ORDER BY l_orderkey LIMIT 2
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_positive_timeout_waiting TIMEOUT 30';
+
+connection pq_queue_timeout_waiter;
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET parallel_queue_timeout= 0;
+SET debug_sync= 'RESET';
+disconnect pq_queue_timeout_waiter;
+
+connection default;
+SELECT CAST(VARIABLE_VALUE AS UNSIGNED) > @pq_queue_positive_timeout_refused_before AS pq_positive_timeout_refused
+FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+WHERE VARIABLE_NAME= 'PQ_THREADS_REFUSED';
+SELECT CAST(VARIABLE_VALUE AS UNSIGNED) = @pq_positive_timeout_held_memory AS pq_positive_timeout_memory_released
+FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+WHERE VARIABLE_NAME= 'PQ_MEMORY_USED';
+SET debug_sync= 'now SIGNAL pq_positive_timeout_release';
+
+connection pq_queue_timeout_holder;
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+disconnect pq_queue_timeout_holder;
+
+connection default;
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+SET @pq_queue_q6_timeout_refused_before= (
+  SELECT CAST(VARIABLE_VALUE AS UNSIGNED)
+  FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+  WHERE VARIABLE_NAME= 'PQ_THREADS_REFUSED'
+);
+
+connect (pq_queue_q6_timeout_holder, localhost, root,,test);
+connect (pq_queue_q6_timeout_waiter, localhost, root,,test);
+
+connection pq_queue_q6_timeout_holder;
+SET debug_sync= 'after_pq_thread_reserve SIGNAL pq_q6_timeout_reserved WAIT_FOR pq_q6_timeout_release';
+--send SELECT /*+ PQ(4) */ COUNT(*) AS pq_q6_timeout_holder_count FROM lineitem WHERE l_shipdate > '1980-01-01'
+
+connection pq_queue_q6_timeout_waiter;
+SET parallel_queue_timeout= 1;
+SET debug_sync= 'before_pq_thread_wait SIGNAL pq_q6_timeout_waiting';
+--send SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_timeout_revenue FROM lineitem_q6 WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01' AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 24
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_q6_timeout_reserved TIMEOUT 30';
+SET debug_sync= 'now WAIT_FOR pq_q6_timeout_waiting TIMEOUT 30';
+
+connection pq_queue_q6_timeout_waiter;
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET parallel_queue_timeout= 0;
+SET debug_sync= 'RESET';
+disconnect pq_queue_q6_timeout_waiter;
+
+connection default;
+SELECT CAST(VARIABLE_VALUE AS UNSIGNED) > @pq_queue_q6_timeout_refused_before AS pq_q6_timeout_refused
+FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+WHERE VARIABLE_NAME= 'PQ_THREADS_REFUSED';
+SET debug_sync= 'now SIGNAL pq_q6_timeout_release';
+
+connection pq_queue_q6_timeout_holder;
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+disconnect pq_queue_q6_timeout_holder;
+
+connection default;
+SET @pq_queue_q1_timeout_refused_before= (
+  SELECT CAST(VARIABLE_VALUE AS UNSIGNED)
+  FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+  WHERE VARIABLE_NAME= 'PQ_THREADS_REFUSED'
+);
+
+connect (pq_queue_q1_timeout_holder, localhost, root,,test);
+connect (pq_queue_q1_timeout_waiter, localhost, root,,test);
+
+connection pq_queue_q1_timeout_holder;
+SET debug_sync= 'after_pq_thread_reserve SIGNAL pq_q1_timeout_reserved WAIT_FOR pq_q1_timeout_release';
+--send SELECT /*+ PQ(4) */ COUNT(*) AS pq_q1_timeout_holder_count FROM lineitem WHERE l_shipdate > '1980-01-01'
+
+connection pq_queue_q1_timeout_waiter;
+SET parallel_queue_timeout= 1;
+SET debug_sync= 'before_pq_thread_wait SIGNAL pq_q1_timeout_waiting';
+--send SELECT /*+ PQ(4) */ l_returnflag, l_linestatus, COUNT(*) AS count_order, SUM(l_quantity) AS sum_qty FROM lineitem_q1_group WHERE l_shipdate <= DATE '1998-09-02' GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_q1_timeout_reserved TIMEOUT 30';
+SET debug_sync= 'now WAIT_FOR pq_q1_timeout_waiting TIMEOUT 30';
+
+connection pq_queue_q1_timeout_waiter;
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET parallel_queue_timeout= 0;
+SET debug_sync= 'RESET';
+disconnect pq_queue_q1_timeout_waiter;
+
+connection default;
+SELECT CAST(VARIABLE_VALUE AS UNSIGNED) > @pq_queue_q1_timeout_refused_before AS pq_q1_timeout_refused
+FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+WHERE VARIABLE_NAME= 'PQ_THREADS_REFUSED';
+SET debug_sync= 'now SIGNAL pq_q1_timeout_release';
+
+connection pq_queue_q1_timeout_holder;
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+disconnect pq_queue_q1_timeout_holder;
+
+connection default;
+SET GLOBAL parallel_max_threads= 64;
+
+SET parallel_queue_timeout= @save_parallel_queue_timeout;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET debug_sync= 'RESET';
+
+DROP TABLE lineitem_q1_group;
+DROP TABLE lineitem_q6;
+DROP TABLE lineitem;

@@ -1,0 +1,80 @@
+--source include/have_innodb.inc
+--source include/have_sequence.inc
+--source include/have_innodb_16k.inc
+
+--echo #
+--echo # InnoDB PQ B-tree descriptor lifecycle boundaries.
+--echo #
+
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_optimizer_trace= @@optimizer_trace;
+SET @save_optimizer_switch= @@optimizer_switch;
+SET @save_debug_dbug= @@debug_dbug;
+
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on';
+SET optimizer_trace= 1;
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+
+CREATE TABLE pq_btree_descriptor_lifecycle_t (
+  id INT NOT NULL,
+  payload VARBINARY(768) NOT NULL,
+  PRIMARY KEY (id)
+) ENGINE=InnoDB STATS_PERSISTENT=1;
+
+INSERT INTO pq_btree_descriptor_lifecycle_t
+SELECT CAST(seq AS SIGNED) * 10 - 163840, REPEAT(CHAR(65 + MOD(seq, 26)), 768)
+FROM seq_1_to_32768;
+
+--echo # Descriptor worker mid-scan errors release active descriptors and resources.
+SET SESSION debug_dbug= 'd,pq_fail_worker_mid_scan';
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+--disable_abort_on_error ONCE
+SELECT /*+ PQ(64) */ COUNT(*) AS descriptor_worker_mid_scan_error_count
+FROM pq_btree_descriptor_lifecycle_t
+WHERE id > -163840;
+--let $descriptor_worker_error_errno= $mysql_errno
+SET SESSION debug_dbug= @save_debug_dbug;
+--let $assert_text= Descriptor worker injected mid-scan error should fail the statement
+--let $assert_cond= $descriptor_worker_error_errno != 0
+--source include/assert.inc
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].btree_descriptor_execution_used') AS descriptor_error_execution_used
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+
+--echo # Descriptor execution still succeeds after injected worker failure.
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(64) */ COUNT(*) AS descriptor_recovery_count
+FROM pq_btree_descriptor_lifecycle_t
+WHERE id > -163840;
+SELECT json_extract(trace,
+       '$**.parallel_query_scan_provider[0].btree_descriptor_execution_used') AS descriptor_recovery_execution_used
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+
+SET optimizer_trace= @save_optimizer_trace;
+SET optimizer_switch= @save_optimizer_switch;
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET SESSION debug_dbug= @save_debug_dbug;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;
+
+DROP TABLE pq_btree_descriptor_lifecycle_t;

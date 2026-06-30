@@ -1,0 +1,76 @@
+--source include/have_innodb.inc
+
+--echo #
+--echo # Unsigned full-span split key remains serial with a stable trace reason.
+--echo #
+
+SET @save_optimizer_trace= @@optimizer_trace;
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_optimizer_switch= @@optimizer_switch;
+
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on';
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+SET optimizer_trace= 'enabled=on';
+
+CREATE TABLE lineitem_unsigned_full_span_pk (
+  l_orderkey BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+  l_shipdate DATE NOT NULL,
+  l_returnflag CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+  l_linestatus CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+  l_quantity DECIMAL(15,2) NOT NULL,
+  l_extendedprice DECIMAL(15,2) NOT NULL,
+  l_discount DECIMAL(15,2) NOT NULL
+) ENGINE=InnoDB;
+
+INSERT INTO lineitem_unsigned_full_span_pk VALUES
+  (0, '1980-01-02', 'A', 'F', 10.00, 100.00, 0.05),
+  (7, '1981-05-10', 'N', 'O', 20.00, 200.00, 0.06),
+  (18446744073709551615, '1979-12-31', 'R', 'F', 30.00, 300.00, 0.07);
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS unsigned_full_span_count
+FROM lineitem_unsigned_full_span_pk
+WHERE l_shipdate > '1980-01-01';
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS unsigned_full_span_q6_sum
+FROM lineitem_unsigned_full_span_pk
+WHERE l_shipdate > '1980-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+  AND l_quantity < 24;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       COUNT(*) AS count_order,
+       SUM(l_quantity) AS sum_qty
+FROM lineitem_unsigned_full_span_pk
+WHERE l_shipdate > '1980-01-01'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+SET optimizer_trace= @save_optimizer_trace;
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET optimizer_switch= @save_optimizer_switch;
+
+DROP TABLE lineitem_unsigned_full_span_pk;

@@ -1,0 +1,247 @@
+--source include/have_innodb.inc
+--source include/have_debug_sync.inc
+
+--echo #
+--echo # Grouped COUNT(DISTINCT) field, expression, memory admission,
+--echo # EXPLAIN, HAVING, and SQL_CALC_FOUND_ROWS boundaries.
+--echo #
+
+SET @save_pq_support_features_switch= @@pq_support_features_switch;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_optimizer_trace= @@optimizer_trace;
+
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_trace= 'enabled=on';
+
+--echo #
+--echo # Grouped COUNT(DISTINCT field) merges worker-local distinct sets.
+--echo #
+
+CREATE TABLE lineitem_group_distinct (
+  l_orderkey INT NOT NULL PRIMARY KEY,
+  l_shipdate DATE NOT NULL,
+  l_returnflag CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+  l_linestatus CHAR(1) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+  l_quantity INT NULL
+) ENGINE=InnoDB;
+
+INSERT INTO lineitem_group_distinct VALUES
+  (1, '1998-09-01', 'A', 'F', 10),
+  (2, '1998-09-01', 'A', 'F', 20),
+  (75, '1998-09-01', 'A', 'F', 10),
+  (76, '1998-09-01', 'N', 'O', 30),
+  (150, '1998-09-01', 'A', 'F', NULL),
+  (151, '1998-09-01', 'N', 'O', 30),
+  (152, '1998-09-01', 'N', 'O', 40),
+  (153, '1998-09-03', 'R', 'F', 50);
+
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ l_returnflag, l_linestatus,
+       COUNT(DISTINCT l_quantity) AS distinct_qty_serial_count
+FROM lineitem_group_distinct
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+SET pq_support_features_switch= 'simple_aggregate=on,count_distinct=off';
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       COUNT(DISTINCT l_quantity) AS distinct_qty_switch_off_count
+FROM lineitem_group_distinct
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+SET pq_support_features_switch= 'simple_aggregate=on,count_distinct=on';
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       COUNT(*) AS count_order,
+       SUM(l_quantity) AS sum_qty,
+       COUNT(DISTINCT l_quantity) AS distinct_qty_count
+FROM lineitem_group_distinct
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ l_returnflag, l_linestatus,
+       COUNT(DISTINCT l_quantity + (l_orderkey MOD 2)) AS distinct_qty_expr_serial_count
+FROM lineitem_group_distinct
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       COUNT(DISTINCT l_quantity + (l_orderkey MOD 2)) AS distinct_qty_expr_count
+FROM lineitem_group_distinct
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+connect (pq_group_distinct_expr_memory_leader, localhost, root,,test);
+SET pq_support_features_switch= 'simple_aggregate=on,count_distinct=on';
+SET debug_sync= 'after_pq_materialized_result_ready SIGNAL pq_group_distinct_expr_ready WAIT_FOR pq_group_distinct_expr_release';
+--send SELECT /*+ PQ(4) */ l_returnflag, l_linestatus, COUNT(DISTINCT l_quantity + (l_orderkey MOD 2)) AS distinct_qty_expr_memory_count FROM lineitem_group_distinct WHERE l_shipdate <= DATE '1998-09-02' GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_group_distinct_expr_ready TIMEOUT 30';
+SELECT CAST(VARIABLE_VALUE AS UNSIGNED) > 0 AS pq_group_distinct_expr_memory_reserved
+FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+WHERE VARIABLE_NAME= 'PQ_MEMORY_USED';
+SET debug_sync= 'now SIGNAL pq_group_distinct_expr_release';
+
+connection pq_group_distinct_expr_memory_leader;
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+disconnect pq_group_distinct_expr_memory_leader;
+
+connection default;
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+SET debug_sync= 'RESET';
+
+--echo # Grouped COUNT(DISTINCT expr) memory admission uses all expression dependency fields.
+--disable_query_log
+CREATE TABLE lineitem_group_distinct_memory LIKE lineitem_group_distinct;
+INSERT INTO lineitem_group_distinct_memory SELECT * FROM lineitem_group_distinct;
+INSERT INTO lineitem_group_distinct_memory SELECT l_orderkey + 100, l_shipdate, l_returnflag, l_linestatus, l_quantity FROM lineitem_group_distinct;
+INSERT INTO lineitem_group_distinct_memory SELECT l_orderkey + 200, l_shipdate, l_returnflag, l_linestatus, l_quantity FROM lineitem_group_distinct;
+INSERT INTO lineitem_group_distinct_memory SELECT l_orderkey + 300, l_shipdate, l_returnflag, l_linestatus, l_quantity FROM lineitem_group_distinct;
+INSERT INTO lineitem_group_distinct_memory SELECT l_orderkey + 400, l_shipdate, l_returnflag, l_linestatus, l_quantity FROM lineitem_group_distinct;
+INSERT INTO lineitem_group_distinct_memory SELECT l_orderkey + 500, l_shipdate, l_returnflag, l_linestatus, l_quantity FROM lineitem_group_distinct;
+INSERT INTO lineitem_group_distinct_memory SELECT l_orderkey + 600, l_shipdate, l_returnflag, l_linestatus, l_quantity FROM lineitem_group_distinct;
+INSERT INTO lineitem_group_distinct_memory SELECT l_orderkey + 700, l_shipdate, l_returnflag, l_linestatus, l_quantity FROM lineitem_group_distinct;
+INSERT INTO lineitem_group_distinct_memory SELECT l_orderkey + 800, l_shipdate, l_returnflag, l_linestatus, l_quantity FROM lineitem_group_distinct;
+INSERT INTO lineitem_group_distinct_memory SELECT l_orderkey + 900, l_shipdate, l_returnflag, l_linestatus, l_quantity FROM lineitem_group_distinct;
+INSERT INTO lineitem_group_distinct_memory SELECT l_orderkey + 1000, l_shipdate, l_returnflag, l_linestatus, l_quantity FROM lineitem_group_distinct;
+INSERT INTO lineitem_group_distinct_memory SELECT l_orderkey + 1100, l_shipdate, l_returnflag, l_linestatus, l_quantity FROM lineitem_group_distinct;
+INSERT INTO lineitem_group_distinct_memory SELECT l_orderkey + 1200, l_shipdate, l_returnflag, l_linestatus, l_quantity FROM lineitem_group_distinct;
+INSERT INTO lineitem_group_distinct_memory SELECT l_orderkey + 1300, l_shipdate, l_returnflag, l_linestatus, l_quantity FROM lineitem_group_distinct;
+INSERT INTO lineitem_group_distinct_memory SELECT l_orderkey + 1400, l_shipdate, l_returnflag, l_linestatus, l_quantity FROM lineitem_group_distinct;
+INSERT INTO lineitem_group_distinct_memory SELECT l_orderkey + 1500, l_shipdate, l_returnflag, l_linestatus, l_quantity FROM lineitem_group_distinct;
+ANALYZE TABLE lineitem_group_distinct_memory;
+
+SET @pq_memory_refused_before= (
+  SELECT CAST(VARIABLE_VALUE AS UNSIGNED)
+  FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+  WHERE VARIABLE_NAME= 'PQ_MEMORY_REFUSED'
+);
+SET @pq_group_distinct_memory_records= (
+  SELECT TABLE_ROWS
+  FROM INFORMATION_SCHEMA.TABLES
+  WHERE TABLE_SCHEMA= DATABASE()
+    AND TABLE_NAME= 'lineitem_group_distinct_memory'
+);
+SET @pq_group_distinct_expr_old_memory_limit=
+  4194304 + (((748 * @pq_group_distinct_memory_records + 4095) DIV 4096) * 4096);
+SET GLOBAL parallel_memory_limit= @pq_group_distinct_expr_old_memory_limit;
+--enable_query_log
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       COUNT(DISTINCT l_quantity + (l_orderkey MOD 2)) AS distinct_qty_expr_memory_limit_count
+FROM lineitem_group_distinct_memory
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SELECT CAST(VARIABLE_VALUE AS UNSIGNED) > @pq_memory_refused_before AS pq_group_distinct_expr_memory_refused
+FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+WHERE VARIABLE_NAME= 'PQ_MEMORY_REFUSED';
+SET GLOBAL parallel_memory_limit= 104857600;
+--disable_query_log
+DROP TABLE lineitem_group_distinct_memory;
+--enable_query_log
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       COUNT(DISTINCT CONCAT(l_quantity, '')) AS distinct_qty_string_expr_count
+FROM lineitem_group_distinct
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+--replace_column 9 #
+EXPLAIN SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       COUNT(DISTINCT l_quantity) AS distinct_qty_count
+FROM lineitem_group_distinct
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+
+--replace_column 9 # 10 # 11 # 12 #
+ANALYZE SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       COUNT(DISTINCT l_quantity) AS distinct_qty_count
+FROM lineitem_group_distinct
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+
+--replace_regex /"rows": [0-9]+/"rows": #/ /"cost": [0-9.]+/"cost": #/
+EXPLAIN FORMAT=JSON SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       COUNT(DISTINCT l_quantity) AS distinct_qty_count
+FROM lineitem_group_distinct
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+
+--replace_regex /"r_total_time_ms": [0-9.]+/"r_total_time_ms": #/ /"r_table_time_ms": [0-9.]+/"r_table_time_ms": #/ /"r_other_time_ms": [0-9.]+/"r_other_time_ms": #/ /"cost": [0-9.]+/"cost": #/ /"pages_accessed": [0-9]+/"pages_accessed": #/
+ANALYZE FORMAT=JSON SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       COUNT(DISTINCT l_quantity) AS distinct_qty_count
+FROM lineitem_group_distinct
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+
+--replace_regex /"rows": [0-9]+/"rows": #/ /"cost": [0-9.]+/"cost": #/
+EXPLAIN FORMAT=JSON SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       COUNT(DISTINCT l_quantity + (l_orderkey MOD 2)) AS distinct_qty_expr_count
+FROM lineitem_group_distinct
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+
+--replace_regex /"r_total_time_ms": [0-9.]+/"r_total_time_ms": #/ /"r_table_time_ms": [0-9.]+/"r_table_time_ms": #/ /"r_other_time_ms": [0-9.]+/"r_other_time_ms": #/ /"cost": [0-9.]+/"cost": #/ /"pages_accessed": [0-9]+/"pages_accessed": #/
+ANALYZE FORMAT=JSON SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       COUNT(DISTINCT l_quantity + (l_orderkey MOD 2)) AS distinct_qty_expr_count
+FROM lineitem_group_distinct
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_returnflag, l_linestatus,
+       COUNT(DISTINCT l_quantity) AS distinct_qty_count
+FROM lineitem_group_distinct
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+HAVING distinct_qty_count > 1
+ORDER BY l_returnflag, l_linestatus;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SQL_CALC_FOUND_ROWS l_returnflag, l_linestatus,
+       COUNT(DISTINCT l_quantity) AS distinct_qty_count
+FROM lineitem_group_distinct
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus
+LIMIT 1;
+SELECT FOUND_ROWS() AS found_rows_after_distinct_grouped_calc;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+
+
+SET pq_support_features_switch= 'simple_aggregate=on,count_distinct=off';
+SET pq_support_features_switch= @save_pq_support_features_switch;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+SET optimizer_trace= @save_optimizer_trace;
+SET debug_sync= 'RESET';
+DROP TABLE lineitem_group_distinct;

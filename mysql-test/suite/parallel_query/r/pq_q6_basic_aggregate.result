@@ -1,0 +1,827 @@
+#
+# Parallel Query Q6 basic aggregate coverage.
+#
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_parallel_cost_threshold= @@parallel_cost_threshold;
+SET @save_parallel_rows_threshold= @@parallel_rows_threshold;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_optimizer_switch= @@optimizer_switch;
+SET @save_optimizer_trace= @@optimizer_trace;
+SET @save_transaction_isolation= @@transaction_isolation;
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on';
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+# TPC-H Q6 shape uses worker filtering and leader SUM(expr) aggregation.
+#
+CREATE TABLE lineitem_q6 (
+l_orderkey INT NOT NULL,
+l_linenumber INT NOT NULL,
+l_shipdate DATE NOT NULL,
+l_quantity DECIMAL(15,2) NOT NULL,
+l_extendedprice DECIMAL(15,2) NOT NULL,
+l_discount DECIMAL(15,2) NOT NULL,
+PRIMARY KEY (l_orderkey, l_linenumber),
+KEY idx_q6_shipdate (l_shipdate)
+) ENGINE=InnoDB;
+INSERT INTO lineitem_q6 VALUES
+(1, 1, '1993-12-31', 10.00, 100.00, 0.06),
+(2, 1, '1994-01-01', 12.00, 200.00, 0.05),
+(3, 1, '1994-06-15', 23.00, 300.00, 0.06),
+(3, 2, '1994-06-16', 18.00, 1000.00, 0.06),
+(4, 1, '1994-12-31', 24.00, 400.00, 0.07),
+(5, 1, '1995-01-01', 20.00, 500.00, 0.06),
+(6, 1, '1994-03-20', 20.00, 600.00, 0.04),
+(7, 1, '1994-08-08', 21.00, 700.00, 0.08),
+(8, 1, '1994-09-09', 22.00, 800.00, 0.07);
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ SUM(l_extendedprice * l_discount) AS q6_serial_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24;
+q6_serial_revenue
+144.0000
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SET @pq_stmt_executed_before= (
+SELECT CAST(VARIABLE_VALUE AS UNSIGNED)
+FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+WHERE VARIABLE_NAME= 'PQ_STMT_EXECUTED'
+);
+SET optimizer_trace= 0;
+SET optimizer_trace= 1;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24;
+q6_revenue
+144.0000
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].scan_provider') AS q6_scan_provider
+FROM information_schema.optimizer_trace;
+q6_scan_provider
+["innodb_clustered_primary"]
+SELECT json_extract(trace,
+'$**.parallel_query_scan_provider[0].handler_scan_available') AS q6_handler_scan_available
+FROM information_schema.optimizer_trace;
+q6_handler_scan_available
+[true]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+SELECT CAST(VARIABLE_VALUE AS UNSIGNED) > @pq_stmt_executed_before AS q6_pq_stmt_executed_increased
+FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+WHERE VARIABLE_NAME= 'PQ_STMT_EXECUTED';
+q6_pq_stmt_executed_increased
+1
+SET @save_auto_rbo_force_parallel_execute= @@force_parallel_execute;
+SET @save_auto_rbo_parallel_cost_threshold= @@parallel_cost_threshold;
+SET @save_auto_rbo_parallel_rows_threshold= @@parallel_rows_threshold;
+SET @save_auto_rbo_parallel_setup_cost= @@parallel_setup_cost;
+SET @save_auto_rbo_parallel_tuple_cost= @@parallel_tuple_cost;
+SET force_parallel_execute= 0;
+SET parallel_default_dop= 4;
+SET parallel_cost_threshold= 0;
+SET parallel_rows_threshold= 0;
+SET parallel_setup_cost= 0;
+SET parallel_tuple_cost= 0;
+FLUSH STATUS;
+SELECT SUM(l_extendedprice * l_discount) AS q6_auto_rbo_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24;
+q6_auto_rbo_revenue
+144.0000
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+SET parallel_cost_threshold= @save_auto_rbo_parallel_cost_threshold;
+SET parallel_rows_threshold= @save_auto_rbo_parallel_rows_threshold;
+SET parallel_setup_cost= @save_auto_rbo_parallel_setup_cost;
+SET parallel_tuple_cost= @save_auto_rbo_parallel_tuple_cost;
+SET force_parallel_execute= @save_auto_rbo_force_parallel_execute;
+# Q6 SQL_CALC_FOUND_ROWS remains on the PQ aggregate path.
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SQL_CALC_FOUND_ROWS
+SUM(l_extendedprice * l_discount) AS q6_found_rows_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24;
+q6_found_rows_revenue
+144.0000
+SELECT FOUND_ROWS() AS found_rows_after_q6_calc;
+found_rows_after_q6_calc
+1
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_original_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1994-01-01' + INTERVAL '1' YEAR
+AND l_discount BETWEEN 0.06 - 0.01 AND 0.06 + 0.01
+AND l_quantity < 24;
+q6_original_revenue
+144.0000
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_having_alias_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24
+HAVING q6_having_alias_revenue > 0;
+q6_having_alias_revenue
+144.0000
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_having_sum_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24
+HAVING SUM(l_extendedprice * l_discount) > 0;
+q6_having_sum_revenue
+144.0000
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+# Q6 HAVING can filter away the aggregate row after PQ execution.
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_having_filtered_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24
+HAVING q6_having_filtered_revenue > 1000;
+q6_having_filtered_revenue
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+# Q6 scalar aggregate ORDER BY LIMIT stays on the PQ path.
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_order_limit_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24
+ORDER BY SUM(l_extendedprice * l_discount)
+LIMIT 1;
+q6_order_limit_revenue
+144.0000
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_read_committed_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24;
+q6_read_committed_revenue
+144.0000
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+SET SESSION transaction_isolation= @save_transaction_isolation;
+SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_read_uncommitted_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24;
+q6_read_uncommitted_revenue
+144.0000
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_serializable_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24;
+q6_serializable_revenue
+144.0000
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+SET SESSION transaction_isolation= @save_transaction_isolation;
+FLUSH STATUS;
+START TRANSACTION;
+INSERT INTO lineitem_q6 VALUES
+(100, 1, '1994-04-04', 10.00, 100.00, 0.06);
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_active_transaction_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24;
+q6_active_transaction_revenue
+150.0000
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+ROLLBACK;
+# Q6 can use PQ when fewer primary-key ranges are generated than requested DOP.
+CREATE TABLE lineitem_q6_small_range (
+l_orderkey INT NOT NULL,
+l_linenumber INT NOT NULL,
+l_shipdate DATE NOT NULL,
+l_quantity DECIMAL(15,2) NOT NULL,
+l_extendedprice DECIMAL(15,2) NOT NULL,
+l_discount DECIMAL(15,2) NOT NULL,
+PRIMARY KEY (l_orderkey, l_linenumber)
+) ENGINE=InnoDB;
+INSERT INTO lineitem_q6_small_range VALUES
+(10, 1, '1994-01-01', 12.00, 200.00, 0.05),
+(11, 1, '1994-06-15', 23.00, 300.00, 0.06),
+(12, 1, '1995-01-01', 20.00, 500.00, 0.06);
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ SUM(l_extendedprice * l_discount) AS q6_small_range_serial_revenue
+FROM lineitem_q6_small_range
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24;
+q6_small_range_serial_revenue
+28.0000
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_small_range_revenue
+FROM lineitem_q6_small_range
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24;
+q6_small_range_revenue
+28.0000
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+SET GLOBAL parallel_max_threads= 3;
+FLUSH STATUS;
+SELECT /*+ PQ(64) */ SUM(l_extendedprice * l_discount) AS q6_small_range_high_dop_revenue
+FROM lineitem_q6_small_range
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24;
+q6_small_range_high_dop_revenue
+28.0000
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(64) */ l_orderkey, l_quantity
+FROM lineitem_q6_small_range
+WHERE l_shipdate >= DATE '1994-01-01'
+ORDER BY l_orderkey;
+l_orderkey	l_quantity
+10	12.00
+11	23.00
+12	20.00
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+SET GLOBAL parallel_max_threads= 64;
+# Q6 keeps PQ when EXPLAIN shows a secondary range access; workers still split by primary key.
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_shipdate_range_revenue
+FROM lineitem_q6 FORCE INDEX (idx_q6_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24;
+q6_shipdate_range_revenue
+144.0000
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+EXPLAIN SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_shipdate_range_revenue
+FROM lineitem_q6 FORCE INDEX (idx_q6_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	<gather1>	ALL	NULL	NULL	NULL	NULL	#	Parallel execute (4 workers, test.lineitem_q6)
+1	SIMPLE	lineitem_q6	range	idx_q6_shipdate	idx_q6_shipdate	3	NULL	#	Using index condition; Using where
+# Q6 can keep PQ execution for a secondary-index equality access shape.
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_shipdate_ref_revenue
+FROM lineitem_q6 FORCE INDEX (idx_q6_shipdate)
+WHERE l_shipdate = DATE '1994-06-15'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24;
+q6_shipdate_ref_revenue
+18.0000
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+# Q6 SUM(expr) skips rows where the expression evaluates to NULL.
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * NULLIF(l_discount, 0.06)) AS q6_nullable_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24;
+q6_nullable_revenue
+66.0000
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+# Q6 expression aggregates preserve nullable DECIMAL field semantics.
+CREATE TABLE lineitem_q6_nullable (
+l_orderkey INT NOT NULL,
+l_linenumber INT NOT NULL,
+l_shipdate DATE NOT NULL,
+l_quantity DECIMAL(15,2) NOT NULL,
+l_extendedprice DECIMAL(15,2) NULL,
+l_discount DECIMAL(15,2) NULL,
+PRIMARY KEY (l_orderkey, l_linenumber)
+) ENGINE=InnoDB;
+INSERT INTO lineitem_q6_nullable VALUES
+(1, 1, '1994-01-01', 10.00, 100.00, 0.05),
+(2, 1, '1994-02-01', 10.00, NULL, 0.06),
+(3, 1, '1994-03-01', 10.00, 300.00, NULL),
+(4, 1, '1994-04-01', 25.00, 400.00, 0.07),
+(5, 1, '1994-05-01', 10.00, 500.00, 0.07),
+(6, 1, '1995-01-01', 10.00, 600.00, 0.05);
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_nullable_field_sum
+FROM lineitem_q6_nullable
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_quantity < 24;
+q6_nullable_field_sum
+40.0000
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ AVG(l_extendedprice * l_discount) AS q6_nullable_field_avg
+FROM lineitem_q6_nullable
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_quantity < 24;
+q6_nullable_field_avg
+20.00000000
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(l_extendedprice * l_discount) AS q6_nullable_field_count
+FROM lineitem_q6_nullable
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_quantity < 24;
+q6_nullable_field_count
+2
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_not_between_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount NOT BETWEEN 0.05 AND 0.07
+AND l_quantity < 24;
+q6_not_between_revenue
+80.0000
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+# Q6 OR predicate combinations match serial result on the PQ path.
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ SUM(l_extendedprice * l_discount) AS q6_or_serial_revenue
+FROM lineitem_q6
+WHERE ((l_shipdate = DATE '1994-06-15' AND l_discount = 0.06)
+OR (l_shipdate = DATE '1994-09-09' AND l_quantity = 22.00))
+AND l_quantity < 24;
+q6_or_serial_revenue
+74.0000
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_or_revenue
+FROM lineitem_q6
+WHERE ((l_shipdate = DATE '1994-06-15' AND l_discount = 0.06)
+OR (l_shipdate = DATE '1994-09-09' AND l_quantity = 22.00))
+AND l_quantity < 24;
+q6_or_revenue
+74.0000
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_empty_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '2100-01-01'
+  AND l_shipdate < DATE '2101-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24;
+q6_empty_revenue
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ NO_PQ */ SUM(l_extendedprice * l_discount) AS q6_empty_serial_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '2100-01-01'
+  AND l_shipdate < DATE '2101-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24;
+q6_empty_serial_revenue
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SQL_CALC_FOUND_ROWS
+SUM(l_extendedprice * l_discount) AS q6_empty_found_rows_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '2100-01-01'
+  AND l_shipdate < DATE '2101-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24;
+q6_empty_found_rows_revenue
+NULL
+SELECT FOUND_ROWS() AS found_rows_after_q6_empty_calc;
+found_rows_after_q6_empty_calc
+1
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+EXPLAIN SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	<gather1>	ALL	NULL	NULL	NULL	NULL	#	Parallel execute (4 workers, test.lineitem_q6)
+1	SIMPLE	lineitem_q6	range	idx_q6_shipdate	idx_q6_shipdate	3	NULL	#	Using index condition; Using where
+ANALYZE SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	r_rows	filtered	r_filtered	Extra
+1	SIMPLE	<gather1>	ALL	NULL	NULL	NULL	NULL	#	#	#	#	Parallel execute (4 workers, test.lineitem_q6)
+1	SIMPLE	lineitem_q6	range	idx_q6_shipdate	idx_q6_shipdate	3	NULL	#	#	#	#	Using index condition; Using where
+EXPLAIN FORMAT=JSON SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24;
+EXPLAIN
+{
+  "query_block": {
+    "select_id": 1,
+    "cost": #,
+    "nested_loop": [
+      {
+        "parallel_execute": {
+          "parallel_degree": 4,
+          "divided_table": "lineitem_q6",
+          "cut_table": "lineitem_q6",
+          "table": {
+            "table_name": "<gather1>",
+            "access_type": "ALL",
+            "rows": #
+          }
+        }
+      },
+      {
+        "table": {
+          "table_name": "lineitem_q6",
+          "access_type": "range",
+          "possible_keys": ["idx_q6_shipdate"],
+          "key": "idx_q6_shipdate",
+          "key_length": "3",
+          "used_key_parts": ["l_shipdate"],
+          "loops": 1,
+          "rows": #,
+          "cost": #,
+          "filtered": 100,
+          "index_condition": "lineitem_q6.l_shipdate >= DATE'1994-01-01' and lineitem_q6.l_shipdate < DATE'1995-01-01'",
+          "attached_condition": "lineitem_q6.l_discount between 0.05 and 0.07 and lineitem_q6.l_quantity < 24"
+        }
+      }
+    ]
+  }
+}
+EXPLAIN FORMAT=JSON SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_shipdate_range_revenue
+FROM lineitem_q6 FORCE INDEX (idx_q6_shipdate)
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24;
+EXPLAIN
+{
+  "query_block": {
+    "select_id": 1,
+    "cost": #,
+    "nested_loop": [
+      {
+        "parallel_execute": {
+          "parallel_degree": 4,
+          "divided_table": "lineitem_q6",
+          "cut_table": "lineitem_q6",
+          "table": {
+            "table_name": "<gather1>",
+            "access_type": "ALL",
+            "rows": #
+          }
+        }
+      },
+      {
+        "table": {
+          "table_name": "lineitem_q6",
+          "access_type": "range",
+          "possible_keys": ["idx_q6_shipdate"],
+          "key": "idx_q6_shipdate",
+          "key_length": "3",
+          "used_key_parts": ["l_shipdate"],
+          "loops": 1,
+          "rows": #,
+          "cost": #,
+          "filtered": 100,
+          "index_condition": "lineitem_q6.l_shipdate >= DATE'1994-01-01' and lineitem_q6.l_shipdate < DATE'1995-01-01'",
+          "attached_condition": "lineitem_q6.l_discount between 0.05 and 0.07 and lineitem_q6.l_quantity < 24"
+        }
+      }
+    ]
+  }
+}
+ANALYZE FORMAT=JSON SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24;
+ANALYZE
+{
+  "query_optimization": {
+    "r_total_time_ms": #
+  },
+  "query_block": {
+    "select_id": 1,
+    "cost": #,
+    "r_loops": 1,
+    "r_total_time_ms": #,
+    "nested_loop": [
+      {
+        "parallel_execute": {
+          "parallel_degree": 4,
+          "divided_table": "lineitem_q6",
+          "cut_table": "lineitem_q6",
+          "table": {
+            "table_name": "<gather1>",
+            "access_type": "ALL",
+            "rows": 7
+          }
+        }
+      },
+      {
+        "table": {
+          "table_name": "lineitem_q6",
+          "access_type": "range",
+          "possible_keys": ["idx_q6_shipdate"],
+          "key": "idx_q6_shipdate",
+          "key_length": "3",
+          "used_key_parts": ["l_shipdate"],
+          "loops": 1,
+          "r_loops": 0,
+          "rows": 7,
+          "r_index_rows": 0,
+          "r_rows": null,
+          "cost": #,
+          "r_table_time_ms": #,
+          "r_other_time_ms": #,
+          "r_engine_stats": {
+            "pages_accessed": #
+          },
+          "filtered": 100,
+          "r_total_filtered": null,
+          "index_condition": "lineitem_q6.l_shipdate >= DATE'1994-01-01' and lineitem_q6.l_shipdate < DATE'1995-01-01'",
+          "r_icp_filtered": 0,
+          "attached_condition": "lineitem_q6.l_discount between 0.05 and 0.07 and lineitem_q6.l_quantity < 24",
+          "r_filtered": null
+        }
+      }
+    ]
+  }
+}
+EXPLAIN FORMAT=JSON SELECT /*+ PQ(4) */ SUM(q6.l_extendedprice * q6.l_discount) AS q6_alias_revenue
+FROM lineitem_q6 AS q6
+WHERE q6.l_shipdate >= DATE '1994-01-01'
+  AND q6.l_shipdate < DATE '1995-01-01'
+  AND q6.l_discount BETWEEN 0.05 AND 0.07
+AND q6.l_quantity < 24;
+EXPLAIN
+{
+  "query_block": {
+    "select_id": 1,
+    "cost": #,
+    "nested_loop": [
+      {
+        "parallel_execute": {
+          "parallel_degree": 4,
+          "divided_table": "q6",
+          "cut_table": "q6",
+          "table": {
+            "table_name": "<gather1>",
+            "access_type": "ALL",
+            "rows": #
+          }
+        }
+      },
+      {
+        "table": {
+          "table_name": "q6",
+          "access_type": "range",
+          "possible_keys": ["idx_q6_shipdate"],
+          "key": "idx_q6_shipdate",
+          "key_length": "3",
+          "used_key_parts": ["l_shipdate"],
+          "loops": 1,
+          "rows": #,
+          "cost": #,
+          "filtered": 100,
+          "index_condition": "q6.l_shipdate >= DATE'1994-01-01' and q6.l_shipdate < DATE'1995-01-01'",
+          "attached_condition": "q6.l_discount between 0.05 and 0.07 and q6.l_quantity < 24"
+        }
+      }
+    ]
+  }
+}
+ANALYZE FORMAT=JSON SELECT /*+ PQ(4) */ SUM(q6.l_extendedprice * q6.l_discount) AS q6_alias_revenue
+FROM lineitem_q6 AS q6
+WHERE q6.l_shipdate >= DATE '1994-01-01'
+  AND q6.l_shipdate < DATE '1995-01-01'
+  AND q6.l_discount BETWEEN 0.05 AND 0.07
+AND q6.l_quantity < 24;
+ANALYZE
+{
+  "query_optimization": {
+    "r_total_time_ms": #
+  },
+  "query_block": {
+    "select_id": 1,
+    "cost": #,
+    "r_loops": 1,
+    "r_total_time_ms": #,
+    "nested_loop": [
+      {
+        "parallel_execute": {
+          "parallel_degree": 4,
+          "divided_table": "q6",
+          "cut_table": "q6",
+          "table": {
+            "table_name": "<gather1>",
+            "access_type": "ALL",
+            "rows": 7
+          }
+        }
+      },
+      {
+        "table": {
+          "table_name": "q6",
+          "access_type": "range",
+          "possible_keys": ["idx_q6_shipdate"],
+          "key": "idx_q6_shipdate",
+          "key_length": "3",
+          "used_key_parts": ["l_shipdate"],
+          "loops": 1,
+          "r_loops": 0,
+          "rows": 7,
+          "r_index_rows": 0,
+          "r_rows": null,
+          "cost": #,
+          "r_table_time_ms": #,
+          "r_other_time_ms": #,
+          "r_engine_stats": {
+            "pages_accessed": #
+          },
+          "filtered": 100,
+          "r_total_filtered": null,
+          "index_condition": "q6.l_shipdate >= DATE'1994-01-01' and q6.l_shipdate < DATE'1995-01-01'",
+          "r_icp_filtered": 0,
+          "attached_condition": "q6.l_discount between 0.05 and 0.07 and q6.l_quantity < 24",
+          "r_filtered": null
+        }
+      }
+    ]
+  }
+}
+# parallel_max_threads caps the effective worker DOP instead of forcing serial fallback.
+SET GLOBAL parallel_max_threads= 2;
+EXPLAIN FORMAT=JSON SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_capped_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24;
+EXPLAIN
+{
+  "query_block": {
+    "select_id": 1,
+    "cost": #,
+    "nested_loop": [
+      {
+        "parallel_execute": {
+          "parallel_degree": 2,
+          "divided_table": "lineitem_q6",
+          "cut_table": "lineitem_q6",
+          "table": {
+            "table_name": "<gather1>",
+            "access_type": "ALL",
+            "rows": #
+          }
+        }
+      },
+      {
+        "table": {
+          "table_name": "lineitem_q6",
+          "access_type": "range",
+          "possible_keys": ["idx_q6_shipdate"],
+          "key": "idx_q6_shipdate",
+          "key_length": "3",
+          "used_key_parts": ["l_shipdate"],
+          "loops": 1,
+          "rows": #,
+          "cost": #,
+          "filtered": 100,
+          "index_condition": "lineitem_q6.l_shipdate >= DATE'1994-01-01' and lineitem_q6.l_shipdate < DATE'1995-01-01'",
+          "attached_condition": "lineitem_q6.l_discount between 0.05 and 0.07 and lineitem_q6.l_quantity < 24"
+        }
+      }
+    ]
+  }
+}
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_extendedprice * l_discount) AS q6_capped_revenue
+FROM lineitem_q6
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07
+AND l_quantity < 24;
+q6_capped_revenue
+144.0000
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+SET GLOBAL parallel_max_threads= 64;
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET parallel_cost_threshold= @save_parallel_cost_threshold;
+SET parallel_rows_threshold= @save_parallel_rows_threshold;
+SET optimizer_switch= @save_optimizer_switch;
+SET optimizer_trace= @save_optimizer_trace;
+SET SESSION transaction_isolation= @save_transaction_isolation;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+DROP TABLE lineitem_q6_nullable;
+DROP TABLE lineitem_q6_small_range;
+DROP TABLE lineitem_q6;

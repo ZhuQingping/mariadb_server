@@ -1,0 +1,298 @@
+#
+# Parallel Query MIN/MAX and scalar aggregate HAVING coverage.
+#
+CREATE TABLE lineitem (
+l_orderkey INT NOT NULL PRIMARY KEY,
+l_shipdate DATE NOT NULL,
+l_quantity INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO lineitem VALUES
+(1, '1979-12-31', 10),
+(2, '1980-01-01', 20),
+(3, '1980-01-02', 30),
+(4, '1981-05-10', 40),
+(5, '1992-07-15', 50),
+(6, '1978-03-20', 60),
+(7, '1980-06-01', 70),
+(8, '1985-09-09', 80);
+CREATE TABLE lineitem_minmax (
+l_orderkey INT NOT NULL PRIMARY KEY,
+l_shipdate DATE NOT NULL,
+l_quantity INT NULL,
+l_comment VARCHAR(32) NULL
+) ENGINE=InnoDB;
+INSERT INTO lineitem_minmax VALUES
+(1, '1979-12-31', 10, 'z'),
+(2, '1980-01-01', NULL, NULL),
+(3, '1980-01-02', -5, 'm'),
+(4, '1981-05-10', 40, 'abc'),
+(5, '1992-07-15', 50, 'zz'),
+(6, '1978-03-20', 60, 'old'),
+(7, '1980-06-01', NULL, NULL),
+(8, '1985-09-09', 80, 'beta');
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_optimizer_switch= @@optimizer_switch;
+SET @save_optimizer_trace= @@optimizer_trace;
+SET @save_transaction_isolation= @@transaction_isolation;
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on';
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+#
+# MIN/MAX(base field) uses worker partial values and leader aggregation.
+#
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ MIN(l_quantity) AS min_quantity
+FROM lineitem_minmax
+WHERE l_shipdate > '1980-01-01';
+min_quantity
+-5
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ MAX(l_quantity) AS max_quantity
+FROM lineitem_minmax
+WHERE l_shipdate > '1980-01-01';
+max_quantity
+80
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ NAME_CONST('flag', 1) * MAX(l_quantity) AS name_const_max_quantity
+FROM lineitem_minmax
+WHERE l_shipdate > '1980-01-01';
+name_const_max_quantity
+80
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ NAME_CONST('flag', -1.5) * MAX(l_quantity) AS name_const_negative_max_quantity
+FROM lineitem_minmax
+WHERE l_shipdate > '1980-01-01';
+name_const_negative_max_quantity
+-120.0
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ MIN(l_shipdate) AS min_shipdate
+FROM lineitem_minmax;
+min_shipdate
+1978-03-20
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ MAX(l_comment) AS max_comment
+FROM lineitem_minmax
+WHERE l_shipdate > '1980-01-01';
+max_comment
+zz
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ MIN(l_quantity) AS min_quantity_all_null
+FROM lineitem_minmax
+WHERE l_quantity IS NULL;
+min_quantity_all_null
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ MAX(l_quantity) AS max_quantity_empty
+FROM lineitem_minmax
+WHERE l_shipdate > '2100-01-01';
+max_quantity_empty
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ MAX(l_comment) AS max_comment_having
+FROM lineitem_minmax
+WHERE l_shipdate > '1980-01-01'
+HAVING max_comment_having = 'zz';
+max_comment_having
+zz
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ MIN(l_quantity) AS min_quantity_having
+FROM lineitem_minmax
+WHERE l_shipdate > '1980-01-01'
+HAVING MIN(l_quantity) < 0;
+min_quantity_having
+-5
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ MAX(l_comment) AS max_comment_having_repeat
+FROM lineitem_minmax
+WHERE l_shipdate > '1980-01-01'
+HAVING MAX(l_comment) = 'nope';
+max_comment_having_repeat
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ MIN(l_quantity) AS min_quantity_having_all_null
+FROM lineitem_minmax
+WHERE l_quantity IS NULL
+HAVING MIN(l_quantity) IS NULL;
+min_quantity_having_all_null
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ MAX(l_quantity) AS max_quantity_having_empty
+FROM lineitem_minmax
+WHERE l_shipdate > '2100-01-01'
+HAVING MAX(l_quantity) IS NULL;
+max_quantity_having_empty
+NULL
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+#
+# Single aggregate HAVING is evaluated by the leader after PQ aggregation.
+#
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS c
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+HAVING c > 1;
+c
+5
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS c
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+HAVING COUNT(*) > 99;
+c
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(1) AS c
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+HAVING COUNT(1) > 1;
+c
+5
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_quantity) AS s
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+HAVING s > 200;
+s
+270
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ SUM(l_quantity) AS s
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+HAVING SUM(l_quantity) > 999;
+s
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ AVG(l_quantity) AS a
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+HAVING a > 50;
+a
+54.0000
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ AVG(l_quantity) AS a
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+HAVING AVG(l_quantity) > 999;
+a
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+FLUSH STATUS;
+SET optimizer_trace=1;
+SELECT /*+ PQ(4) */ COUNT(*) AS c
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+HAVING c > (SELECT 1 FROM lineitem WHERE l_orderkey = 1);
+c
+5
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 2,
+        "chosen": false,
+        "reason": "zero_result_or_const_table"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	1
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS c
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+HAVING c > (SELECT 1 FROM lineitem WHERE l_orderkey = 1);
+c
+5
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+pq_trace
+[
+    {
+        "select_id": 1,
+        "chosen": false,
+        "reason": "unsupported_aggregate_having"
+    },
+    {
+        "select_id": 2,
+        "chosen": false,
+        "reason": "zero_result_or_const_table"
+    }
+]
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+Variable_name	Value
+Parallel_query_count	0
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET optimizer_switch= @save_optimizer_switch;
+SET optimizer_trace= @save_optimizer_trace;
+SET SESSION transaction_isolation= @save_transaction_isolation;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+DROP TABLE lineitem_minmax;
+DROP TABLE lineitem;

@@ -1,0 +1,590 @@
+--source include/have_innodb.inc
+--source include/have_debug_sync.inc
+
+--echo #
+--echo # Parallel Query resource lifecycle coverage.
+--echo #
+
+CREATE TABLE lineitem (
+  l_orderkey INT NOT NULL PRIMARY KEY,
+  l_shipdate DATE NOT NULL,
+  l_quantity INT NOT NULL
+) ENGINE=InnoDB;
+
+INSERT INTO lineitem VALUES
+  (1, '1979-12-31', 10),
+  (2, '1980-01-01', 20),
+  (3, '1980-01-02', 30),
+  (4, '1981-05-10', 40),
+  (5, '1992-07-15', 50),
+  (6, '1978-03-20', 60),
+  (7, '1980-06-01', 70),
+  (8, '1985-09-09', 80);
+
+SET @save_force_parallel_execute= @@force_parallel_execute;
+SET @save_parallel_default_dop= @@parallel_default_dop;
+SET @save_parallel_queue_timeout= @@parallel_queue_timeout;
+SET @save_parallel_fail_retry= @@parallel_fail_retry;
+SET @save_parallel_graceful_fallback= @@parallel_graceful_fallback;
+SET @save_pq_master_enable= @@global.pq_master_enable;
+SET @save_parallel_max_threads= @@global.parallel_max_threads;
+SET @save_parallel_memory_limit= @@global.parallel_memory_limit;
+SET @save_optimizer_trace= @@optimizer_trace;
+SET @save_optimizer_switch= @@optimizer_switch;
+SET @save_debug_dbug= @@debug_dbug;
+
+SET GLOBAL pq_master_enable= ON;
+SET GLOBAL parallel_max_threads= 64;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET optimizer_switch= 'parallel_query=on';
+SET optimizer_trace= 1;
+SET force_parallel_execute= ON;
+SET parallel_default_dop= 4;
+SET parallel_queue_timeout= 0;
+SET parallel_fail_retry= ON;
+SET parallel_graceful_fallback= ON;
+
+--echo #
+--echo # TaurusDB-style worker thread resource governance.
+--echo #
+
+SET GLOBAL parallel_max_threads= 4;
+SET GLOBAL parallel_memory_limit= 104857600;
+SET @pq_stmt_executed_before= (
+  SELECT CAST(VARIABLE_VALUE AS UNSIGNED)
+  FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+  WHERE VARIABLE_NAME= 'PQ_STMT_EXECUTED'
+);
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS pq_resource_count
+FROM lineitem
+WHERE l_shipdate > '1980-01-01';
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+SELECT CAST(VARIABLE_VALUE AS UNSIGNED) > @pq_stmt_executed_before AS pq_stmt_executed_increased
+FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+WHERE VARIABLE_NAME= 'PQ_STMT_EXECUTED';
+
+SET @pq_refused_before= (
+  SELECT CAST(VARIABLE_VALUE AS UNSIGNED)
+  FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+  WHERE VARIABLE_NAME= 'PQ_THREADS_REFUSED'
+);
+SET GLOBAL parallel_max_threads= 1;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS pq_resource_fallback_count
+FROM lineitem
+WHERE l_shipdate > '1980-01-01';
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SELECT CAST(VARIABLE_VALUE AS UNSIGNED) > @pq_refused_before AS pq_threads_refused_increased
+FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+WHERE VARIABLE_NAME= 'PQ_THREADS_REFUSED';
+SET GLOBAL parallel_max_threads= 64;
+
+SET GLOBAL parallel_memory_limit= 0;
+SET parallel_fail_retry= OFF;
+--error ER_UNKNOWN_ERROR
+SELECT /*+ PQ(4) */ COUNT(*) AS pq_resource_no_fail_retry_count
+FROM lineitem
+WHERE l_shipdate > '1980-01-01';
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SET parallel_fail_retry= ON;
+SET parallel_fail_retry= OFF;
+--error ER_UNKNOWN_ERROR
+SELECT /*+ PQ(4) */ l_orderkey, l_quantity
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+ORDER BY l_orderkey
+LIMIT 2;
+SET parallel_fail_retry= ON;
+
+SET parallel_graceful_fallback= OFF;
+--error ER_UNKNOWN_ERROR
+SELECT /*+ PQ(4) */ COUNT(*) AS pq_resource_no_graceful_fallback_count
+FROM lineitem
+WHERE l_shipdate > '1980-01-01';
+SET parallel_graceful_fallback= ON;
+SET parallel_graceful_fallback= OFF;
+--error ER_UNKNOWN_ERROR
+SELECT /*+ PQ(4) */ l_orderkey, l_quantity
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+ORDER BY l_orderkey
+LIMIT 2;
+SET parallel_graceful_fallback= ON;
+SET GLOBAL parallel_memory_limit= 104857600;
+
+--echo # PQ does not fall back after partial worker thread launch failure.
+SET SESSION debug_dbug='d,pq_fail_worker_create_after_first';
+FLUSH STATUS;
+--error ER_CANT_CREATE_THREAD
+SELECT /*+ PQ(4) */ COUNT(*) AS pq_partial_launch_failure_count
+FROM lineitem
+WHERE l_shipdate > '1980-01-01';
+SET SESSION debug_dbug= @save_debug_dbug;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+
+--echo # First worker create failure falls back with trace and clean status.
+SET SESSION debug_dbug='d,pq_fail_worker_create_first';
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS pq_first_launch_fallback_count
+FROM lineitem
+WHERE l_shipdate > '1980-01-01';
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, l_quantity
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+ORDER BY l_orderkey;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_shipdate, COUNT(*) AS count_order
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+GROUP BY l_shipdate
+ORDER BY l_shipdate;
+SELECT json_detailed(json_extract(trace, '$**.not_apply_pq_plan')) AS pq_trace
+FROM information_schema.optimizer_trace;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+SET SESSION debug_dbug= @save_debug_dbug;
+
+--echo # Mid-scan worker errors cancel sibling workers and release resources.
+SET SESSION debug_dbug='d,pq_fail_worker_mid_scan';
+FLUSH STATUS;
+--error ER_UNKNOWN_ERROR
+SELECT /*+ PQ(4) */ COUNT(*) AS pq_mid_scan_failure_count
+FROM lineitem
+WHERE l_shipdate > '1980-01-01';
+SET SESSION debug_dbug= @save_debug_dbug;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+
+CREATE TABLE pq_memory_materialized (
+  l_orderkey INT NOT NULL PRIMARY KEY,
+  l_shipdate DATE NOT NULL,
+  l_quantity INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO pq_memory_materialized VALUES
+  (1, '1980-01-02', 10),
+  (2, '1980-01-03', 20),
+  (3, '1980-01-04', 30),
+  (4, '1980-01-05', 40),
+  (5, '1980-01-06', 50),
+  (6, '1980-01-07', 60),
+  (7, '1980-01-08', 70),
+  (8, '1980-01-09', 80),
+  (9, '1980-01-10', 90),
+  (10, '1980-01-11', 100),
+  (11, '1980-01-12', 110),
+  (12, '1980-01-13', 120),
+  (13, '1980-01-14', 130),
+  (14, '1980-01-15', 140),
+  (15, '1980-01-16', 150),
+  (16, '1980-01-17', 160);
+ANALYZE TABLE pq_memory_materialized;
+
+SET @pq_memory_refused_before= (
+  SELECT CAST(VARIABLE_VALUE AS UNSIGNED)
+  FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+  WHERE VARIABLE_NAME= 'PQ_MEMORY_REFUSED'
+);
+SET GLOBAL parallel_memory_limit= 4194304;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_orderkey, l_quantity
+FROM pq_memory_materialized
+ORDER BY l_orderkey;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+SELECT CAST(VARIABLE_VALUE AS UNSIGNED) > @pq_memory_refused_before AS pq_materialized_memory_refused
+FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+WHERE VARIABLE_NAME= 'PQ_MEMORY_REFUSED';
+
+SET @pq_memory_refused_before= (
+  SELECT CAST(VARIABLE_VALUE AS UNSIGNED)
+  FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+  WHERE VARIABLE_NAME= 'PQ_MEMORY_REFUSED'
+);
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_shipdate, COUNT(*) AS c
+FROM pq_memory_materialized
+GROUP BY l_shipdate
+ORDER BY l_shipdate;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+SELECT CAST(VARIABLE_VALUE AS UNSIGNED) > @pq_memory_refused_before AS pq_group_memory_refused
+FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+WHERE VARIABLE_NAME= 'PQ_MEMORY_REFUSED';
+
+SET @pq_memory_refused_before= (
+  SELECT CAST(VARIABLE_VALUE AS UNSIGNED)
+  FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+  WHERE VARIABLE_NAME= 'PQ_MEMORY_REFUSED'
+);
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ l_shipdate,
+       SUM(l_quantity + 1) AS sum_expr,
+       AVG(l_quantity + 2) AS avg_expr
+FROM pq_memory_materialized
+GROUP BY l_shipdate
+ORDER BY l_shipdate;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+SELECT CAST(VARIABLE_VALUE AS UNSIGNED) > @pq_memory_refused_before AS pq_group_expr_memory_refused
+FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+WHERE VARIABLE_NAME= 'PQ_MEMORY_REFUSED';
+SET GLOBAL parallel_memory_limit= 104857600;
+DROP TABLE pq_memory_materialized;
+
+--echo #
+--echo # Materialized result memory stays reserved until leader consumption.
+--echo #
+
+connect (pq_memory_leader, localhost, root,,test);
+SET debug_sync= 'after_pq_materialized_result_ready SIGNAL pq_materialized_ready WAIT_FOR pq_materialized_release';
+--send SELECT /*+ PQ(4) */ l_orderkey, l_quantity FROM lineitem WHERE l_shipdate > '1980-01-01' ORDER BY l_orderkey
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_materialized_ready TIMEOUT 30';
+SELECT CAST(VARIABLE_VALUE AS UNSIGNED) > 0 AS pq_materialized_memory_held
+FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+WHERE VARIABLE_NAME= 'PQ_MEMORY_USED';
+SET debug_sync= 'now SIGNAL pq_materialized_release';
+
+connection pq_memory_leader;
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+disconnect pq_memory_leader;
+
+connection default;
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+SET debug_sync= 'RESET';
+
+--echo #
+--echo # parallel_queue_timeout waits for worker thread admission.
+--echo #
+
+SET GLOBAL parallel_max_threads= 4;
+connect (con1, localhost, root,,test);
+connect (con2, localhost, root,,test);
+
+SET @pq_refused_before= (
+  SELECT CAST(VARIABLE_VALUE AS UNSIGNED)
+  FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+  WHERE VARIABLE_NAME= 'PQ_THREADS_REFUSED'
+);
+
+connection con1;
+SET debug_sync= 'after_pq_thread_reserve SIGNAL pq_reserved WAIT_FOR pq_release';
+--send SELECT /*+ PQ(4) */ COUNT(*) AS pq_queue_holder_count FROM lineitem WHERE l_shipdate > '1980-01-01'
+
+connection con2;
+SET parallel_queue_timeout= 0;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS pq_queue_no_wait_count
+FROM lineitem
+WHERE l_shipdate > '1980-01-01';
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SELECT CAST(VARIABLE_VALUE AS UNSIGNED) > @pq_refused_before AS pq_queue_no_wait_refused
+FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+WHERE VARIABLE_NAME= 'PQ_THREADS_REFUSED';
+
+SET parallel_queue_timeout= 5000;
+SET debug_sync= 'before_pq_thread_wait SIGNAL pq_waiting';
+--send SELECT /*+ PQ(4) */ COUNT(*) AS pq_queue_wait_count FROM lineitem WHERE l_shipdate > '1980-01-01'
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_reserved TIMEOUT 30';
+SET debug_sync= 'now WAIT_FOR pq_waiting TIMEOUT 30';
+SET debug_sync= 'now SIGNAL pq_release';
+
+connection con1;
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+
+connection con2;
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+SET parallel_queue_timeout= 0;
+
+disconnect con1;
+disconnect con2;
+connection default;
+SET debug_sync= 'RESET';
+
+--echo #
+--echo # KILL QUERY after worker launch must abort PQ and release resources.
+--echo #
+
+connect (pq_kill_leader, localhost, root,,test);
+--let $pq_kill_leader_id= `SELECT CONNECTION_ID()`
+SET debug_sync= 'after_pq_workers_launched SIGNAL pq_workers_launched WAIT_FOR pq_kill_release';
+--send SELECT /*+ PQ(4) */ COUNT(*) AS pq_killed_count FROM lineitem WHERE l_shipdate > '1980-01-01'
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_workers_launched TIMEOUT 30';
+--disable_query_log
+--eval KILL QUERY $pq_kill_leader_id
+--enable_query_log
+SET debug_sync= 'now SIGNAL pq_kill_release';
+
+connection pq_kill_leader;
+--error ER_QUERY_INTERRUPTED
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+disconnect pq_kill_leader;
+
+connection default;
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+SET debug_sync= 'RESET';
+
+connect (pq_projection_kill_leader, localhost, root,,test);
+--let $pq_projection_kill_leader_id= `SELECT CONNECTION_ID()`
+SET debug_sync= 'after_pq_workers_launched SIGNAL pq_projection_workers_launched WAIT_FOR pq_projection_kill_release';
+--send SELECT /*+ PQ(4) */ l_orderkey, l_shipdate, l_quantity FROM lineitem WHERE l_shipdate > '1980-01-01'
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_projection_workers_launched TIMEOUT 30';
+--disable_query_log
+--eval KILL QUERY $pq_projection_kill_leader_id
+--enable_query_log
+SET debug_sync= 'now SIGNAL pq_projection_kill_release';
+
+connection pq_projection_kill_leader;
+--error ER_QUERY_INTERRUPTED
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+disconnect pq_projection_kill_leader;
+
+connection default;
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+SET debug_sync= 'RESET';
+
+connect (pq_projection_ready_kill_leader, localhost, root,,test);
+--let $pq_projection_ready_kill_leader_id= `SELECT CONNECTION_ID()`
+SET debug_sync= 'after_pq_materialized_result_ready SIGNAL pq_projection_ready WAIT_FOR pq_projection_ready_release';
+--send SELECT /*+ PQ(4) */ l_orderkey, l_shipdate, l_quantity FROM lineitem WHERE l_shipdate > '1980-01-01'
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_projection_ready TIMEOUT 30';
+--disable_query_log
+--eval KILL QUERY $pq_projection_ready_kill_leader_id
+--enable_query_log
+SET debug_sync= 'now SIGNAL pq_projection_ready_release';
+
+connection pq_projection_ready_kill_leader;
+--error ER_QUERY_INTERRUPTED
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+disconnect pq_projection_ready_kill_leader;
+
+connection default;
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+SET debug_sync= 'RESET';
+
+--echo # Grouped COUNT(*) releases resources after materialized-ready KILL.
+connect (pq_group_count_ready_kill_leader, localhost, root,,test);
+--let $pq_group_count_ready_kill_leader_id= `SELECT CONNECTION_ID()`
+SET debug_sync= 'after_pq_materialized_result_ready SIGNAL pq_group_count_ready WAIT_FOR pq_group_count_ready_release';
+--send SELECT /*+ PQ(4) */ l_shipdate, COUNT(*) AS count_order FROM lineitem WHERE l_shipdate > '1980-01-01' GROUP BY l_shipdate ORDER BY l_shipdate
+
+connection default;
+SET debug_sync= 'now WAIT_FOR pq_group_count_ready TIMEOUT 30';
+--disable_query_log
+--eval KILL QUERY $pq_group_count_ready_kill_leader_id
+--enable_query_log
+SET debug_sync= 'now SIGNAL pq_group_count_ready_release';
+
+connection pq_group_count_ready_kill_leader;
+--error ER_QUERY_INTERRUPTED
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+disconnect pq_group_count_ready_kill_leader;
+
+connection default;
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+SET debug_sync= 'RESET';
+
+--echo # Projection does not fall back after partial worker thread launch failure.
+SET SESSION debug_dbug='d,pq_fail_worker_create_after_first';
+FLUSH STATUS;
+--error ER_CANT_CREATE_THREAD
+SELECT /*+ PQ(4) */ l_orderkey, l_quantity
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+ORDER BY l_orderkey;
+SET SESSION debug_dbug= @save_debug_dbug;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+
+--echo # Projection mid-scan worker errors cancel sibling workers and release resources.
+SET SESSION debug_dbug='d,pq_fail_worker_mid_scan';
+FLUSH STATUS;
+--error ER_UNKNOWN_ERROR
+SELECT /*+ PQ(4) */ l_orderkey, l_quantity
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+ORDER BY l_orderkey;
+SET SESSION debug_dbug= @save_debug_dbug;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+
+--echo # Projection last-worker mid-scan errors also release resources.
+SET SESSION debug_dbug='d,pq_fail_last_worker_mid_scan';
+FLUSH STATUS;
+--error ER_UNKNOWN_ERROR
+SELECT /*+ PQ(4) */ l_orderkey, l_quantity
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+ORDER BY l_orderkey;
+SET SESSION debug_dbug= @save_debug_dbug;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+
+--echo # Group mid-scan worker errors cancel sibling workers and release resources.
+SET SESSION debug_dbug='d,pq_fail_worker_mid_scan';
+FLUSH STATUS;
+--error ER_UNKNOWN_ERROR
+SELECT /*+ PQ(4) */ l_shipdate, COUNT(*) AS count_order
+FROM lineitem
+WHERE l_shipdate > '1980-01-01'
+GROUP BY l_shipdate
+ORDER BY l_shipdate;
+SET SESSION debug_dbug= @save_debug_dbug;
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+
+--echo #
+--echo # Worker open failures preserve non-KILL diagnostics.
+--echo #
+
+connect (pq_mdl_leader, localhost, root,,test);
+connect (pq_mdl_ddl, localhost, root,,test);
+
+connection pq_mdl_leader;
+SET debug_sync= 'after_pq_create_snapshot SIGNAL pq_mdl_snapshot WAIT_FOR pq_mdl_release';
+--send SELECT /*+ PQ(4) */ COUNT(*) AS pq_mdl_worker_error_count FROM lineitem WHERE l_shipdate > '1980-01-01'
+
+connection pq_mdl_ddl;
+SET debug_sync= 'now WAIT_FOR pq_mdl_snapshot TIMEOUT 30';
+--send ALTER TABLE lineitem ADD COLUMN pq_mdl_guard INT DEFAULT 0
+
+connection default;
+let $wait_condition= SELECT COUNT(*) = 1 FROM information_schema.processlist WHERE state = 'Waiting for table metadata lock' AND info LIKE 'ALTER TABLE lineitem ADD COLUMN pq_mdl_guard%';
+--source include/wait_condition.inc
+SET debug_sync= 'now SIGNAL pq_mdl_release';
+
+connection pq_mdl_leader;
+--error ER_LOCK_WAIT_TIMEOUT
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SET debug_sync= 'RESET';
+disconnect pq_mdl_leader;
+
+connection pq_mdl_ddl;
+--reap
+ALTER TABLE lineitem DROP COLUMN pq_mdl_guard;
+disconnect pq_mdl_ddl;
+
+connection default;
+SET debug_sync= 'RESET';
+
+--echo #
+--echo # Projection worker open failures preserve non-KILL diagnostics.
+--echo #
+
+connect (pq_projection_mdl_leader, localhost, root,,test);
+connect (pq_projection_mdl_ddl, localhost, root,,test);
+
+connection pq_projection_mdl_leader;
+SET debug_sync= 'after_pq_create_snapshot SIGNAL pq_projection_mdl_snapshot WAIT_FOR pq_projection_mdl_release';
+--send SELECT /*+ PQ(4) */ l_orderkey, l_quantity FROM lineitem WHERE l_shipdate > '1980-01-01' ORDER BY l_orderkey
+
+connection pq_projection_mdl_ddl;
+SET debug_sync= 'now WAIT_FOR pq_projection_mdl_snapshot TIMEOUT 30';
+--send ALTER TABLE lineitem ADD COLUMN pq_projection_mdl_guard INT DEFAULT 0
+
+connection default;
+let $wait_condition= SELECT COUNT(*) = 1 FROM information_schema.processlist WHERE state = 'Waiting for table metadata lock' AND info LIKE 'ALTER TABLE lineitem ADD COLUMN pq_projection_mdl_guard%';
+--source include/wait_condition.inc
+SET debug_sync= 'now SIGNAL pq_projection_mdl_release';
+
+connection pq_projection_mdl_leader;
+--error ER_LOCK_WAIT_TIMEOUT
+--reap
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SHOW GLOBAL STATUS LIKE 'PQ_threads_running';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+SET debug_sync= 'RESET';
+disconnect pq_projection_mdl_leader;
+
+connection pq_projection_mdl_ddl;
+--reap
+ALTER TABLE lineitem DROP COLUMN pq_projection_mdl_guard;
+disconnect pq_projection_mdl_ddl;
+
+connection default;
+SET debug_sync= 'RESET';
+
+SET @pq_memory_refused_before= (
+  SELECT CAST(VARIABLE_VALUE AS UNSIGNED)
+  FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+  WHERE VARIABLE_NAME= 'PQ_MEMORY_REFUSED'
+);
+SET GLOBAL parallel_memory_limit= 4096;
+FLUSH STATUS;
+SELECT /*+ PQ(4) */ COUNT(*) AS pq_memory_fallback_count
+FROM lineitem
+WHERE l_shipdate > '1980-01-01';
+SHOW SESSION STATUS LIKE 'Parallel_query_count';
+SHOW GLOBAL STATUS LIKE 'PQ_memory_used';
+SELECT CAST(VARIABLE_VALUE AS UNSIGNED) > @pq_memory_refused_before AS pq_memory_refused_increased
+FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+WHERE VARIABLE_NAME= 'PQ_MEMORY_REFUSED';
+SET GLOBAL parallel_memory_limit= 104857600;
+
+SET force_parallel_execute= @save_force_parallel_execute;
+SET parallel_default_dop= @save_parallel_default_dop;
+SET parallel_queue_timeout= @save_parallel_queue_timeout;
+SET parallel_fail_retry= @save_parallel_fail_retry;
+SET parallel_graceful_fallback= @save_parallel_graceful_fallback;
+SET optimizer_switch= @save_optimizer_switch;
+SET optimizer_trace= @save_optimizer_trace;
+SET SESSION debug_dbug= @save_debug_dbug;
+SET GLOBAL pq_master_enable= @save_pq_master_enable;
+SET GLOBAL parallel_max_threads= @save_parallel_max_threads;
+SET GLOBAL parallel_memory_limit= @save_parallel_memory_limit;
+
+DROP TABLE lineitem;
