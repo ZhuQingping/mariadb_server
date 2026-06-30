@@ -1,0 +1,232 @@
+CREATE TABLE sbtest1 (
+id INTEGER NOT NULL AUTO_INCREMENT,
+k INTEGER DEFAULT 0 NOT NULL,
+c CHAR(120) DEFAULT '' NOT NULL,
+pad CHAR(60) DEFAULT '' NOT NULL,
+PRIMARY KEY(id),
+KEY k_1(k)
+) ENGINE=InnoDB;
+CREATE TABLE sbtest_secondary (
+id INTEGER NOT NULL,
+k INTEGER DEFAULT 0 NOT NULL,
+c CHAR(120) DEFAULT '' NOT NULL,
+pad CHAR(60) DEFAULT '' NOT NULL,
+KEY xid(id),
+KEY k_secondary(k)
+) ENGINE=InnoDB;
+INSERT INTO sbtest1(k, c, pad) VALUES
+(10, 'c3', 'p1'), (20, 'c1', 'p2'), (30, 'c2', 'p3'), (40, 'c1', 'p4');
+INSERT INTO sbtest_secondary(id, k, c, pad) VALUES
+(1, 10, 's1', 'p1'), (1, 11, 's1b', 'p1b'), (2, 20, 's2', 'p2');
+SET @@session.session_plan_cache = ON;
+SET @save_ratio=@@session.session_plan_cache_allow_change_ratio;
+SET @@session.session_plan_cache_allow_change_ratio = 0;
+# sysbench point_selects on PRIMARY KEY(id) is currently covered
+PREPARE stmt FROM 'SELECT c FROM sbtest1 WHERE id=?';
+SET @id=1;
+EXECUTE stmt USING @id;
+SET @id=2;
+EXECUTE stmt USING @id;
+SET @id=3;
+EXECUTE stmt USING @id;
+include/assert.inc [sysbench primary-key point_selects creates one cached state]
+include/assert.inc [sysbench primary-key point_selects has repeated cache hits]
+include/assert.inc [sysbench primary-key point_selects has prevalidations before hits]
+DEALLOCATE PREPARE stmt;
+include/assert.inc [sysbench primary-key point_selects releases cached state on deallocate]
+# sysbench point_selects with --secondary is a non-unique ref query and is now covered
+PREPARE stmt FROM 'SELECT c FROM sbtest_secondary WHERE id=?';
+SET @id=1;
+EXECUTE stmt USING @id;
+EXECUTE stmt USING @id;
+include/assert.inc [sysbench secondary point_selects creates one cached ref state]
+include/assert.inc [sysbench secondary point_selects has one cache hit]
+include/assert.inc [sysbench secondary point_selects has one prevalidation before hit]
+DEALLOCATE PREPARE stmt;
+include/assert.inc [sysbench secondary point_selects releases cached state on deallocate]
+# sysbench simple_ranges is now covered by the range recipe
+PREPARE stmt FROM 'SELECT c FROM sbtest1 WHERE id BETWEEN ? AND ?';
+SET @lo=1;
+SET @hi=3;
+EXECUTE stmt USING @lo, @hi;
+c
+c3
+c1
+c2
+SET @lo=2;
+SET @hi=4;
+EXECUTE stmt USING @lo, @hi;
+c
+c1
+c2
+c1
+SET @lo=1;
+SET @hi=2;
+EXECUTE stmt USING @lo, @hi;
+c
+c3
+c1
+include/assert.inc [sysbench simple_ranges creates one cached range state]
+include/assert.inc [sysbench simple_ranges has repeated cache hits]
+include/assert.inc [sysbench simple_ranges has prevalidations before hits]
+DEALLOCATE PREPARE stmt;
+include/assert.inc [sysbench simple_ranges releases cached state on deallocate]
+# sysbench sum_ranges is now covered by the aggregate range recipe
+PREPARE stmt FROM 'SELECT SUM(k) FROM sbtest1 WHERE id BETWEEN ? AND ?';
+SET @lo=1;
+SET @hi=3;
+EXECUTE stmt USING @lo, @hi;
+SUM(k)
+60
+SET @lo=2;
+SET @hi=4;
+EXECUTE stmt USING @lo, @hi;
+SUM(k)
+90
+SET @lo=5;
+SET @hi=6;
+EXECUTE stmt USING @lo, @hi;
+SUM(k)
+NULL
+SET @lo=1;
+SET @hi=2;
+EXECUTE stmt USING @lo, @hi;
+SUM(k)
+30
+include/assert.inc [sysbench sum_ranges creates one cached aggregate range state]
+include/assert.inc [sysbench sum_ranges has repeated cache hits]
+include/assert.inc [sysbench sum_ranges has prevalidations before hits]
+DEALLOCATE PREPARE stmt;
+include/assert.inc [sysbench sum_ranges releases cached state on deallocate]
+# non-sysbench SUM expressions remain outside the aggregate range boundary
+PREPARE stmt FROM 'SELECT SUM(k + 1) FROM sbtest1 WHERE id BETWEEN ? AND ?';
+EXECUTE stmt USING @lo, @hi;
+EXECUTE stmt USING @lo, @hi;
+DEALLOCATE PREPARE stmt;
+# sysbench order_ranges is now covered by the ORDER BY range recipe
+PREPARE stmt FROM 'SELECT c FROM sbtest1 WHERE id BETWEEN ? AND ? ORDER BY c';
+SET @lo=1;
+SET @hi=4;
+EXECUTE stmt USING @lo, @hi;
+c
+c1
+c1
+c2
+c3
+SET @lo=2;
+SET @hi=4;
+EXECUTE stmt USING @lo, @hi;
+c
+c1
+c1
+c2
+SET @lo=1;
+SET @hi=3;
+EXECUTE stmt USING @lo, @hi;
+c
+c1
+c2
+c3
+include/assert.inc [sysbench order_ranges creates one cached ORDER BY range state]
+include/assert.inc [sysbench order_ranges has repeated cache hits]
+include/assert.inc [sysbench order_ranges has prevalidations before hits]
+DEALLOCATE PREPARE stmt;
+include/assert.inc [sysbench order_ranges releases cached state on deallocate]
+# non-sysbench ORDER BY projection remains outside the range boundary
+PREPARE stmt FROM 'SELECT pad FROM sbtest1 WHERE id BETWEEN ? AND ? ORDER BY c';
+SET @lo=1;
+SET @hi=4;
+EXECUTE stmt USING @lo, @hi;
+EXECUTE stmt USING @lo, @hi;
+include/assert.inc [non-sysbench ORDER BY projection does not create cached state]
+include/assert.inc [non-sysbench ORDER BY projection does not add hits]
+include/assert.inc [non-sysbench ORDER BY projection does not add prevalidations]
+DEALLOCATE PREPARE stmt;
+# sysbench distinct_ranges is now covered by the DISTINCT ORDER BY range recipe
+PREPARE stmt FROM 'SELECT DISTINCT c FROM sbtest1 WHERE id BETWEEN ? AND ? ORDER BY c';
+SET @lo=1;
+SET @hi=4;
+EXECUTE stmt USING @lo, @hi;
+c
+c1
+c2
+c3
+SET @lo=2;
+SET @hi=4;
+EXECUTE stmt USING @lo, @hi;
+c
+c1
+c2
+SET @lo=1;
+SET @hi=3;
+EXECUTE stmt USING @lo, @hi;
+c
+c1
+c2
+c3
+include/assert.inc [sysbench distinct_ranges creates one cached DISTINCT range state]
+include/assert.inc [sysbench distinct_ranges has repeated cache hits]
+include/assert.inc [sysbench distinct_ranges has prevalidations before hits]
+DEALLOCATE PREPARE stmt;
+include/assert.inc [sysbench distinct_ranges releases cached state on deallocate]
+# literal LIMIT 1 remains outside ref/range/order/distinct sysbench recipes
+PREPARE stmt FROM 'SELECT c FROM sbtest_secondary WHERE id=? LIMIT 1';
+SET @id=1;
+EXECUTE stmt USING @id;
+EXECUTE stmt USING @id;
+DEALLOCATE PREPARE stmt;
+PREPARE stmt FROM 'SELECT c FROM sbtest1 WHERE id BETWEEN ? AND ? LIMIT 1';
+SET @lo=1;
+SET @hi=4;
+EXECUTE stmt USING @lo, @hi;
+EXECUTE stmt USING @lo, @hi;
+DEALLOCATE PREPARE stmt;
+PREPARE stmt FROM 'SELECT c FROM sbtest1 WHERE id BETWEEN ? AND ? ORDER BY c LIMIT 1';
+EXECUTE stmt USING @lo, @hi;
+EXECUTE stmt USING @lo, @hi;
+DEALLOCATE PREPARE stmt;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM sbtest1 WHERE id BETWEEN ? AND ? ORDER BY c LIMIT 1';
+EXECUTE stmt USING @lo, @hi;
+EXECUTE stmt USING @lo, @hi;
+DEALLOCATE PREPARE stmt;
+include/assert.inc [ref/range/order/distinct LIMIT 1 sysbench variants do not create cached state]
+include/assert.inc [ref/range/order/distinct LIMIT 1 sysbench variants do not add hits]
+include/assert.inc [ref/range/order/distinct LIMIT 1 sysbench variants do not add prevalidations]
+# sysbench transaction control and write templates are not cached
+PREPARE stmt_begin FROM 'BEGIN';
+PREPARE stmt_commit FROM 'COMMIT';
+PREPARE stmt_update_index FROM 'UPDATE sbtest1 SET k=k+1 WHERE id=?';
+PREPARE stmt_update_non_index FROM 'UPDATE sbtest1 SET c=? WHERE id=?';
+PREPARE stmt_delete FROM 'DELETE FROM sbtest1 WHERE id=?';
+PREPARE stmt_insert FROM 'INSERT INTO sbtest1 (id, k, c, pad) VALUES (?, ?, ?, ?)';
+SET @id=4;
+SET @c='updated';
+SET @k=50;
+SET @pad='inserted';
+EXECUTE stmt_begin;
+EXECUTE stmt_update_index USING @id;
+EXECUTE stmt_update_non_index USING @c, @id;
+EXECUTE stmt_delete USING @id;
+EXECUTE stmt_insert USING @id, @k, @c, @pad;
+EXECUTE stmt_commit;
+DEALLOCATE PREPARE stmt_begin;
+DEALLOCATE PREPARE stmt_commit;
+DEALLOCATE PREPARE stmt_update_index;
+DEALLOCATE PREPARE stmt_update_non_index;
+DEALLOCATE PREPARE stmt_delete;
+DEALLOCATE PREPARE stmt_insert;
+# sysbench oltp_insert uses text INSERT in the MySQL branch, not prepared SELECT
+INSERT INTO sbtest1 (id, k, c, pad) VALUES (100, 100, 'literal insert', 'literal pad');
+# sysbench write templates still execute normally while remaining uncached
+SELECT id, k, c, pad FROM sbtest1 WHERE id IN (4, 100) ORDER BY id;
+id	k	c	pad
+4	50	updated	inserted
+100	100	literal insert	literal pad
+include/assert.inc [unsupported sysbench templates do not leave cached state]
+include/assert.inc [transaction control and write templates do not add hits beyond covered SELECT templates]
+include/assert.inc [transaction control and write templates do not add prevalidations beyond covered SELECT templates]
+include/assert.inc [unsupported sysbench templates do not add invalidations]
+SET @@session.session_plan_cache_allow_change_ratio = @save_ratio;
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE sbtest_secondary;
+DROP TABLE sbtest1;

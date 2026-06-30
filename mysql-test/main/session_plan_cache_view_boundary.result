@@ -1,0 +1,27 @@
+CREATE TABLE pc_view_base (
+id INT PRIMARY KEY,
+v INT
+) ENGINE=InnoDB;
+INSERT INTO pc_view_base VALUES (1,10),(2,20);
+CREATE VIEW pc_view_boundary AS
+SELECT id, v FROM pc_view_base;
+SET @@session.session_plan_cache = ON;
+# Views are not plan-cache candidates
+PREPARE stmt FROM
+'SELECT id, v FROM pc_view_boundary WHERE id = ?';
+SET @p=1;
+EXECUTE stmt USING @p;
+id	v
+1	10
+SET @p=2;
+EXECUTE stmt USING @p;
+id	v
+2	20
+include/assert.inc [Cached_plan_count does not grow for view SELECT]
+include/assert.inc [Cached_plan_hits does not grow for view SELECT]
+include/assert.inc [Cached_plan_prevalidations does not grow for view SELECT]
+include/assert.inc [Cached_plan_invalidations does not grow for view SELECT]
+DEALLOCATE PREPARE stmt;
+SET @@session.session_plan_cache = DEFAULT;
+DROP VIEW pc_view_boundary;
+DROP TABLE pc_view_base;

@@ -1,0 +1,42 @@
+--source include/have_innodb.inc
+
+CREATE TABLE pc_disconnect_count (
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+
+INSERT INTO pc_disconnect_count VALUES (1,10),(2,20);
+
+--disable_query_log
+let $count_before= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+--enable_query_log
+
+--echo # A secondary connection creates one live cached-plan state
+connect (con_plan_cache_disconnect,localhost,root,,);
+SET @@session.session_plan_cache = ON;
+PREPARE stmt FROM 'SELECT id, v FROM pc_disconnect_count WHERE id = ?';
+SET @p=1;
+EXECUTE stmt USING @p;
+
+--connection default
+--disable_query_log
+let $count_after_execute= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count grows while secondary connection owns a live state
+--let $assert_cond= $count_after_execute = $count_before + 1
+--source include/assert.inc
+--enable_query_log
+
+--echo # Disconnect releases prepared statements and cached-plan state
+--disconnect con_plan_cache_disconnect
+--connection default
+
+--disable_query_log
+let $count_after_disconnect= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after connection disconnect
+--let $assert_cond= $count_after_disconnect = $count_before
+--source include/assert.inc
+--enable_query_log
+
+DROP TABLE pc_disconnect_count;

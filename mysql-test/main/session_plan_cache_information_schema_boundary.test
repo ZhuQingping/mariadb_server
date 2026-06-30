@@ -1,0 +1,45 @@
+SET @@session.session_plan_cache = ON;
+
+--disable_query_log
+let $count_before= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+--enable_query_log
+
+--echo # INFORMATION_SCHEMA tables are not plan-cache candidates
+PREPARE stmt FROM
+  'SELECT COUNT(*) AS cnt FROM information_schema.tables WHERE table_schema = ?';
+SET @schema_name='INFORMATION_SCHEMA';
+--disable_result_log
+EXECUTE stmt USING @schema_name;
+SET @schema_name='test';
+EXECUTE stmt USING @schema_name;
+--enable_result_log
+
+--disable_query_log
+let $count_after= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_after= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count does not grow for INFORMATION_SCHEMA SELECT
+--let $assert_cond= $count_after = $count_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits does not grow for INFORMATION_SCHEMA SELECT
+--let $assert_cond= $hits_after = $hits_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for INFORMATION_SCHEMA SELECT
+--let $assert_cond= $prevalidations_after = $prevalidations_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations does not grow for INFORMATION_SCHEMA SELECT
+--let $assert_cond= $invalidations_after = $invalidations_before
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt;
+
+SET @@session.session_plan_cache = DEFAULT;

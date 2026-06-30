@@ -1,0 +1,87 @@
+--source include/have_innodb.inc
+
+CREATE TABLE pc_distinct_range_profile (
+  id INT NOT NULL PRIMARY KEY,
+  c CHAR(10) NOT NULL
+) ENGINE=InnoDB;
+
+INSERT INTO pc_distinct_range_profile VALUES
+  (1, 'c3'), (2, 'c1'), (3, 'c2'),
+  (4, 'c1'), (5, 'c4'), (6, 'c2');
+
+SET @@session.session_plan_cache = ON;
+SET @save_ratio=@@session.session_plan_cache_allow_change_ratio;
+SET @save_profile=@@session.session_plan_cache_profile;
+SET @@session.session_plan_cache_allow_change_ratio = 0;
+SET @@session.session_plan_cache_profile = ON;
+
+--disable_query_log
+let $hits_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $range_hits_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_range_count', Value, 1);
+let $setup_post_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_range_setup_post_us', Value, 1);
+let $setup_ref_array_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_range_setup_ref_array_us', Value, 1);
+let $setup_aggr_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_range_setup_aggr_us', Value, 1);
+let $setup_distinct_fast_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_range_setup_distinct_fast_us', Value, 1);
+let $hit_explain_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_explain_us', Value, 1);
+--enable_query_log
+
+PREPARE stmt FROM
+  'SELECT DISTINCT c FROM pc_distinct_range_profile WHERE id BETWEEN ? AND ? ORDER BY c';
+
+--echo # First execution creates the state; later executions are profiled hits
+SET @lo=1;
+SET @hi=4;
+EXECUTE stmt USING @lo, @hi;
+
+SET @lo=2;
+SET @hi=6;
+EXECUTE stmt USING @lo, @hi;
+
+SET @lo=1;
+SET @hi=6;
+EXECUTE stmt USING @lo, @hi;
+
+--disable_query_log
+let $hits_after= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $range_hits_after= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_range_count', Value, 1);
+let $setup_post_after= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_range_setup_post_us', Value, 1);
+let $setup_ref_array_after= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_range_setup_ref_array_us', Value, 1);
+let $setup_aggr_after= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_range_setup_aggr_us', Value, 1);
+let $setup_distinct_fast_after= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_range_setup_distinct_fast_us', Value, 1);
+let $hit_explain_after= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_explain_us', Value, 1);
+
+--let $assert_text= profiled DISTINCT range records two cache hits
+--let $assert_cond= $hits_after = $hits_before + 2
+--source include/assert.inc
+
+--let $assert_text= profiled DISTINCT range increments range hit counter
+--let $assert_cond= $range_hits_after = $range_hits_before + 2
+--source include/assert.inc
+
+--let $assert_text= profiled DISTINCT range records post setup time
+--let $assert_cond= $setup_post_after > $setup_post_before
+--source include/assert.inc
+
+--let $assert_text= profiled DISTINCT range exposes ref array setup time
+--let $assert_cond= $setup_ref_array_after >= $setup_ref_array_before
+--source include/assert.inc
+
+--let $assert_text= profiled DISTINCT range records aggregate setup time
+--let $assert_cond= $setup_aggr_after > $setup_aggr_before
+--source include/assert.inc
+
+--let $assert_text= profiled DISTINCT range records fast aggregate setup time
+--let $assert_cond= $setup_distinct_fast_after > $setup_distinct_fast_before
+--source include/assert.inc
+
+--let $assert_text= profiled DISTINCT range records hit explain time
+--let $assert_cond= $hit_explain_after > $hit_explain_before
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt;
+
+SET @@session.session_plan_cache_profile = @save_profile;
+SET @@session.session_plan_cache_allow_change_ratio = @save_ratio;
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_distinct_range_profile;

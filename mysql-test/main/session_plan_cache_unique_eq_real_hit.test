@@ -1,0 +1,1188 @@
+--source include/have_innodb.inc
+
+CREATE TABLE pc_real_hit_pk (
+  id INT NOT NULL PRIMARY KEY,
+  uq INT NOT NULL,
+  pad CHAR(10),
+  UNIQUE KEY uq_key(uq)
+) ENGINE=InnoDB;
+INSERT INTO pc_real_hit_pk VALUES (1, 10, 'a'), (2, 20, 'b');
+
+CREATE TABLE pc_real_hit_nullable (
+  id INT,
+  pad CHAR(10),
+  UNIQUE KEY id_uq(id)
+) ENGINE=InnoDB;
+INSERT INTO pc_real_hit_nullable VALUES (1, 'a'), (NULL, 'n');
+
+CREATE TABLE pc_real_hit_nonunique (
+  id INT NOT NULL,
+  pad CHAR(10),
+  KEY id_key(id)
+) ENGINE=InnoDB;
+INSERT INTO pc_real_hit_nonunique VALUES (1, 'a'), (1, 'a2'), (2, 'b');
+
+CREATE TABLE pc_real_hit_multi (
+  tenant_id INT NOT NULL,
+  id INT NOT NULL,
+  pad CHAR(10),
+  UNIQUE KEY tenant_id_uq(tenant_id, id)
+) ENGINE=InnoDB;
+INSERT INTO pc_real_hit_multi VALUES (10, 1, 'a'), (10, 2, 'b');
+
+CREATE TABLE pc_real_hit_char (
+  c VARCHAR(20) NOT NULL,
+  pad CHAR(10),
+  UNIQUE KEY c_uq(c)
+) ENGINE=InnoDB DEFAULT CHARSET latin1 COLLATE latin1_swedish_ci;
+INSERT INTO pc_real_hit_char VALUES ('a', 'ca'), ('b', 'cb');
+
+SET @@session.session_plan_cache = ON;
+SET @save_ratio=@@session.session_plan_cache_allow_change_ratio;
+SET @@session.session_plan_cache_allow_change_ratio = 0;
+
+--disable_query_log
+let $count_before= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $handler_read_key_before= query_get_value(SHOW SESSION STATUS LIKE 'Handler_read_key', Value, 1);
+let $handler_read_next_before= query_get_value(SHOW SESSION STATUS LIKE 'Handler_read_next', Value, 1);
+let $handler_read_rnd_next_before= query_get_value(SHOW SESSION STATUS LIKE 'Handler_read_rnd_next', Value, 1);
+--enable_query_log
+
+PREPARE stmt_pk FROM 'SELECT pad FROM pc_real_hit_pk WHERE id = ?';
+
+--echo # First execute creates state but does not count a cache hit
+SET @p=1;
+EXECUTE stmt_pk USING @p;
+
+--echo # Later eligible executes should use the real unique-equality hit path
+SET @p=2;
+EXECUTE stmt_pk USING @p;
+SET @p=42;
+EXECUTE stmt_pk USING @p;
+SET @p=1;
+EXECUTE stmt_pk USING @p;
+
+--disable_query_log
+let $count_after_pk= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_pk= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_pk= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $handler_read_key_after_pk= query_get_value(SHOW SESSION STATUS LIKE 'Handler_read_key', Value, 1);
+let $handler_read_next_after_pk= query_get_value(SHOW SESSION STATUS LIKE 'Handler_read_next', Value, 1);
+let $handler_read_rnd_next_after_pk= query_get_value(SHOW SESSION STATUS LIKE 'Handler_read_rnd_next', Value, 1);
+
+--let $assert_text= Cached_plan_count keeps one real-hit state for primary-key lookup
+--let $assert_cond= $count_after_pk = $count_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations grows before primary-key real hits
+--let $assert_cond= $prevalidations_after_pk = $prevalidations_before + 3
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits grows for repeated primary-key real hits
+--let $assert_cond= $hits_after_pk = $hits_before + 3
+--source include/assert.inc
+
+--let $assert_text= Handler_read_key grows for primary-key point lookups
+--let $assert_cond= $handler_read_key_after_pk >= $handler_read_key_before + 4
+--source include/assert.inc
+
+--let $assert_text= Handler_read_next does not grow for primary-key point lookups
+--let $assert_cond= $handler_read_next_after_pk = $handler_read_next_before
+--source include/assert.inc
+
+--let $assert_text= Handler_read_rnd_next does not grow for primary-key point lookups
+--let $assert_cond= $handler_read_rnd_next_after_pk = $handler_read_rnd_next_before
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_pk;
+
+PREPARE stmt_unique FROM 'SELECT pad FROM pc_real_hit_pk WHERE uq = ?';
+
+--echo # Non-null unique secondary lookup should use the same real hit path
+SET @p=10;
+EXECUTE stmt_unique USING @p;
+SET @p=20;
+EXECUTE stmt_unique USING @p;
+SET @p=99;
+EXECUTE stmt_unique USING @p;
+
+--disable_query_log
+let $count_after_unique= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_unique= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_unique= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count keeps one real-hit state for unique secondary lookup
+--let $assert_cond= $count_after_unique = $count_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations grows before unique secondary real hits
+--let $assert_cond= $prevalidations_after_unique = $prevalidations_after_pk + 2
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits grows for repeated unique secondary real hits
+--let $assert_cond= $hits_after_unique = $hits_after_pk + 2
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_unique;
+
+PREPARE stmt_reverse FROM 'SELECT pad FROM pc_real_hit_pk WHERE ? = id';
+
+--echo # Reversed equality is eligible for real hits
+SET @p=1;
+EXECUTE stmt_reverse USING @p;
+SET @p=2;
+EXECUTE stmt_reverse USING @p;
+
+--disable_query_log
+let $hits_after_reverse= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_reverse= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_prevalidations grows before reversed real hit
+--let $assert_cond= $prevalidations_after_reverse = $prevalidations_after_unique + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits grows for reversed real hit
+--let $assert_cond= $hits_after_reverse = $hits_after_unique + 1
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_reverse;
+
+PREPARE stmt_char FROM 'SELECT pad FROM pc_real_hit_char WHERE c = ?';
+
+--echo # Stable string unique lookup should use the real hit path
+SET @p='a';
+EXECUTE stmt_char USING @p;
+SET @p='b';
+EXECUTE stmt_char USING @p;
+
+--disable_query_log
+let $hits_after_char= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_char= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_prevalidations grows before string unique real hit
+--let $assert_cond= $prevalidations_after_char = $prevalidations_after_reverse + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits grows for string unique real hit
+--let $assert_cond= $hits_after_char = $hits_after_reverse + 1
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_char;
+
+--disable_query_log
+let $invalidations_before_select_param= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+--enable_query_log
+
+PREPARE stmt_select_param FROM
+  'SELECT pad, ? AS marker FROM pc_real_hit_pk WHERE id = ?';
+
+--echo # SELECT-list parameters must refresh on each real hit
+SET @m='m1';
+SET @p=1;
+EXECUTE stmt_select_param USING @m, @p;
+SET @m='m2';
+SET @p=2;
+EXECUTE stmt_select_param USING @m, @p;
+SET @m='m3';
+SET @p=1;
+EXECUTE stmt_select_param USING @m, @p;
+
+--echo # Non-WHERE parameter shape changes invalidate and stay off stale hits
+SET @m=100;
+SET @p=2;
+EXECUTE stmt_select_param USING @m, @p;
+SET @m=200;
+SET @p=1;
+EXECUTE stmt_select_param USING @m, @p;
+SET @m=300;
+SET @p=2;
+EXECUTE stmt_select_param USING @m, @p;
+
+--disable_query_log
+let $count_after_select_param= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_select_param= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_select_param= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_after_select_param= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count keeps one replacement state for SELECT-list parameter refresh
+--let $assert_cond= $count_after_select_param = $count_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits grows for same-shape SELECT-list parameter refresh and replacement recache
+--let $assert_cond= $hits_after_select_param = $hits_after_char + 3
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations grows for same-shape SELECT-list parameter refresh and replacement recache
+--let $assert_cond= $prevalidations_after_select_param = $prevalidations_after_char + 3
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations grows after SELECT-list parameter shape change
+--let $assert_cond= $invalidations_after_select_param = $invalidations_before_select_param + 1
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_select_param;
+
+PREPARE stmt_output_shapes FROM
+  'SELECT *, id AS id_alias, pad AS pad_alias, id + 10 AS id_plus, CAST(pad AS CHAR(10)) AS pad_cast, ''tag'' AS tag FROM pc_real_hit_pk WHERE id = ?';
+
+--echo # Real hits must preserve current row output for star, aliases, constants, and expressions
+SET @p=1;
+EXECUTE stmt_output_shapes USING @p;
+UPDATE pc_real_hit_pk SET pad='aa' WHERE id=1;
+SET @p=2;
+EXECUTE stmt_output_shapes USING @p;
+SET @p=1;
+EXECUTE stmt_output_shapes USING @p;
+UPDATE pc_real_hit_pk SET pad='a' WHERE id=1;
+
+--disable_query_log
+let $count_after_output_shapes= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_output_shapes= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_output_shapes= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_after_output_shapes= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count keeps one state for expanded SELECT output shapes
+--let $assert_cond= $count_after_output_shapes = $count_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits grows for expanded SELECT output shapes
+--let $assert_cond= $hits_after_output_shapes = $hits_after_select_param + 2
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations grows for expanded SELECT output shapes
+--let $assert_cond= $prevalidations_after_output_shapes = $prevalidations_after_select_param + 2
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations does not grow for expanded SELECT output shapes
+--let $assert_cond= $invalidations_after_output_shapes = $invalidations_after_select_param
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_output_shapes;
+
+PREPARE stmt_null FROM 'SELECT pad FROM pc_real_hit_pk WHERE id = ?';
+
+--echo # NULL parameter remains fail-closed and must not count as a hit
+SET @p=1;
+EXECUTE stmt_null USING @p;
+SET @p=NULL;
+EXECUTE stmt_null USING @p;
+
+--disable_query_log
+let $hits_after_null= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_null= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for NULL real-hit candidate
+--let $assert_cond= $hits_after_null = $hits_after_output_shapes
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for NULL real-hit candidate
+--let $assert_cond= $prevalidations_after_null = $prevalidations_after_output_shapes
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_null;
+
+PREPARE stmt_nullable FROM
+  'SELECT pad FROM pc_real_hit_nullable WHERE id = ?';
+
+--echo # Nullable unique key remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_nullable USING @p;
+SET @p=1;
+EXECUTE stmt_nullable USING @p;
+
+--disable_query_log
+let $hits_after_nullable= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_nullable= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for nullable unique real-hit candidate
+--let $assert_cond= $hits_after_nullable = $hits_after_null
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for nullable unique real-hit candidate
+--let $assert_cond= $prevalidations_after_nullable = $prevalidations_after_null
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_nullable;
+
+PREPARE stmt_nonunique FROM
+  'SELECT pad FROM pc_real_hit_nonunique WHERE id = ?';
+
+--echo # Non-unique key is now covered by the ref real-hit path
+SET @p=1;
+EXECUTE stmt_nonunique USING @p;
+SET @p=2;
+EXECUTE stmt_nonunique USING @p;
+
+--disable_query_log
+let $hits_after_nonunique= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_nonunique= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits grows for non-unique ref real-hit candidate
+--let $assert_cond= $hits_after_nonunique = $hits_after_nullable + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations grows for non-unique ref real-hit candidate
+--let $assert_cond= $prevalidations_after_nonunique = $prevalidations_after_nullable + 1
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_nonunique;
+
+PREPARE stmt_multi_full FROM
+  'SELECT pad FROM pc_real_hit_multi WHERE tenant_id = ? AND id = ?';
+
+--echo # Full multi-part unique equality remains fail-closed for real hits
+SET @p=10;
+SET @q=1;
+EXECUTE stmt_multi_full USING @p, @q;
+SET @p=10;
+SET @q=2;
+EXECUTE stmt_multi_full USING @p, @q;
+
+--disable_query_log
+let $hits_after_multi_full= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_multi_full= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for full multi-part real-hit candidate
+--let $assert_cond= $hits_after_multi_full = $hits_after_nonunique
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for full multi-part real-hit candidate
+--let $assert_cond= $prevalidations_after_multi_full = $prevalidations_after_nonunique
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_multi_full;
+
+PREPARE stmt_multi_first_partial FROM
+  'SELECT pad FROM pc_real_hit_multi WHERE tenant_id = ?';
+
+--echo # First keypart of multi-part unique equality remains fail-closed for real hits
+SET @p=10;
+EXECUTE stmt_multi_first_partial USING @p;
+SET @p=20;
+EXECUTE stmt_multi_first_partial USING @p;
+
+--disable_query_log
+let $hits_after_multi_first_partial= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_multi_first_partial= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for first-keypart multi-part real-hit candidate
+--let $assert_cond= $hits_after_multi_first_partial = $hits_after_multi_full
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for first-keypart multi-part real-hit candidate
+--let $assert_cond= $prevalidations_after_multi_first_partial = $prevalidations_after_multi_full
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_multi_first_partial;
+
+PREPARE stmt_multi_const_param FROM
+  'SELECT pad FROM pc_real_hit_multi WHERE tenant_id = 10 AND id = ?';
+
+--echo # Mixed constant and parameter multi-part unique equality remains fail-closed
+SET @p=1;
+EXECUTE stmt_multi_const_param USING @p;
+SET @p=2;
+EXECUTE stmt_multi_const_param USING @p;
+
+--disable_query_log
+let $hits_after_multi_const_param= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_multi_const_param= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for const-param multi-part real-hit candidate
+--let $assert_cond= $hits_after_multi_const_param = $hits_after_multi_first_partial
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for const-param multi-part real-hit candidate
+--let $assert_cond= $prevalidations_after_multi_const_param = $prevalidations_after_multi_first_partial
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_multi_const_param;
+
+PREPARE stmt_range FROM 'SELECT pad FROM pc_real_hit_pk WHERE id > ?';
+
+--echo # Range predicate remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_range USING @p;
+SET @p=1;
+EXECUTE stmt_range USING @p;
+
+--disable_query_log
+let $hits_after_range= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_range= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for range real-hit candidate
+--let $assert_cond= $hits_after_range = $hits_after_multi_const_param
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for range real-hit candidate
+--let $assert_cond= $prevalidations_after_range = $prevalidations_after_multi_const_param
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_range;
+
+PREPARE stmt_order FROM
+  'SELECT pad FROM pc_real_hit_pk WHERE id = ? ORDER BY pad';
+
+--echo # ORDER BY remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_order USING @p;
+SET @p=2;
+EXECUTE stmt_order USING @p;
+
+--disable_query_log
+let $hits_after_order= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_order= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for ORDER BY real-hit candidate
+--let $assert_cond= $hits_after_order = $hits_after_range
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for ORDER BY real-hit candidate
+--let $assert_cond= $prevalidations_after_order = $prevalidations_after_range
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_order;
+
+PREPARE stmt_multi_partial FROM
+  'SELECT pad FROM pc_real_hit_multi WHERE id = ?';
+
+--echo # Partial multi-part unique equality remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_multi_partial USING @p;
+SET @p=2;
+EXECUTE stmt_multi_partial USING @p;
+
+--disable_query_log
+let $hits_after_multi_partial= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_multi_partial= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for partial multi-part real-hit candidate
+--let $assert_cond= $hits_after_multi_partial = $hits_after_order
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for partial multi-part real-hit candidate
+--let $assert_cond= $prevalidations_after_multi_partial = $prevalidations_after_order
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_multi_partial;
+
+PREPARE stmt_and FROM
+  'SELECT pad FROM pc_real_hit_pk WHERE id = ? AND pad = ?';
+
+--echo # AND predicates remain fail-closed for real hits
+SET @p=1;
+SET @q='a';
+EXECUTE stmt_and USING @p, @q;
+SET @p=2;
+SET @q='b';
+EXECUTE stmt_and USING @p, @q;
+
+--disable_query_log
+let $hits_after_and= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_and= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for AND real-hit candidate
+--let $assert_cond= $hits_after_and = $hits_after_multi_partial
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for AND real-hit candidate
+--let $assert_cond= $prevalidations_after_and = $prevalidations_after_multi_partial
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_and;
+
+PREPARE stmt_group FROM
+  'SELECT id, COUNT(*) FROM pc_real_hit_pk WHERE id = ? GROUP BY id';
+
+--echo # GROUP BY remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_group USING @p;
+SET @p=2;
+EXECUTE stmt_group USING @p;
+
+--disable_query_log
+let $hits_after_group= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_group= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for GROUP BY real-hit candidate
+--let $assert_cond= $hits_after_group = $hits_after_and
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for GROUP BY real-hit candidate
+--let $assert_cond= $prevalidations_after_group = $prevalidations_after_and
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_group;
+
+PREPARE stmt_distinct FROM
+  'SELECT DISTINCT pad FROM pc_real_hit_pk WHERE id = ?';
+
+--echo # DISTINCT remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_distinct USING @p;
+SET @p=2;
+EXECUTE stmt_distinct USING @p;
+
+--disable_query_log
+let $hits_after_distinct= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_distinct= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for DISTINCT real-hit candidate
+--let $assert_cond= $hits_after_distinct = $hits_after_group
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for DISTINCT real-hit candidate
+--let $assert_cond= $prevalidations_after_distinct = $prevalidations_after_group
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_distinct;
+
+PREPARE stmt_subquery FROM
+  'SELECT pad, (SELECT MAX(uq) FROM pc_real_hit_pk) FROM pc_real_hit_pk WHERE id = ?';
+
+--echo # Scalar subquery remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_subquery USING @p;
+SET @p=2;
+EXECUTE stmt_subquery USING @p;
+
+--disable_query_log
+let $hits_after_subquery= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_subquery= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for subquery real-hit candidate
+--let $assert_cond= $hits_after_subquery = $hits_after_distinct
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for subquery real-hit candidate
+--let $assert_cond= $prevalidations_after_subquery = $prevalidations_after_distinct
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_subquery;
+
+PREPARE stmt_user_var FROM
+  'SELECT @pc_rh_uv := pad FROM pc_real_hit_pk WHERE id = ?';
+
+--echo # User-variable side effects remain fail-closed for real hits
+SET @pc_rh_uv='';
+SET @p=1;
+EXECUTE stmt_user_var USING @p;
+SET @p=2;
+EXECUTE stmt_user_var USING @p;
+
+--disable_query_log
+let $hits_after_user_var= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_user_var= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for user-variable real-hit candidate
+--let $assert_cond= $hits_after_user_var = $hits_after_subquery
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for user-variable real-hit candidate
+--let $assert_cond= $prevalidations_after_user_var = $prevalidations_after_subquery
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_user_var;
+
+PREPARE stmt_lock FROM
+  'SELECT pad FROM pc_real_hit_pk WHERE id = ? FOR UPDATE';
+
+--echo # Locking clauses remain fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_lock USING @p;
+SET @p=2;
+EXECUTE stmt_lock USING @p;
+
+--disable_query_log
+let $hits_after_lock= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_lock= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for locking real-hit candidate
+--let $assert_cond= $hits_after_lock = $hits_after_user_var
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for locking real-hit candidate
+--let $assert_cond= $prevalidations_after_lock = $prevalidations_after_user_var
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_lock;
+
+PREPARE stmt_limit_one FROM
+  'SELECT pad FROM pc_real_hit_pk WHERE id = ? LIMIT 1';
+
+--echo # Literal LIMIT 1 is eligible under the unique-equality boundary
+SET @p=1;
+EXECUTE stmt_limit_one USING @p;
+SET @p=2;
+EXECUTE stmt_limit_one USING @p;
+SET @p=42;
+EXECUTE stmt_limit_one USING @p;
+
+PREPARE stmt_limit_one_reverse FROM
+  'SELECT pad FROM pc_real_hit_pk WHERE ? = id LIMIT 1';
+
+SET @p=1;
+EXECUTE stmt_limit_one_reverse USING @p;
+SET @p=2;
+EXECUTE stmt_limit_one_reverse USING @p;
+
+--disable_query_log
+let $hits_after_limit_one= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_limit_one= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits grows for literal LIMIT 1 real-hit candidates
+--let $assert_cond= $hits_after_limit_one = $hits_after_lock + 3
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations grows for literal LIMIT 1 real-hit candidates
+--let $assert_cond= $prevalidations_after_limit_one = $prevalidations_after_lock + 3
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_limit_one;
+DEALLOCATE PREPARE stmt_limit_one_reverse;
+
+PREPARE stmt_found_rows FROM
+  'SELECT SQL_CALC_FOUND_ROWS pad FROM pc_real_hit_pk WHERE id = ?';
+
+--echo # SQL_CALC_FOUND_ROWS remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_found_rows USING @p;
+SET @p=2;
+EXECUTE stmt_found_rows USING @p;
+
+--disable_query_log
+let $hits_after_found_rows= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_found_rows= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for SQL_CALC_FOUND_ROWS real-hit candidate
+--let $assert_cond= $hits_after_found_rows = $hits_after_limit_one
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for SQL_CALC_FOUND_ROWS real-hit candidate
+--let $assert_cond= $prevalidations_after_found_rows = $prevalidations_after_limit_one
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_found_rows;
+
+PREPARE stmt_found_rows_limit_one FROM
+  'SELECT SQL_CALC_FOUND_ROWS pad FROM pc_real_hit_pk WHERE id = ? LIMIT 1';
+
+--echo # SQL_CALC_FOUND_ROWS LIMIT 1 remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_found_rows_limit_one USING @p;
+SET @p=2;
+EXECUTE stmt_found_rows_limit_one USING @p;
+
+--disable_query_log
+let $hits_after_found_rows_limit_one= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_found_rows_limit_one= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for SQL_CALC_FOUND_ROWS LIMIT 1 real-hit candidate
+--let $assert_cond= $hits_after_found_rows_limit_one = $hits_after_found_rows
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for SQL_CALC_FOUND_ROWS LIMIT 1 real-hit candidate
+--let $assert_cond= $prevalidations_after_found_rows_limit_one = $prevalidations_after_found_rows
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_found_rows_limit_one;
+
+--disable_ps_protocol
+PREPARE stmt_found_rows_scan FROM
+  'SELECT SQL_CALC_FOUND_ROWS pad FROM pc_real_hit_pk ORDER BY id LIMIT 1';
+
+--echo # FOUND_ROWS keeps normal executor semantics when plan cache is enabled
+EXECUTE stmt_found_rows_scan;
+SELECT FOUND_ROWS();
+
+DEALLOCATE PREPARE stmt_found_rows_scan;
+--enable_ps_protocol
+
+PREPARE stmt_limit_param FROM
+  'SELECT pad FROM pc_real_hit_pk WHERE id = ? LIMIT ?';
+
+--echo # Parameterized LIMIT remains fail-closed for real hits
+SET @p=1;
+SET @q=1;
+EXECUTE stmt_limit_param USING @p, @q;
+SET @p=2;
+EXECUTE stmt_limit_param USING @p, @q;
+SET @p=2;
+SET @q=0;
+EXECUTE stmt_limit_param USING @p, @q;
+
+--disable_query_log
+let $hits_after_limit_param= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_limit_param= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for parameterized LIMIT real-hit candidate
+--let $assert_cond= $hits_after_limit_param = $hits_after_found_rows_limit_one
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for parameterized LIMIT real-hit candidate
+--let $assert_cond= $prevalidations_after_limit_param = $prevalidations_after_found_rows_limit_one
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_limit_param;
+
+PREPARE stmt_limit_zero FROM
+  'SELECT pad FROM pc_real_hit_pk WHERE id = ? LIMIT 0';
+
+--echo # LIMIT 0 remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_limit_zero USING @p;
+SET @p=2;
+EXECUTE stmt_limit_zero USING @p;
+
+--disable_query_log
+let $hits_after_limit_zero= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_limit_zero= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for LIMIT 0 real-hit candidate
+--let $assert_cond= $hits_after_limit_zero = $hits_after_limit_param
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for LIMIT 0 real-hit candidate
+--let $assert_cond= $prevalidations_after_limit_zero = $prevalidations_after_limit_param
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_limit_zero;
+
+PREPARE stmt_limit_two FROM
+  'SELECT pad FROM pc_real_hit_pk WHERE id = ? LIMIT 2';
+
+--echo # Non-one literal LIMIT remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_limit_two USING @p;
+SET @p=2;
+EXECUTE stmt_limit_two USING @p;
+
+--disable_query_log
+let $hits_after_limit_two= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_limit_two= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for LIMIT 2 real-hit candidate
+--let $assert_cond= $hits_after_limit_two = $hits_after_limit_zero
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for LIMIT 2 real-hit candidate
+--let $assert_cond= $prevalidations_after_limit_two = $prevalidations_after_limit_zero
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_limit_two;
+
+PREPARE stmt_limit_offset FROM
+  'SELECT pad FROM pc_real_hit_pk WHERE id = ? LIMIT 1 OFFSET 0';
+
+--echo # OFFSET remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_limit_offset USING @p;
+SET @p=2;
+EXECUTE stmt_limit_offset USING @p;
+
+--disable_query_log
+let $hits_after_limit_offset= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_limit_offset= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for LIMIT OFFSET real-hit candidate
+--let $assert_cond= $hits_after_limit_offset = $hits_after_limit_two
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for LIMIT OFFSET real-hit candidate
+--let $assert_cond= $prevalidations_after_limit_offset = $prevalidations_after_limit_two
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_limit_offset;
+
+PREPARE stmt_limit_offset_one FROM
+  'SELECT pad FROM pc_real_hit_pk WHERE id = ? LIMIT 1 OFFSET 1';
+
+--echo # Non-zero OFFSET remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_limit_offset_one USING @p;
+SET @p=2;
+EXECUTE stmt_limit_offset_one USING @p;
+
+--disable_query_log
+let $hits_after_limit_offset_one= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_limit_offset_one= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for LIMIT OFFSET 1 real-hit candidate
+--let $assert_cond= $hits_after_limit_offset_one = $hits_after_limit_offset
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for LIMIT OFFSET 1 real-hit candidate
+--let $assert_cond= $prevalidations_after_limit_offset_one = $prevalidations_after_limit_offset
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_limit_offset_one;
+
+PREPARE stmt_limit_comma_offset FROM
+  'SELECT pad FROM pc_real_hit_pk WHERE id = ? LIMIT 1, 1';
+
+--echo # Comma OFFSET syntax remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_limit_comma_offset USING @p;
+SET @p=2;
+EXECUTE stmt_limit_comma_offset USING @p;
+
+--disable_query_log
+let $hits_after_limit_comma_offset= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_limit_comma_offset= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for LIMIT comma-offset real-hit candidate
+--let $assert_cond= $hits_after_limit_comma_offset = $hits_after_limit_offset_one
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for LIMIT comma-offset real-hit candidate
+--let $assert_cond= $prevalidations_after_limit_comma_offset = $prevalidations_after_limit_offset_one
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_limit_comma_offset;
+
+PREPARE stmt_limit_order FROM
+  'SELECT pad FROM pc_real_hit_pk WHERE id = ? ORDER BY pad LIMIT 1';
+
+--echo # ORDER BY LIMIT remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_limit_order USING @p;
+SET @p=2;
+EXECUTE stmt_limit_order USING @p;
+
+--disable_query_log
+let $hits_after_limit_order= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_limit_order= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for ORDER BY LIMIT real-hit candidate
+--let $assert_cond= $hits_after_limit_order = $hits_after_limit_comma_offset
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for ORDER BY LIMIT real-hit candidate
+--let $assert_cond= $prevalidations_after_limit_order = $prevalidations_after_limit_comma_offset
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_limit_order;
+
+PREPARE stmt_fetch_first FROM
+  'SELECT pad FROM pc_real_hit_pk WHERE id = ? FETCH FIRST ROW ONLY';
+
+--echo # FETCH FIRST syntax remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_fetch_first USING @p;
+SET @p=2;
+EXECUTE stmt_fetch_first USING @p;
+
+--disable_query_log
+let $hits_after_fetch_first= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_fetch_first= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for FETCH FIRST real-hit candidate
+--let $assert_cond= $hits_after_fetch_first = $hits_after_limit_order
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for FETCH FIRST real-hit candidate
+--let $assert_cond= $prevalidations_after_fetch_first = $prevalidations_after_limit_order
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_fetch_first;
+
+PREPARE stmt_fetch_next FROM
+  'SELECT pad FROM pc_real_hit_pk WHERE id = ? FETCH NEXT 1 ROW ONLY';
+
+--echo # FETCH NEXT syntax remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_fetch_next USING @p;
+SET @p=2;
+EXECUTE stmt_fetch_next USING @p;
+
+--disable_query_log
+let $hits_after_fetch_next= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_fetch_next= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for FETCH NEXT real-hit candidate
+--let $assert_cond= $hits_after_fetch_next = $hits_after_fetch_first
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for FETCH NEXT real-hit candidate
+--let $assert_cond= $prevalidations_after_fetch_next = $prevalidations_after_fetch_first
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_fetch_next;
+
+PREPARE stmt_fetch_with_ties FROM
+  'SELECT pad FROM pc_real_hit_pk WHERE id = ? ORDER BY pad FETCH FIRST ROW WITH TIES';
+
+--echo # FETCH WITH TIES syntax remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_fetch_with_ties USING @p;
+SET @p=2;
+EXECUTE stmt_fetch_with_ties USING @p;
+
+--disable_query_log
+let $hits_after_fetch_with_ties= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_fetch_with_ties= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for FETCH WITH TIES real-hit candidate
+--let $assert_cond= $hits_after_fetch_with_ties = $hits_after_fetch_next
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for FETCH WITH TIES real-hit candidate
+--let $assert_cond= $prevalidations_after_fetch_with_ties = $prevalidations_after_fetch_next
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_fetch_with_ties;
+
+PREPARE stmt_offset_rows FROM
+  'SELECT pad FROM pc_real_hit_pk WHERE id = ? OFFSET 0 ROWS';
+
+--echo # OFFSET-only syntax remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_offset_rows USING @p;
+SET @p=2;
+EXECUTE stmt_offset_rows USING @p;
+
+--disable_query_log
+let $hits_after_offset_rows= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_offset_rows= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for OFFSET-only real-hit candidate
+--let $assert_cond= $hits_after_offset_rows = $hits_after_fetch_with_ties
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for OFFSET-only real-hit candidate
+--let $assert_cond= $prevalidations_after_offset_rows = $prevalidations_after_fetch_with_ties
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_offset_rows;
+
+PREPARE stmt_offset_fetch FROM
+  'SELECT pad FROM pc_real_hit_pk WHERE id = ? OFFSET 0 ROWS FETCH FIRST ROW ONLY';
+
+--echo # OFFSET FETCH syntax remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_offset_fetch USING @p;
+SET @p=2;
+EXECUTE stmt_offset_fetch USING @p;
+
+--disable_query_log
+let $hits_after_offset_fetch= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_offset_fetch= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for OFFSET FETCH real-hit candidate
+--let $assert_cond= $hits_after_offset_fetch = $hits_after_offset_rows
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for OFFSET FETCH real-hit candidate
+--let $assert_cond= $prevalidations_after_offset_fetch = $prevalidations_after_offset_rows
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_offset_fetch;
+
+PREPARE stmt_limit_rows_examined FROM
+  'SELECT pad FROM pc_real_hit_pk WHERE id = ? LIMIT ROWS EXAMINED 1000';
+
+--echo # LIMIT ROWS EXAMINED remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_limit_rows_examined USING @p;
+SET @p=2;
+EXECUTE stmt_limit_rows_examined USING @p;
+
+--disable_query_log
+let $hits_after_limit_rows_examined= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_limit_rows_examined= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for LIMIT ROWS EXAMINED real-hit candidate
+--let $assert_cond= $hits_after_limit_rows_examined = $hits_after_offset_fetch
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for LIMIT ROWS EXAMINED real-hit candidate
+--let $assert_cond= $prevalidations_after_limit_rows_examined = $prevalidations_after_offset_fetch
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_limit_rows_examined;
+
+PREPARE stmt_limit_rows_examined_param FROM
+  'SELECT pad FROM pc_real_hit_pk WHERE id = ? LIMIT ROWS EXAMINED ?';
+
+--echo # Parameterized LIMIT ROWS EXAMINED remains fail-closed for real hits
+SET @p=1;
+SET @q=1000;
+EXECUTE stmt_limit_rows_examined_param USING @p, @q;
+SET @p=2;
+EXECUTE stmt_limit_rows_examined_param USING @p, @q;
+
+--disable_query_log
+let $hits_after_limit_rows_examined_param= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_limit_rows_examined_param= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for parameterized LIMIT ROWS EXAMINED real-hit candidate
+--let $assert_cond= $hits_after_limit_rows_examined_param = $hits_after_limit_rows_examined
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for parameterized LIMIT ROWS EXAMINED real-hit candidate
+--let $assert_cond= $prevalidations_after_limit_rows_examined_param = $prevalidations_after_limit_rows_examined
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_limit_rows_examined_param;
+
+PREPARE stmt_limit_one_rows_examined FROM
+  'SELECT pad FROM pc_real_hit_pk WHERE id = ? LIMIT 1 ROWS EXAMINED 1000';
+
+--echo # LIMIT 1 ROWS EXAMINED remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_limit_one_rows_examined USING @p;
+SET @p=2;
+EXECUTE stmt_limit_one_rows_examined USING @p;
+
+--disable_query_log
+let $hits_after_limit_one_rows_examined= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_limit_one_rows_examined= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for LIMIT 1 ROWS EXAMINED real-hit candidate
+--let $assert_cond= $hits_after_limit_one_rows_examined = $hits_after_limit_rows_examined_param
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for LIMIT 1 ROWS EXAMINED real-hit candidate
+--let $assert_cond= $prevalidations_after_limit_one_rows_examined = $prevalidations_after_limit_rows_examined_param
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_limit_one_rows_examined;
+
+PREPARE stmt_limit_comma_zero FROM
+  'SELECT pad FROM pc_real_hit_pk WHERE id = ? LIMIT 0, 1';
+
+--echo # Zero comma-offset syntax remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_limit_comma_zero USING @p;
+SET @p=2;
+EXECUTE stmt_limit_comma_zero USING @p;
+
+--disable_query_log
+let $hits_after_limit_comma_zero= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_limit_comma_zero= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for LIMIT zero comma-offset real-hit candidate
+--let $assert_cond= $hits_after_limit_comma_zero = $hits_after_limit_one_rows_examined
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for LIMIT zero comma-offset real-hit candidate
+--let $assert_cond= $prevalidations_after_limit_comma_zero = $prevalidations_after_limit_one_rows_examined
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_limit_comma_zero;
+
+PREPARE stmt_having FROM
+  'SELECT pad FROM pc_real_hit_pk WHERE id = ? HAVING pad IS NOT NULL';
+
+--echo # HAVING remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_having USING @p;
+SET @p=2;
+EXECUTE stmt_having USING @p;
+
+--disable_query_log
+let $hits_after_having= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_having= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow for HAVING real-hit candidate
+--let $assert_cond= $hits_after_having = $hits_after_limit_comma_zero
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for HAVING real-hit candidate
+--let $assert_cond= $prevalidations_after_having = $prevalidations_after_limit_comma_zero
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_having;
+
+SET @save_character_set_client= @@session.character_set_client;
+SET @save_character_set_connection= @@session.character_set_connection;
+SET @save_character_set_results= @@session.character_set_results;
+
+SET NAMES latin1;
+PREPARE stmt_charset FROM
+  'SELECT pad FROM pc_real_hit_char WHERE c = ?';
+
+--echo # Charset change invalidates an otherwise eligible string unique lookup
+SET @p='a';
+EXECUTE stmt_charset USING @p;
+SET NAMES utf8;
+SET @p='b';
+EXECUTE stmt_charset USING @p;
+
+--disable_query_log
+let $hits_after_charset= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_charset= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits does not grow across charset invalidation
+--let $assert_cond= $hits_after_charset = $hits_after_having
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow across charset invalidation
+--let $assert_cond= $prevalidations_after_charset = $prevalidations_after_having
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_charset;
+SET @@session.character_set_client= @save_character_set_client;
+SET @@session.character_set_connection= @save_character_set_connection;
+SET @@session.character_set_results= @save_character_set_results;
+
+--disable_query_log
+let $count_after_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after real-hit deallocates
+--let $assert_cond= $count_after_deallocate = $count_before
+--source include/assert.inc
+--enable_query_log
+
+SET @@session.session_plan_cache_allow_change_ratio = @save_ratio;
+SET @@session.session_plan_cache = DEFAULT;
+
+DROP TABLE pc_real_hit_pk;
+DROP TABLE pc_real_hit_nullable;
+DROP TABLE pc_real_hit_nonunique;
+DROP TABLE pc_real_hit_multi;
+DROP TABLE pc_real_hit_char;

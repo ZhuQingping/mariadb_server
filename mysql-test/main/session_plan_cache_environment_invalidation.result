@@ -1,0 +1,117 @@
+CREATE TABLE pc_env (
+id INT PRIMARY KEY,
+c VARCHAR(20),
+KEY(c)
+) ENGINE=MyISAM;
+INSERT INTO pc_env VALUES (1,'a'),(2,'b'),(3,'c');
+SET @save_optimizer_switch= @@session.optimizer_switch;
+SET @save_character_set_client= @@session.character_set_client;
+SET @save_character_set_connection= @@session.character_set_connection;
+SET @save_character_set_results= @@session.character_set_results;
+SET @@session.session_plan_cache = ON;
+# optimizer_switch change invalidates existing state without recipe-less replacement
+PREPARE stmt FROM 'SELECT id, c FROM pc_env WHERE id = ?';
+SET @p=1;
+EXECUTE stmt USING @p;
+id	c
+1	a
+SET @@session.optimizer_switch='index_condition_pushdown=off';
+SET @p=2;
+EXECUTE stmt USING @p;
+id	c
+2	b
+include/assert.inc [Cached_plan_count returns to baseline after optimizer_switch change]
+include/assert.inc [Cached_plan_hits remains unchanged after optimizer_switch invalidation]
+include/assert.inc [Cached_plan_invalidations grows after optimizer_switch change]
+DEALLOCATE PREPARE stmt;
+SET @@session.optimizer_switch= @save_optimizer_switch;
+include/assert.inc [Cached_plan_count returns to baseline after optimizer test deallocate]
+# character_set_client change invalidates existing state without recipe-less replacement
+SET NAMES latin1;
+PREPARE stmt FROM 'SELECT id, c FROM pc_env WHERE c = ?';
+SET @p='a';
+EXECUTE stmt USING @p;
+id	c
+1	a
+SET NAMES utf8;
+SET @p='b';
+EXECUTE stmt USING @p;
+id	c
+2	b
+include/assert.inc [Cached_plan_count returns to baseline after character_set_client change]
+include/assert.inc [Cached_plan_hits remains unchanged after character_set_client invalidation]
+include/assert.inc [Cached_plan_invalidations grows after character_set_client change]
+DEALLOCATE PREPARE stmt;
+SET @@session.character_set_client= @save_character_set_client;
+SET @@session.character_set_connection= @save_character_set_connection;
+SET @@session.character_set_results= @save_character_set_results;
+include/assert.inc [Cached_plan_count returns to baseline after charset test deallocate]
+# sharp table row-count change invalidates only when ratio is positive
+SET @@session.session_plan_cache_allow_change_ratio = 0.2;
+PREPARE stmt FROM 'SELECT id, c FROM pc_env WHERE id = ?';
+SET @p=1;
+EXECUTE stmt USING @p;
+id	c
+1	a
+INSERT INTO pc_env VALUES (4,'d'),(5,'e'),(6,'f'),(7,'g');
+SET @p=2;
+EXECUTE stmt USING @p;
+id	c
+2	b
+include/assert.inc [Cached_plan_count returns to baseline after row-count invalidation]
+include/assert.inc [Cached_plan_hits remains unchanged after row-count invalidation]
+include/assert.inc [Cached_plan_invalidations grows after sharp row-count change]
+DEALLOCATE PREPARE stmt;
+# ratio 0 disables row-count invalidation
+SET @@session.session_plan_cache_allow_change_ratio = 0;
+PREPARE stmt FROM 'SELECT id, c FROM pc_env WHERE id = ?';
+SET @p=1;
+EXECUTE stmt USING @p;
+id	c
+1	a
+INSERT INTO pc_env VALUES (8,'h'),(9,'i'),(10,'j'),(11,'k'),(12,'l'),(13,'m');
+SET @p=3;
+EXECUTE stmt USING @p;
+id	c
+3	c
+include/assert.inc [Cached_plan_count keeps one state when ratio zero ignores row-count change]
+include/assert.inc [Cached_plan_hits grows when ratio zero allows stable real hit]
+include/assert.inc [Cached_plan_invalidations does not grow when ratio zero ignores row-count change]
+DEALLOCATE PREPARE stmt;
+# disabling plan cache destroys state without counting an invalidation
+SET @@session.session_plan_cache_allow_change_ratio = DEFAULT;
+PREPARE stmt FROM 'SELECT id, c FROM pc_env WHERE id = ?';
+SET @p=1;
+EXECUTE stmt USING @p;
+id	c
+1	a
+SET @@session.session_plan_cache = OFF;
+SET @p=2;
+EXECUTE stmt USING @p;
+id	c
+2	b
+include/assert.inc [Cached_plan_count returns to baseline when plan cache is disabled]
+include/assert.inc [Cached_plan_hits remains unchanged when plan cache is disabled]
+include/assert.inc [Cached_plan_invalidations does not grow when plan cache is disabled]
+DEALLOCATE PREPARE stmt;
+# disabling plan cache before metadata reprepare also avoids invalidation count
+SET @@session.session_plan_cache = ON;
+PREPARE stmt FROM 'SELECT id, c FROM pc_env WHERE id = ?';
+SET @p=1;
+EXECUTE stmt USING @p;
+id	c
+1	a
+SET @@session.session_plan_cache = OFF;
+ALTER TABLE pc_env ADD COLUMN extra INT DEFAULT 0;
+SET @p=2;
+EXECUTE stmt USING @p;
+id	c
+2	b
+include/assert.inc [Cached_plan_count returns to baseline when disabled before reprepare]
+include/assert.inc [Cached_plan_hits remains unchanged when disabled before reprepare]
+include/assert.inc [Cached_plan_invalidations does not grow when disabled before reprepare]
+DEALLOCATE PREPARE stmt;
+include/assert.inc [Cached_plan_count returns to baseline after final deallocate]
+SET @@session.session_plan_cache_allow_change_ratio = DEFAULT;
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_env;

@@ -1,0 +1,25 @@
+CREATE TABLE pc_ref_profile (
+id INT NOT NULL,
+c CHAR(10) NOT NULL,
+KEY id_key(id)
+) ENGINE=InnoDB;
+INSERT INTO pc_ref_profile VALUES
+(1, 'a'), (1, 'b'), (2, 'c'), (3, 'd');
+SET @@session.session_plan_cache = ON;
+SET @save_ratio=@@session.session_plan_cache_allow_change_ratio;
+SET @save_profile=@@session.session_plan_cache_profile;
+SET @@session.session_plan_cache_allow_change_ratio = 0;
+SET @@session.session_plan_cache_profile = ON;
+PREPARE stmt FROM 'SELECT c FROM pc_ref_profile WHERE id = ?';
+# First execution creates the state; later executions are profiled ref hits
+SET @id=1;
+include/assert.inc [profiled ref lookup records repeated cache hits]
+include/assert.inc [profiled ref lookup increments ref hit counter]
+include/assert.inc [profiled ref lookup records aggregate build time]
+include/assert.inc [profiled ref lookup records allocation time]
+include/assert.inc [profiled ref lookup records setup time]
+DEALLOCATE PREPARE stmt;
+SET @@session.session_plan_cache_profile = @save_profile;
+SET @@session.session_plan_cache_allow_change_ratio = @save_ratio;
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_ref_profile;

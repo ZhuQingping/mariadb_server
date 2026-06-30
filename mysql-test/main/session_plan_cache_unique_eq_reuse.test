@@ -1,0 +1,302 @@
+--source include/have_innodb.inc
+
+CREATE TABLE pc_reuse_pk (
+  id INT NOT NULL PRIMARY KEY,
+  pad CHAR(10)
+) ENGINE=InnoDB;
+INSERT INTO pc_reuse_pk VALUES (1, 'a'), (2, 'b');
+
+CREATE TABLE pc_reuse_nullable (
+  id INT,
+  pad CHAR(10),
+  UNIQUE KEY id_uq(id)
+) ENGINE=InnoDB;
+INSERT INTO pc_reuse_nullable VALUES (1, 'a'), (NULL, 'n');
+
+CREATE TABLE pc_reuse_nonunique (
+  id INT NOT NULL,
+  pad CHAR(10),
+  KEY id_key(id)
+) ENGINE=InnoDB;
+INSERT INTO pc_reuse_nonunique VALUES (1, 'a'), (2, 'b');
+
+CREATE TABLE pc_reuse_multi (
+  tenant_id INT NOT NULL,
+  id INT NOT NULL,
+  pad CHAR(10),
+  UNIQUE KEY tenant_id_uq(tenant_id, id)
+) ENGINE=InnoDB;
+INSERT INTO pc_reuse_multi VALUES (10, 1, 'a'), (10, 2, 'b');
+
+SET @@session.session_plan_cache = ON;
+SET @save_ratio=@@session.session_plan_cache_allow_change_ratio;
+SET @@session.session_plan_cache_allow_change_ratio = 0;
+
+--disable_query_log
+let $count_before= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+--enable_query_log
+
+PREPARE stmt FROM 'SELECT pad FROM pc_reuse_pk WHERE id = ?';
+
+--echo # First execute creates state; later eligible executes hit
+SET @p=1;
+EXECUTE stmt USING @p;
+SET @p=2;
+EXECUTE stmt USING @p;
+SET @p=42;
+EXECUTE stmt USING @p;
+
+--disable_query_log
+let $count_after_pk= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_pk= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_pk= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count keeps one state for future unique equality reuse
+--let $assert_cond= $count_after_pk = $count_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations grows for repeated future reuse candidates
+--let $assert_cond= $prevalidations_after_pk = $prevalidations_before + 2
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits grows for repeated unique equality reuse candidates
+--let $assert_cond= $hits_after_pk = $hits_before + 2
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt;
+
+--disable_query_log
+let $count_after_pk_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after future reuse candidate deallocate
+--let $assert_cond= $count_after_pk_deallocate = $count_before
+--source include/assert.inc
+--enable_query_log
+
+PREPARE stmt_reverse FROM 'SELECT pad FROM pc_reuse_pk WHERE ? = id';
+
+--echo # Reversed equality is also a reuse candidate
+SET @p=1;
+EXECUTE stmt_reverse USING @p;
+SET @p=2;
+EXECUTE stmt_reverse USING @p;
+
+--disable_query_log
+let $hits_after_reverse= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_reverse= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_prevalidations grows for reversed future reuse candidate
+--let $assert_cond= $prevalidations_after_reverse = $prevalidations_after_pk + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits grows for reversed reuse candidate
+--let $assert_cond= $hits_after_reverse = $hits_after_pk + 1
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_reverse;
+
+PREPARE stmt_null FROM 'SELECT pad FROM pc_reuse_pk WHERE id = ?';
+
+--echo # NULL parameter remains fail-closed and must not count as a hit
+SET @p=1;
+EXECUTE stmt_null USING @p;
+SET @p=NULL;
+EXECUTE stmt_null USING @p;
+
+--disable_query_log
+let $hits_after_null= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_null= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_prevalidations does not grow for NULL future reuse candidate
+--let $assert_cond= $prevalidations_after_null = $prevalidations_after_reverse
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits remains unchanged for NULL future reuse candidate
+--let $assert_cond= $hits_after_null = $hits_after_reverse
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_null;
+
+PREPARE stmt_nullable FROM 'SELECT pad FROM pc_reuse_nullable WHERE id = ?';
+
+--echo # Nullable unique key remains fail-closed for future reuse
+SET @p=1;
+EXECUTE stmt_nullable USING @p;
+SET @p=1;
+EXECUTE stmt_nullable USING @p;
+
+--disable_query_log
+let $hits_after_nullable= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_nullable= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_prevalidations does not grow for nullable future reuse candidate
+--let $assert_cond= $prevalidations_after_nullable = $prevalidations_after_null
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits remains unchanged for nullable future reuse candidate
+--let $assert_cond= $hits_after_nullable = $hits_after_null
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_nullable;
+
+PREPARE stmt_nonunique FROM 'SELECT pad FROM pc_reuse_nonunique WHERE id = ?';
+
+--echo # Non-unique key is now reusable through the ref equality recipe
+SET @p=1;
+EXECUTE stmt_nonunique USING @p;
+SET @p=2;
+EXECUTE stmt_nonunique USING @p;
+
+--disable_query_log
+let $hits_after_nonunique= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_nonunique= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_prevalidations grows for non-unique ref reuse candidate
+--let $assert_cond= $prevalidations_after_nonunique = $prevalidations_after_nullable + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits grows for non-unique ref reuse candidate
+--let $assert_cond= $hits_after_nonunique = $hits_after_nullable + 1
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_nonunique;
+
+PREPARE stmt_multi FROM 'SELECT pad FROM pc_reuse_multi WHERE id = ?';
+
+--echo # Multi-part unique key remains fail-closed for future reuse
+SET @p=1;
+EXECUTE stmt_multi USING @p;
+SET @p=2;
+EXECUTE stmt_multi USING @p;
+
+--disable_query_log
+let $hits_after_multi= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_multi= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_prevalidations does not grow for multi-part future reuse candidate
+--let $assert_cond= $prevalidations_after_multi = $prevalidations_after_nonunique
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits remains unchanged for multi-part future reuse candidate
+--let $assert_cond= $hits_after_multi = $hits_after_nonunique
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_multi;
+
+PREPARE stmt_multi_full FROM
+  'SELECT pad FROM pc_reuse_multi WHERE tenant_id = ? AND id = ?';
+
+--echo # Full multi-part unique equality remains fail-closed for future reuse
+SET @p=10;
+SET @q=1;
+EXECUTE stmt_multi_full USING @p, @q;
+SET @p=10;
+SET @q=2;
+EXECUTE stmt_multi_full USING @p, @q;
+
+--disable_query_log
+let $hits_after_multi_full= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_multi_full= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_prevalidations does not grow for full multi-part future reuse candidate
+--let $assert_cond= $prevalidations_after_multi_full = $prevalidations_after_multi
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits remains unchanged for full multi-part future reuse candidate
+--let $assert_cond= $hits_after_multi_full = $hits_after_multi
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_multi_full;
+
+PREPARE stmt_range FROM 'SELECT pad FROM pc_reuse_pk WHERE id > ?';
+
+--echo # Range predicate remains fail-closed for future reuse
+SET @p=0;
+EXECUTE stmt_range USING @p;
+SET @p=1;
+EXECUTE stmt_range USING @p;
+
+--disable_query_log
+let $hits_after_range= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_range= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_prevalidations does not grow for range future reuse candidate
+--let $assert_cond= $prevalidations_after_range = $prevalidations_after_multi_full
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits remains unchanged for range future reuse candidate
+--let $assert_cond= $hits_after_range = $hits_after_multi_full
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_range;
+
+PREPARE stmt_and FROM 'SELECT pad FROM pc_reuse_pk WHERE id = ? AND pad = ?';
+
+--echo # AND predicate remains fail-closed for future reuse
+SET @p=1;
+SET @q='a';
+EXECUTE stmt_and USING @p, @q;
+SET @p=2;
+SET @q='b';
+EXECUTE stmt_and USING @p, @q;
+
+--disable_query_log
+let $hits_after_and= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_and= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_prevalidations does not grow for AND future reuse candidate
+--let $assert_cond= $prevalidations_after_and = $prevalidations_after_range
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits remains unchanged for AND future reuse candidate
+--let $assert_cond= $hits_after_and = $hits_after_range
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_and;
+
+PREPARE stmt_order FROM 'SELECT pad FROM pc_reuse_pk WHERE id = ? ORDER BY pad';
+
+--echo # ORDER BY remains outside the future unique equality reuse scope
+SET @p=1;
+EXECUTE stmt_order USING @p;
+SET @p=2;
+EXECUTE stmt_order USING @p;
+
+--disable_query_log
+let $hits_after_order= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_order= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_prevalidations does not grow for ORDER BY future reuse candidate
+--let $assert_cond= $prevalidations_after_order = $prevalidations_after_and
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits remains unchanged for ORDER BY future reuse candidate
+--let $assert_cond= $hits_after_order = $hits_after_and
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_order;
+
+--disable_query_log
+let $count_after_all_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after all future reuse candidates
+--let $assert_cond= $count_after_all_deallocate = $count_before
+--source include/assert.inc
+--enable_query_log
+
+SET @@session.session_plan_cache_allow_change_ratio = @save_ratio;
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_reuse_pk, pc_reuse_nullable, pc_reuse_nonunique,
+           pc_reuse_multi;

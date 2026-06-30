@@ -1406,6 +1406,16 @@ The following specify which files/extra groups are read (specified before remain
  timestamp
  --server-id=#       Uniquely identifies the server instance in the community
  of replication partners
+ --session-plan-cache 
+ Enable session-level prepared statement plan cache. This
+ feature is disabled by default
+ --session-plan-cache-allow-change-ratio=# 
+ Invalidate cached plans when table row count changes by
+ this ratio. The default is 0
+ --session-plan-cache-profile 
+ Collect lightweight session plan cache hit-path profiling
+ counters. This is disabled by default and intended for
+ diagnostics
  --session-track-schema 
  Track changes to the default schema
  (Defaults to on; use --skip-session-track-schema to disable.)
@@ -2100,6 +2110,9 @@ safe-user-create FALSE
 secure-file-priv (No default value)
 secure-timestamp NO
 server-id 1
+session-plan-cache FALSE
+session-plan-cache-allow-change-ratio 0
+session-plan-cache-profile FALSE
 session-track-schema TRUE
 session-track-state-change FALSE
 session-track-system-variables autocommit,character_set_client,character_set_connection,character_set_results,redirect_url,time_zone

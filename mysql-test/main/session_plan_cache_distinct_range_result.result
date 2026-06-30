@@ -1,0 +1,57 @@
+CREATE TABLE pc_distinct_range_result (
+id INT NOT NULL PRIMARY KEY,
+c CHAR(10) NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO pc_distinct_range_result VALUES
+(1, 'c3'), (2, 'c1'), (3, 'c2'),
+(4, 'c1'), (5, 'c4'), (6, 'c2');
+SET @@session.session_plan_cache = ON;
+SET @save_ratio=@@session.session_plan_cache_allow_change_ratio;
+SET @@session.session_plan_cache_allow_change_ratio = 0;
+PREPARE stmt FROM
+'SELECT DISTINCT c FROM pc_distinct_range_result WHERE id BETWEEN ? AND ? ORDER BY c';
+# First execution creates the cached exact DISTINCT range state
+SET @lo=1;
+SET @hi=4;
+EXECUTE stmt USING @lo, @hi;
+c
+c1
+c2
+c3
+# Different bounds preserve DISTINCT and ORDER BY on a cache hit
+SET @lo=2;
+SET @hi=6;
+EXECUTE stmt USING @lo, @hi;
+c
+c1
+c2
+c4
+# A wider range also preserves DISTINCT and ORDER BY on a cache hit
+SET @lo=1;
+SET @hi=6;
+EXECUTE stmt USING @lo, @hi;
+c
+c1
+c2
+c3
+c4
+# Empty ranges remain empty on a cache hit
+SET @lo=7;
+SET @hi=8;
+EXECUTE stmt USING @lo, @hi;
+c
+# Single-row ranges remain correct on a cache hit
+SET @lo=4;
+SET @hi=4;
+EXECUTE stmt USING @lo, @hi;
+c
+c1
+include/assert.inc [exact DISTINCT range creates one cached state]
+include/assert.inc [exact DISTINCT range repeated executions are hits]
+include/assert.inc [exact DISTINCT range has prevalidations before hits]
+include/assert.inc [exact DISTINCT range does not invalidate during stable execution]
+DEALLOCATE PREPARE stmt;
+include/assert.inc [exact DISTINCT range releases cached state on deallocate]
+SET @@session.session_plan_cache_allow_change_ratio = @save_ratio;
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_distinct_range_result;

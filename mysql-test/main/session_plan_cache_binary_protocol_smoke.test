@@ -1,0 +1,106 @@
+--source include/have_innodb.inc
+
+CREATE TABLE pc_binary_smoke (
+  id INT NOT NULL PRIMARY KEY,
+  pad CHAR(10)
+) ENGINE=InnoDB;
+INSERT INTO pc_binary_smoke VALUES (1, 'a'), (2, 'b');
+
+--disable_query_log
+let $count_before= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+--enable_query_log
+
+PREPARE stmt_disabled FROM 'SELECT pad FROM pc_binary_smoke WHERE id = ?';
+
+--echo # Default-off execution should not create plan-cache state
+SET @p=1;
+EXECUTE stmt_disabled USING @p;
+SET @p=2;
+EXECUTE stmt_disabled USING @p;
+
+--disable_query_log
+let $count_after_disabled= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_disabled= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_disabled= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count does not grow while plan cache is disabled
+--let $assert_cond= $count_after_disabled = $count_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits does not grow while plan cache is disabled
+--let $assert_cond= $hits_after_disabled = $hits_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow while plan cache is disabled
+--let $assert_cond= $prevalidations_after_disabled = $prevalidations_before
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_disabled;
+
+SET @@session.session_plan_cache = ON;
+SET @save_ratio=@@session.session_plan_cache_allow_change_ratio;
+SET @@session.session_plan_cache_allow_change_ratio = 0;
+
+PREPARE stmt_hit FROM 'SELECT pad FROM pc_binary_smoke WHERE id = ?';
+
+--echo # First enabled execute creates state; later executes use the real-hit path
+SET @p=1;
+EXECUTE stmt_hit USING @p;
+
+--disable_query_log
+let $count_after_first_hit= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_first_hit= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_first_hit= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count grows after first binary-protocol smoke execute
+--let $assert_cond= $count_after_first_hit = $count_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits does not grow on first binary-protocol smoke execute
+--let $assert_cond= $hits_after_first_hit = $hits_after_disabled
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow on first binary-protocol smoke execute
+--let $assert_cond= $prevalidations_after_first_hit = $prevalidations_after_disabled
+--source include/assert.inc
+--enable_query_log
+
+SET @p=2;
+EXECUTE stmt_hit USING @p;
+SET @p=42;
+EXECUTE stmt_hit USING @p;
+
+--disable_query_log
+let $count_after_hit= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_hit= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_hit= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count keeps one binary-protocol smoke state
+--let $assert_cond= $count_after_hit = $count_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations grows for binary-protocol smoke hits
+--let $assert_cond= $prevalidations_after_hit = $prevalidations_after_first_hit + 2
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits grows for binary-protocol smoke hits
+--let $assert_cond= $hits_after_hit = $hits_after_first_hit + 2
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_hit;
+
+--disable_query_log
+let $count_after_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after binary-protocol smoke deallocate
+--let $assert_cond= $count_after_deallocate = $count_before
+--source include/assert.inc
+--enable_query_log
+
+SET @@session.session_plan_cache_allow_change_ratio = @save_ratio;
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_binary_smoke;

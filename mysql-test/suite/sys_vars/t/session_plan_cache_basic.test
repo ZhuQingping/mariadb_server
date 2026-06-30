@@ -1,0 +1,19 @@
+--echo # session_plan_cache defaults to OFF in MariaDB MVP
+SELECT @@session.session_plan_cache;
+SET @@session.session_plan_cache = ON;
+SELECT @@session.session_plan_cache;
+SET @@session.session_plan_cache = OFF;
+SELECT @@session.session_plan_cache;
+SET @@session.session_plan_cache = DEFAULT;
+SELECT @@session.session_plan_cache;
+SET @@global.session_plan_cache = ON;
+SELECT @@global.session_plan_cache;
+SELECT @@session.session_plan_cache;
+SET @@global.session_plan_cache = DEFAULT;
+SELECT @@global.session_plan_cache;
+--error ER_WRONG_VALUE_FOR_VAR
+SET @@session.session_plan_cache = 2;
+--error ER_WRONG_VALUE_FOR_VAR
+SET @@session.session_plan_cache = 'invalid';
+--error ER_WRONG_VALUE_FOR_VAR
+SET @@global.session_plan_cache = 2;

@@ -1,0 +1,75 @@
+CREATE TABLE pc_state (
+id INT PRIMARY KEY,
+v INT
+) ENGINE=InnoDB;
+INSERT INTO pc_state VALUES (1,10),(2,20);
+SET @@session.session_plan_cache = ON;
+# First eligible execute creates one cached-plan state
+PREPARE stmt FROM 'SELECT id, v FROM pc_state WHERE id = ?';
+SET @p=1;
+EXECUTE stmt USING @p;
+id	v
+1	10
+include/assert.inc [Cached_plan_count grows after first eligible execute]
+include/assert.inc [Cached_plan_hits remains unchanged before a reusable state exists]
+include/assert.inc [Cached_plan_invalidations remains unchanged before reprepare]
+# Re-executing same statement keeps one state and uses a real hit
+SET @p=2;
+EXECUTE stmt USING @p;
+id	v
+2	20
+include/assert.inc [Cached_plan_count stays at one state for the same prepared statement]
+include/assert.inc [Cached_plan_hits grows after second execute]
+# Deallocate destroys the state
+DEALLOCATE PREPARE stmt;
+include/assert.inc [Cached_plan_count returns to baseline after deallocate]
+include/assert.inc [Cached_plan_invalidations remains unchanged after deallocate]
+# Metadata reprepare invalidates the old state and creates a replacement
+PREPARE stmt FROM 'SELECT id, v FROM pc_state WHERE id = ?';
+SET @p=1;
+EXECUTE stmt USING @p;
+id	v
+1	10
+ALTER TABLE pc_state ADD COLUMN extra INT DEFAULT 0;
+SET @p=2;
+EXECUTE stmt USING @p;
+id	v
+2	20
+include/assert.inc [Cached_plan_count has one replacement state after reprepare]
+include/assert.inc [Cached_plan_hits does not grow while replacing state after reprepare]
+include/assert.inc [Cached_plan_invalidations grows once after metadata reprepare]
+DEALLOCATE PREPARE stmt;
+include/assert.inc [Cached_plan_count returns to baseline after final deallocate]
+# Same-name PREPARE replacement destroys the old state without invalidation
+PREPARE stmt FROM 'SELECT id, v FROM pc_state WHERE id = ?';
+SET @p=1;
+EXECUTE stmt USING @p;
+id	v
+1	10
+include/assert.inc [Cached_plan_count has one state before same-name PREPARE replacement]
+PREPARE stmt FROM 'SELECT v FROM pc_state WHERE id = ?';
+include/assert.inc [Cached_plan_count returns to baseline after same-name PREPARE replacement]
+include/assert.inc [Cached_plan_invalidations does not grow after same-name PREPARE replacement]
+SET @p=2;
+EXECUTE stmt USING @p;
+v
+20
+include/assert.inc [Cached_plan_count grows after replacement statement execute]
+include/assert.inc [Cached_plan_invalidations remains unchanged after replacement statement execute]
+DEALLOCATE PREPARE stmt;
+include/assert.inc [Cached_plan_count returns to baseline after replacement deallocate]
+# Failed same-name PREPARE replacement also removes the old state
+PREPARE stmt FROM 'SELECT id, v FROM pc_state WHERE id = ?';
+SET @p=1;
+EXECUTE stmt USING @p;
+id	v
+1	10
+include/assert.inc [Cached_plan_count has one state before failed same-name PREPARE replacement]
+PREPARE stmt FROM 'SELECT FROM';
+ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MariaDB server version for the right syntax to use near 'FROM' at line 1
+include/assert.inc [Cached_plan_count returns to baseline after failed same-name PREPARE replacement]
+include/assert.inc [Cached_plan_invalidations does not grow after failed same-name PREPARE replacement]
+EXECUTE stmt USING @p;
+ERROR HY000: Unknown prepared statement handler (stmt) given to EXECUTE
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_state;

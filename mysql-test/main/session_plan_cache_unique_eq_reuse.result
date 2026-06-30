@@ -1,0 +1,172 @@
+CREATE TABLE pc_reuse_pk (
+id INT NOT NULL PRIMARY KEY,
+pad CHAR(10)
+) ENGINE=InnoDB;
+INSERT INTO pc_reuse_pk VALUES (1, 'a'), (2, 'b');
+CREATE TABLE pc_reuse_nullable (
+id INT,
+pad CHAR(10),
+UNIQUE KEY id_uq(id)
+) ENGINE=InnoDB;
+INSERT INTO pc_reuse_nullable VALUES (1, 'a'), (NULL, 'n');
+CREATE TABLE pc_reuse_nonunique (
+id INT NOT NULL,
+pad CHAR(10),
+KEY id_key(id)
+) ENGINE=InnoDB;
+INSERT INTO pc_reuse_nonunique VALUES (1, 'a'), (2, 'b');
+CREATE TABLE pc_reuse_multi (
+tenant_id INT NOT NULL,
+id INT NOT NULL,
+pad CHAR(10),
+UNIQUE KEY tenant_id_uq(tenant_id, id)
+) ENGINE=InnoDB;
+INSERT INTO pc_reuse_multi VALUES (10, 1, 'a'), (10, 2, 'b');
+SET @@session.session_plan_cache = ON;
+SET @save_ratio=@@session.session_plan_cache_allow_change_ratio;
+SET @@session.session_plan_cache_allow_change_ratio = 0;
+PREPARE stmt FROM 'SELECT pad FROM pc_reuse_pk WHERE id = ?';
+# First execute creates state; later eligible executes hit
+SET @p=1;
+EXECUTE stmt USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt USING @p;
+pad
+b
+SET @p=42;
+EXECUTE stmt USING @p;
+pad
+include/assert.inc [Cached_plan_count keeps one state for future unique equality reuse]
+include/assert.inc [Cached_plan_prevalidations grows for repeated future reuse candidates]
+include/assert.inc [Cached_plan_hits grows for repeated unique equality reuse candidates]
+DEALLOCATE PREPARE stmt;
+include/assert.inc [Cached_plan_count returns to baseline after future reuse candidate deallocate]
+PREPARE stmt_reverse FROM 'SELECT pad FROM pc_reuse_pk WHERE ? = id';
+# Reversed equality is also a reuse candidate
+SET @p=1;
+EXECUTE stmt_reverse USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_reverse USING @p;
+pad
+b
+include/assert.inc [Cached_plan_prevalidations grows for reversed future reuse candidate]
+include/assert.inc [Cached_plan_hits grows for reversed reuse candidate]
+DEALLOCATE PREPARE stmt_reverse;
+PREPARE stmt_null FROM 'SELECT pad FROM pc_reuse_pk WHERE id = ?';
+# NULL parameter remains fail-closed and must not count as a hit
+SET @p=1;
+EXECUTE stmt_null USING @p;
+pad
+a
+SET @p=NULL;
+EXECUTE stmt_null USING @p;
+pad
+include/assert.inc [Cached_plan_prevalidations does not grow for NULL future reuse candidate]
+include/assert.inc [Cached_plan_hits remains unchanged for NULL future reuse candidate]
+DEALLOCATE PREPARE stmt_null;
+PREPARE stmt_nullable FROM 'SELECT pad FROM pc_reuse_nullable WHERE id = ?';
+# Nullable unique key remains fail-closed for future reuse
+SET @p=1;
+EXECUTE stmt_nullable USING @p;
+pad
+a
+SET @p=1;
+EXECUTE stmt_nullable USING @p;
+pad
+a
+include/assert.inc [Cached_plan_prevalidations does not grow for nullable future reuse candidate]
+include/assert.inc [Cached_plan_hits remains unchanged for nullable future reuse candidate]
+DEALLOCATE PREPARE stmt_nullable;
+PREPARE stmt_nonunique FROM 'SELECT pad FROM pc_reuse_nonunique WHERE id = ?';
+# Non-unique key is now reusable through the ref equality recipe
+SET @p=1;
+EXECUTE stmt_nonunique USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_nonunique USING @p;
+pad
+b
+include/assert.inc [Cached_plan_prevalidations grows for non-unique ref reuse candidate]
+include/assert.inc [Cached_plan_hits grows for non-unique ref reuse candidate]
+DEALLOCATE PREPARE stmt_nonunique;
+PREPARE stmt_multi FROM 'SELECT pad FROM pc_reuse_multi WHERE id = ?';
+# Multi-part unique key remains fail-closed for future reuse
+SET @p=1;
+EXECUTE stmt_multi USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_multi USING @p;
+pad
+b
+include/assert.inc [Cached_plan_prevalidations does not grow for multi-part future reuse candidate]
+include/assert.inc [Cached_plan_hits remains unchanged for multi-part future reuse candidate]
+DEALLOCATE PREPARE stmt_multi;
+PREPARE stmt_multi_full FROM
+'SELECT pad FROM pc_reuse_multi WHERE tenant_id = ? AND id = ?';
+# Full multi-part unique equality remains fail-closed for future reuse
+SET @p=10;
+SET @q=1;
+EXECUTE stmt_multi_full USING @p, @q;
+pad
+a
+SET @p=10;
+SET @q=2;
+EXECUTE stmt_multi_full USING @p, @q;
+pad
+b
+include/assert.inc [Cached_plan_prevalidations does not grow for full multi-part future reuse candidate]
+include/assert.inc [Cached_plan_hits remains unchanged for full multi-part future reuse candidate]
+DEALLOCATE PREPARE stmt_multi_full;
+PREPARE stmt_range FROM 'SELECT pad FROM pc_reuse_pk WHERE id > ?';
+# Range predicate remains fail-closed for future reuse
+SET @p=0;
+EXECUTE stmt_range USING @p;
+pad
+a
+b
+SET @p=1;
+EXECUTE stmt_range USING @p;
+pad
+b
+include/assert.inc [Cached_plan_prevalidations does not grow for range future reuse candidate]
+include/assert.inc [Cached_plan_hits remains unchanged for range future reuse candidate]
+DEALLOCATE PREPARE stmt_range;
+PREPARE stmt_and FROM 'SELECT pad FROM pc_reuse_pk WHERE id = ? AND pad = ?';
+# AND predicate remains fail-closed for future reuse
+SET @p=1;
+SET @q='a';
+EXECUTE stmt_and USING @p, @q;
+pad
+a
+SET @p=2;
+SET @q='b';
+EXECUTE stmt_and USING @p, @q;
+pad
+b
+include/assert.inc [Cached_plan_prevalidations does not grow for AND future reuse candidate]
+include/assert.inc [Cached_plan_hits remains unchanged for AND future reuse candidate]
+DEALLOCATE PREPARE stmt_and;
+PREPARE stmt_order FROM 'SELECT pad FROM pc_reuse_pk WHERE id = ? ORDER BY pad';
+# ORDER BY remains outside the future unique equality reuse scope
+SET @p=1;
+EXECUTE stmt_order USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_order USING @p;
+pad
+b
+include/assert.inc [Cached_plan_prevalidations does not grow for ORDER BY future reuse candidate]
+include/assert.inc [Cached_plan_hits remains unchanged for ORDER BY future reuse candidate]
+DEALLOCATE PREPARE stmt_order;
+include/assert.inc [Cached_plan_count returns to baseline after all future reuse candidates]
+SET @@session.session_plan_cache_allow_change_ratio = @save_ratio;
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_reuse_pk, pc_reuse_nullable, pc_reuse_nonunique,
+pc_reuse_multi;

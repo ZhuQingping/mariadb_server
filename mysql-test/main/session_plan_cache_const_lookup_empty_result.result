@@ -1,0 +1,28 @@
+CREATE TABLE pc_const_lookup (
+id INT PRIMARY KEY,
+pad CHAR(10)
+) ENGINE=InnoDB;
+INSERT INTO pc_const_lookup VALUES (1, 'x');
+SET @@session.session_plan_cache = ON;
+SET @save_ratio=@@session.session_plan_cache_allow_change_ratio;
+SET @@session.session_plan_cache_allow_change_ratio = 0;
+PREPARE stmt FROM 'SELECT id FROM pc_const_lookup WHERE id = ?';
+# First execute creates a const lookup state
+SET @p=1;
+EXECUTE stmt USING @p;
+id
+1
+include/assert.inc [Cached_plan_count grows after first const lookup execute]
+include/assert.inc [Cached_plan_invalidations remains unchanged after first const lookup execute]
+# Same const lookup shape can return no rows through a real hit
+SET @p=0;
+EXECUTE stmt USING @p;
+id
+include/assert.inc [Cached_plan_count keeps one const lookup state after empty result]
+include/assert.inc [Cached_plan_invalidations remains unchanged when const lookup shape is stable]
+include/assert.inc [Cached_plan_hits grows for empty const lookup real hit]
+DEALLOCATE PREPARE stmt;
+include/assert.inc [Cached_plan_count returns to baseline after const lookup deallocate]
+SET @@session.session_plan_cache_allow_change_ratio = @save_ratio;
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_const_lookup;

@@ -1,0 +1,38 @@
+CREATE TABLE pc_param_shape (
+id INT PRIMARY KEY,
+v INT NOT NULL,
+KEY(v)
+) ENGINE=InnoDB;
+INSERT INTO pc_param_shape VALUES (1,10),(2,20);
+SET @@session.session_plan_cache = ON;
+# Non-unique equality creates a ref plan-cache state
+PREPARE stmt FROM 'SELECT id FROM pc_param_shape WHERE v = ?';
+SET @p=10;
+EXECUTE stmt USING @p;
+id
+1
+include/assert.inc [Cached_plan_count grows after non-unique ref execute]
+include/assert.inc [Cached_plan_hits remains unchanged after non-unique parameter-shape execute]
+include/assert.inc [Cached_plan_prevalidations remains unchanged after non-unique parameter-shape execute]
+include/assert.inc [Cached_plan_invalidations remains unchanged after non-unique parameter-shape execute]
+# String parameter shape invalidates and recaches the ref state
+SET @p='10';
+EXECUTE stmt USING @p;
+id
+1
+include/assert.inc [Cached_plan_count keeps one replacement ref state after string parameter shape]
+include/assert.inc [Cached_plan_invalidations grows after string parameter shape]
+include/assert.inc [Cached_plan_hits remains unchanged after string parameter shape]
+include/assert.inc [Cached_plan_prevalidations remains unchanged after string parameter shape]
+# NULL parameter shape invalidates and leaves no ref state
+SET @p=NULL;
+EXECUTE stmt USING @p;
+id
+include/assert.inc [Cached_plan_count returns to baseline after NULL parameter shape]
+include/assert.inc [Cached_plan_invalidations grows after NULL parameter shape]
+include/assert.inc [Cached_plan_hits remains unchanged after NULL parameter shape]
+include/assert.inc [Cached_plan_prevalidations remains unchanged after NULL parameter shape]
+DEALLOCATE PREPARE stmt;
+include/assert.inc [Cached_plan_count returns to baseline after parameter-shape deallocate]
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_param_shape;

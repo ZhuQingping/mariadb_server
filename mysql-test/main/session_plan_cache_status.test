@@ -1,0 +1,22 @@
+--echo # Status variables are present before behavior is implemented
+--replace_column 2 NUMBER
+SHOW SESSION STATUS LIKE 'Cached_plan_hits';
+SHOW SESSION STATUS LIKE 'Cached_plan_count';
+--replace_column 2 NUMBER
+SHOW GLOBAL STATUS LIKE 'Cached_plan_count';
+--replace_column 2 NUMBER
+SHOW SESSION STATUS LIKE 'Cached_plan_invalidations';
+--replace_column 2 NUMBER
+SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_unique_alloc_us';
+--replace_column 2 NUMBER
+SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_unique_setup_plan_us';
+--replace_column 2 NUMBER
+SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_ref_alloc_us';
+--replace_column 2 NUMBER
+SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_ref_setup_us';
+--replace_column 2 NUMBER
+SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_range_setup_ref_array_us';
+--replace_column 2 NUMBER
+SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_range_setup_aggr_us';
+--replace_column 2 NUMBER
+SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_range_setup_distinct_fast_us';

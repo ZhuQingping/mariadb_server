@@ -1,0 +1,711 @@
+CREATE TABLE pc_real_hit_pk (
+id INT NOT NULL PRIMARY KEY,
+uq INT NOT NULL,
+pad CHAR(10),
+UNIQUE KEY uq_key(uq)
+) ENGINE=InnoDB;
+INSERT INTO pc_real_hit_pk VALUES (1, 10, 'a'), (2, 20, 'b');
+CREATE TABLE pc_real_hit_nullable (
+id INT,
+pad CHAR(10),
+UNIQUE KEY id_uq(id)
+) ENGINE=InnoDB;
+INSERT INTO pc_real_hit_nullable VALUES (1, 'a'), (NULL, 'n');
+CREATE TABLE pc_real_hit_nonunique (
+id INT NOT NULL,
+pad CHAR(10),
+KEY id_key(id)
+) ENGINE=InnoDB;
+INSERT INTO pc_real_hit_nonunique VALUES (1, 'a'), (1, 'a2'), (2, 'b');
+CREATE TABLE pc_real_hit_multi (
+tenant_id INT NOT NULL,
+id INT NOT NULL,
+pad CHAR(10),
+UNIQUE KEY tenant_id_uq(tenant_id, id)
+) ENGINE=InnoDB;
+INSERT INTO pc_real_hit_multi VALUES (10, 1, 'a'), (10, 2, 'b');
+CREATE TABLE pc_real_hit_char (
+c VARCHAR(20) NOT NULL,
+pad CHAR(10),
+UNIQUE KEY c_uq(c)
+) ENGINE=InnoDB DEFAULT CHARSET latin1 COLLATE latin1_swedish_ci;
+INSERT INTO pc_real_hit_char VALUES ('a', 'ca'), ('b', 'cb');
+SET @@session.session_plan_cache = ON;
+SET @save_ratio=@@session.session_plan_cache_allow_change_ratio;
+SET @@session.session_plan_cache_allow_change_ratio = 0;
+PREPARE stmt_pk FROM 'SELECT pad FROM pc_real_hit_pk WHERE id = ?';
+# First execute creates state but does not count a cache hit
+SET @p=1;
+EXECUTE stmt_pk USING @p;
+pad
+a
+# Later eligible executes should use the real unique-equality hit path
+SET @p=2;
+EXECUTE stmt_pk USING @p;
+pad
+b
+SET @p=42;
+EXECUTE stmt_pk USING @p;
+pad
+SET @p=1;
+EXECUTE stmt_pk USING @p;
+pad
+a
+include/assert.inc [Cached_plan_count keeps one real-hit state for primary-key lookup]
+include/assert.inc [Cached_plan_prevalidations grows before primary-key real hits]
+include/assert.inc [Cached_plan_hits grows for repeated primary-key real hits]
+include/assert.inc [Handler_read_key grows for primary-key point lookups]
+include/assert.inc [Handler_read_next does not grow for primary-key point lookups]
+include/assert.inc [Handler_read_rnd_next does not grow for primary-key point lookups]
+DEALLOCATE PREPARE stmt_pk;
+PREPARE stmt_unique FROM 'SELECT pad FROM pc_real_hit_pk WHERE uq = ?';
+# Non-null unique secondary lookup should use the same real hit path
+SET @p=10;
+EXECUTE stmt_unique USING @p;
+pad
+a
+SET @p=20;
+EXECUTE stmt_unique USING @p;
+pad
+b
+SET @p=99;
+EXECUTE stmt_unique USING @p;
+pad
+include/assert.inc [Cached_plan_count keeps one real-hit state for unique secondary lookup]
+include/assert.inc [Cached_plan_prevalidations grows before unique secondary real hits]
+include/assert.inc [Cached_plan_hits grows for repeated unique secondary real hits]
+DEALLOCATE PREPARE stmt_unique;
+PREPARE stmt_reverse FROM 'SELECT pad FROM pc_real_hit_pk WHERE ? = id';
+# Reversed equality is eligible for real hits
+SET @p=1;
+EXECUTE stmt_reverse USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_reverse USING @p;
+pad
+b
+include/assert.inc [Cached_plan_prevalidations grows before reversed real hit]
+include/assert.inc [Cached_plan_hits grows for reversed real hit]
+DEALLOCATE PREPARE stmt_reverse;
+PREPARE stmt_char FROM 'SELECT pad FROM pc_real_hit_char WHERE c = ?';
+# Stable string unique lookup should use the real hit path
+SET @p='a';
+EXECUTE stmt_char USING @p;
+pad
+ca
+SET @p='b';
+EXECUTE stmt_char USING @p;
+pad
+cb
+include/assert.inc [Cached_plan_prevalidations grows before string unique real hit]
+include/assert.inc [Cached_plan_hits grows for string unique real hit]
+DEALLOCATE PREPARE stmt_char;
+PREPARE stmt_select_param FROM
+'SELECT pad, ? AS marker FROM pc_real_hit_pk WHERE id = ?';
+# SELECT-list parameters must refresh on each real hit
+SET @m='m1';
+SET @p=1;
+EXECUTE stmt_select_param USING @m, @p;
+pad	marker
+a	m1
+SET @m='m2';
+SET @p=2;
+EXECUTE stmt_select_param USING @m, @p;
+pad	marker
+b	m2
+SET @m='m3';
+SET @p=1;
+EXECUTE stmt_select_param USING @m, @p;
+pad	marker
+a	m3
+# Non-WHERE parameter shape changes invalidate and stay off stale hits
+SET @m=100;
+SET @p=2;
+EXECUTE stmt_select_param USING @m, @p;
+pad	marker
+b	100
+SET @m=200;
+SET @p=1;
+EXECUTE stmt_select_param USING @m, @p;
+pad	marker
+a	200
+SET @m=300;
+SET @p=2;
+EXECUTE stmt_select_param USING @m, @p;
+pad	marker
+b	300
+include/assert.inc [Cached_plan_count keeps one replacement state for SELECT-list parameter refresh]
+include/assert.inc [Cached_plan_hits grows for same-shape SELECT-list parameter refresh and replacement recache]
+include/assert.inc [Cached_plan_prevalidations grows for same-shape SELECT-list parameter refresh and replacement recache]
+include/assert.inc [Cached_plan_invalidations grows after SELECT-list parameter shape change]
+DEALLOCATE PREPARE stmt_select_param;
+PREPARE stmt_output_shapes FROM
+'SELECT *, id AS id_alias, pad AS pad_alias, id + 10 AS id_plus, CAST(pad AS CHAR(10)) AS pad_cast, ''tag'' AS tag FROM pc_real_hit_pk WHERE id = ?';
+# Real hits must preserve current row output for star, aliases, constants, and expressions
+SET @p=1;
+EXECUTE stmt_output_shapes USING @p;
+id	uq	pad	id_alias	pad_alias	id_plus	pad_cast	tag
+1	10	a	1	a	11	a	tag
+UPDATE pc_real_hit_pk SET pad='aa' WHERE id=1;
+SET @p=2;
+EXECUTE stmt_output_shapes USING @p;
+id	uq	pad	id_alias	pad_alias	id_plus	pad_cast	tag
+2	20	b	2	b	12	b	tag
+SET @p=1;
+EXECUTE stmt_output_shapes USING @p;
+id	uq	pad	id_alias	pad_alias	id_plus	pad_cast	tag
+1	10	aa	1	aa	11	aa	tag
+UPDATE pc_real_hit_pk SET pad='a' WHERE id=1;
+include/assert.inc [Cached_plan_count keeps one state for expanded SELECT output shapes]
+include/assert.inc [Cached_plan_hits grows for expanded SELECT output shapes]
+include/assert.inc [Cached_plan_prevalidations grows for expanded SELECT output shapes]
+include/assert.inc [Cached_plan_invalidations does not grow for expanded SELECT output shapes]
+DEALLOCATE PREPARE stmt_output_shapes;
+PREPARE stmt_null FROM 'SELECT pad FROM pc_real_hit_pk WHERE id = ?';
+# NULL parameter remains fail-closed and must not count as a hit
+SET @p=1;
+EXECUTE stmt_null USING @p;
+pad
+a
+SET @p=NULL;
+EXECUTE stmt_null USING @p;
+pad
+include/assert.inc [Cached_plan_hits does not grow for NULL real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for NULL real-hit candidate]
+DEALLOCATE PREPARE stmt_null;
+PREPARE stmt_nullable FROM
+'SELECT pad FROM pc_real_hit_nullable WHERE id = ?';
+# Nullable unique key remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_nullable USING @p;
+pad
+a
+SET @p=1;
+EXECUTE stmt_nullable USING @p;
+pad
+a
+include/assert.inc [Cached_plan_hits does not grow for nullable unique real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for nullable unique real-hit candidate]
+DEALLOCATE PREPARE stmt_nullable;
+PREPARE stmt_nonunique FROM
+'SELECT pad FROM pc_real_hit_nonunique WHERE id = ?';
+# Non-unique key is now covered by the ref real-hit path
+SET @p=1;
+EXECUTE stmt_nonunique USING @p;
+pad
+a
+a2
+SET @p=2;
+EXECUTE stmt_nonunique USING @p;
+pad
+b
+include/assert.inc [Cached_plan_hits grows for non-unique ref real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations grows for non-unique ref real-hit candidate]
+DEALLOCATE PREPARE stmt_nonunique;
+PREPARE stmt_multi_full FROM
+'SELECT pad FROM pc_real_hit_multi WHERE tenant_id = ? AND id = ?';
+# Full multi-part unique equality remains fail-closed for real hits
+SET @p=10;
+SET @q=1;
+EXECUTE stmt_multi_full USING @p, @q;
+pad
+a
+SET @p=10;
+SET @q=2;
+EXECUTE stmt_multi_full USING @p, @q;
+pad
+b
+include/assert.inc [Cached_plan_hits does not grow for full multi-part real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for full multi-part real-hit candidate]
+DEALLOCATE PREPARE stmt_multi_full;
+PREPARE stmt_multi_first_partial FROM
+'SELECT pad FROM pc_real_hit_multi WHERE tenant_id = ?';
+# First keypart of multi-part unique equality remains fail-closed for real hits
+SET @p=10;
+EXECUTE stmt_multi_first_partial USING @p;
+pad
+a
+b
+SET @p=20;
+EXECUTE stmt_multi_first_partial USING @p;
+pad
+include/assert.inc [Cached_plan_hits does not grow for first-keypart multi-part real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for first-keypart multi-part real-hit candidate]
+DEALLOCATE PREPARE stmt_multi_first_partial;
+PREPARE stmt_multi_const_param FROM
+'SELECT pad FROM pc_real_hit_multi WHERE tenant_id = 10 AND id = ?';
+# Mixed constant and parameter multi-part unique equality remains fail-closed
+SET @p=1;
+EXECUTE stmt_multi_const_param USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_multi_const_param USING @p;
+pad
+b
+include/assert.inc [Cached_plan_hits does not grow for const-param multi-part real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for const-param multi-part real-hit candidate]
+DEALLOCATE PREPARE stmt_multi_const_param;
+PREPARE stmt_range FROM 'SELECT pad FROM pc_real_hit_pk WHERE id > ?';
+# Range predicate remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_range USING @p;
+pad
+b
+SET @p=1;
+EXECUTE stmt_range USING @p;
+pad
+b
+include/assert.inc [Cached_plan_hits does not grow for range real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for range real-hit candidate]
+DEALLOCATE PREPARE stmt_range;
+PREPARE stmt_order FROM
+'SELECT pad FROM pc_real_hit_pk WHERE id = ? ORDER BY pad';
+# ORDER BY remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_order USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_order USING @p;
+pad
+b
+include/assert.inc [Cached_plan_hits does not grow for ORDER BY real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for ORDER BY real-hit candidate]
+DEALLOCATE PREPARE stmt_order;
+PREPARE stmt_multi_partial FROM
+'SELECT pad FROM pc_real_hit_multi WHERE id = ?';
+# Partial multi-part unique equality remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_multi_partial USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_multi_partial USING @p;
+pad
+b
+include/assert.inc [Cached_plan_hits does not grow for partial multi-part real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for partial multi-part real-hit candidate]
+DEALLOCATE PREPARE stmt_multi_partial;
+PREPARE stmt_and FROM
+'SELECT pad FROM pc_real_hit_pk WHERE id = ? AND pad = ?';
+# AND predicates remain fail-closed for real hits
+SET @p=1;
+SET @q='a';
+EXECUTE stmt_and USING @p, @q;
+pad
+a
+SET @p=2;
+SET @q='b';
+EXECUTE stmt_and USING @p, @q;
+pad
+b
+include/assert.inc [Cached_plan_hits does not grow for AND real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for AND real-hit candidate]
+DEALLOCATE PREPARE stmt_and;
+PREPARE stmt_group FROM
+'SELECT id, COUNT(*) FROM pc_real_hit_pk WHERE id = ? GROUP BY id';
+# GROUP BY remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_group USING @p;
+id	COUNT(*)
+1	1
+SET @p=2;
+EXECUTE stmt_group USING @p;
+id	COUNT(*)
+2	1
+include/assert.inc [Cached_plan_hits does not grow for GROUP BY real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for GROUP BY real-hit candidate]
+DEALLOCATE PREPARE stmt_group;
+PREPARE stmt_distinct FROM
+'SELECT DISTINCT pad FROM pc_real_hit_pk WHERE id = ?';
+# DISTINCT remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_distinct USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_distinct USING @p;
+pad
+b
+include/assert.inc [Cached_plan_hits does not grow for DISTINCT real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for DISTINCT real-hit candidate]
+DEALLOCATE PREPARE stmt_distinct;
+PREPARE stmt_subquery FROM
+'SELECT pad, (SELECT MAX(uq) FROM pc_real_hit_pk) FROM pc_real_hit_pk WHERE id = ?';
+# Scalar subquery remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_subquery USING @p;
+pad	(SELECT MAX(uq) FROM pc_real_hit_pk)
+a	20
+SET @p=2;
+EXECUTE stmt_subquery USING @p;
+pad	(SELECT MAX(uq) FROM pc_real_hit_pk)
+b	20
+include/assert.inc [Cached_plan_hits does not grow for subquery real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for subquery real-hit candidate]
+DEALLOCATE PREPARE stmt_subquery;
+PREPARE stmt_user_var FROM
+'SELECT @pc_rh_uv := pad FROM pc_real_hit_pk WHERE id = ?';
+# User-variable side effects remain fail-closed for real hits
+SET @pc_rh_uv='';
+SET @p=1;
+EXECUTE stmt_user_var USING @p;
+@pc_rh_uv := pad
+a
+SET @p=2;
+EXECUTE stmt_user_var USING @p;
+@pc_rh_uv := pad
+b
+include/assert.inc [Cached_plan_hits does not grow for user-variable real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for user-variable real-hit candidate]
+DEALLOCATE PREPARE stmt_user_var;
+PREPARE stmt_lock FROM
+'SELECT pad FROM pc_real_hit_pk WHERE id = ? FOR UPDATE';
+# Locking clauses remain fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_lock USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_lock USING @p;
+pad
+b
+include/assert.inc [Cached_plan_hits does not grow for locking real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for locking real-hit candidate]
+DEALLOCATE PREPARE stmt_lock;
+PREPARE stmt_limit_one FROM
+'SELECT pad FROM pc_real_hit_pk WHERE id = ? LIMIT 1';
+# Literal LIMIT 1 is eligible under the unique-equality boundary
+SET @p=1;
+EXECUTE stmt_limit_one USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_limit_one USING @p;
+pad
+b
+SET @p=42;
+EXECUTE stmt_limit_one USING @p;
+pad
+PREPARE stmt_limit_one_reverse FROM
+'SELECT pad FROM pc_real_hit_pk WHERE ? = id LIMIT 1';
+SET @p=1;
+EXECUTE stmt_limit_one_reverse USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_limit_one_reverse USING @p;
+pad
+b
+include/assert.inc [Cached_plan_hits grows for literal LIMIT 1 real-hit candidates]
+include/assert.inc [Cached_plan_prevalidations grows for literal LIMIT 1 real-hit candidates]
+DEALLOCATE PREPARE stmt_limit_one;
+DEALLOCATE PREPARE stmt_limit_one_reverse;
+PREPARE stmt_found_rows FROM
+'SELECT SQL_CALC_FOUND_ROWS pad FROM pc_real_hit_pk WHERE id = ?';
+# SQL_CALC_FOUND_ROWS remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_found_rows USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_found_rows USING @p;
+pad
+b
+include/assert.inc [Cached_plan_hits does not grow for SQL_CALC_FOUND_ROWS real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for SQL_CALC_FOUND_ROWS real-hit candidate]
+DEALLOCATE PREPARE stmt_found_rows;
+PREPARE stmt_found_rows_limit_one FROM
+'SELECT SQL_CALC_FOUND_ROWS pad FROM pc_real_hit_pk WHERE id = ? LIMIT 1';
+# SQL_CALC_FOUND_ROWS LIMIT 1 remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_found_rows_limit_one USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_found_rows_limit_one USING @p;
+pad
+b
+include/assert.inc [Cached_plan_hits does not grow for SQL_CALC_FOUND_ROWS LIMIT 1 real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for SQL_CALC_FOUND_ROWS LIMIT 1 real-hit candidate]
+DEALLOCATE PREPARE stmt_found_rows_limit_one;
+PREPARE stmt_found_rows_scan FROM
+'SELECT SQL_CALC_FOUND_ROWS pad FROM pc_real_hit_pk ORDER BY id LIMIT 1';
+# FOUND_ROWS keeps normal executor semantics when plan cache is enabled
+EXECUTE stmt_found_rows_scan;
+pad
+a
+SELECT FOUND_ROWS();
+FOUND_ROWS()
+2
+DEALLOCATE PREPARE stmt_found_rows_scan;
+PREPARE stmt_limit_param FROM
+'SELECT pad FROM pc_real_hit_pk WHERE id = ? LIMIT ?';
+# Parameterized LIMIT remains fail-closed for real hits
+SET @p=1;
+SET @q=1;
+EXECUTE stmt_limit_param USING @p, @q;
+pad
+a
+SET @p=2;
+EXECUTE stmt_limit_param USING @p, @q;
+pad
+b
+SET @p=2;
+SET @q=0;
+EXECUTE stmt_limit_param USING @p, @q;
+pad
+include/assert.inc [Cached_plan_hits does not grow for parameterized LIMIT real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for parameterized LIMIT real-hit candidate]
+DEALLOCATE PREPARE stmt_limit_param;
+PREPARE stmt_limit_zero FROM
+'SELECT pad FROM pc_real_hit_pk WHERE id = ? LIMIT 0';
+# LIMIT 0 remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_limit_zero USING @p;
+pad
+SET @p=2;
+EXECUTE stmt_limit_zero USING @p;
+pad
+include/assert.inc [Cached_plan_hits does not grow for LIMIT 0 real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for LIMIT 0 real-hit candidate]
+DEALLOCATE PREPARE stmt_limit_zero;
+PREPARE stmt_limit_two FROM
+'SELECT pad FROM pc_real_hit_pk WHERE id = ? LIMIT 2';
+# Non-one literal LIMIT remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_limit_two USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_limit_two USING @p;
+pad
+b
+include/assert.inc [Cached_plan_hits does not grow for LIMIT 2 real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for LIMIT 2 real-hit candidate]
+DEALLOCATE PREPARE stmt_limit_two;
+PREPARE stmt_limit_offset FROM
+'SELECT pad FROM pc_real_hit_pk WHERE id = ? LIMIT 1 OFFSET 0';
+# OFFSET remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_limit_offset USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_limit_offset USING @p;
+pad
+b
+include/assert.inc [Cached_plan_hits does not grow for LIMIT OFFSET real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for LIMIT OFFSET real-hit candidate]
+DEALLOCATE PREPARE stmt_limit_offset;
+PREPARE stmt_limit_offset_one FROM
+'SELECT pad FROM pc_real_hit_pk WHERE id = ? LIMIT 1 OFFSET 1';
+# Non-zero OFFSET remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_limit_offset_one USING @p;
+pad
+SET @p=2;
+EXECUTE stmt_limit_offset_one USING @p;
+pad
+include/assert.inc [Cached_plan_hits does not grow for LIMIT OFFSET 1 real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for LIMIT OFFSET 1 real-hit candidate]
+DEALLOCATE PREPARE stmt_limit_offset_one;
+PREPARE stmt_limit_comma_offset FROM
+'SELECT pad FROM pc_real_hit_pk WHERE id = ? LIMIT 1, 1';
+# Comma OFFSET syntax remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_limit_comma_offset USING @p;
+pad
+SET @p=2;
+EXECUTE stmt_limit_comma_offset USING @p;
+pad
+include/assert.inc [Cached_plan_hits does not grow for LIMIT comma-offset real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for LIMIT comma-offset real-hit candidate]
+DEALLOCATE PREPARE stmt_limit_comma_offset;
+PREPARE stmt_limit_order FROM
+'SELECT pad FROM pc_real_hit_pk WHERE id = ? ORDER BY pad LIMIT 1';
+# ORDER BY LIMIT remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_limit_order USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_limit_order USING @p;
+pad
+b
+include/assert.inc [Cached_plan_hits does not grow for ORDER BY LIMIT real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for ORDER BY LIMIT real-hit candidate]
+DEALLOCATE PREPARE stmt_limit_order;
+PREPARE stmt_fetch_first FROM
+'SELECT pad FROM pc_real_hit_pk WHERE id = ? FETCH FIRST ROW ONLY';
+# FETCH FIRST syntax remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_fetch_first USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_fetch_first USING @p;
+pad
+b
+include/assert.inc [Cached_plan_hits does not grow for FETCH FIRST real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for FETCH FIRST real-hit candidate]
+DEALLOCATE PREPARE stmt_fetch_first;
+PREPARE stmt_fetch_next FROM
+'SELECT pad FROM pc_real_hit_pk WHERE id = ? FETCH NEXT 1 ROW ONLY';
+# FETCH NEXT syntax remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_fetch_next USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_fetch_next USING @p;
+pad
+b
+include/assert.inc [Cached_plan_hits does not grow for FETCH NEXT real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for FETCH NEXT real-hit candidate]
+DEALLOCATE PREPARE stmt_fetch_next;
+PREPARE stmt_fetch_with_ties FROM
+'SELECT pad FROM pc_real_hit_pk WHERE id = ? ORDER BY pad FETCH FIRST ROW WITH TIES';
+# FETCH WITH TIES syntax remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_fetch_with_ties USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_fetch_with_ties USING @p;
+pad
+b
+include/assert.inc [Cached_plan_hits does not grow for FETCH WITH TIES real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for FETCH WITH TIES real-hit candidate]
+DEALLOCATE PREPARE stmt_fetch_with_ties;
+PREPARE stmt_offset_rows FROM
+'SELECT pad FROM pc_real_hit_pk WHERE id = ? OFFSET 0 ROWS';
+# OFFSET-only syntax remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_offset_rows USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_offset_rows USING @p;
+pad
+b
+include/assert.inc [Cached_plan_hits does not grow for OFFSET-only real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for OFFSET-only real-hit candidate]
+DEALLOCATE PREPARE stmt_offset_rows;
+PREPARE stmt_offset_fetch FROM
+'SELECT pad FROM pc_real_hit_pk WHERE id = ? OFFSET 0 ROWS FETCH FIRST ROW ONLY';
+# OFFSET FETCH syntax remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_offset_fetch USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_offset_fetch USING @p;
+pad
+b
+include/assert.inc [Cached_plan_hits does not grow for OFFSET FETCH real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for OFFSET FETCH real-hit candidate]
+DEALLOCATE PREPARE stmt_offset_fetch;
+PREPARE stmt_limit_rows_examined FROM
+'SELECT pad FROM pc_real_hit_pk WHERE id = ? LIMIT ROWS EXAMINED 1000';
+# LIMIT ROWS EXAMINED remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_limit_rows_examined USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_limit_rows_examined USING @p;
+pad
+b
+include/assert.inc [Cached_plan_hits does not grow for LIMIT ROWS EXAMINED real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for LIMIT ROWS EXAMINED real-hit candidate]
+DEALLOCATE PREPARE stmt_limit_rows_examined;
+PREPARE stmt_limit_rows_examined_param FROM
+'SELECT pad FROM pc_real_hit_pk WHERE id = ? LIMIT ROWS EXAMINED ?';
+# Parameterized LIMIT ROWS EXAMINED remains fail-closed for real hits
+SET @p=1;
+SET @q=1000;
+EXECUTE stmt_limit_rows_examined_param USING @p, @q;
+pad
+a
+SET @p=2;
+EXECUTE stmt_limit_rows_examined_param USING @p, @q;
+pad
+b
+include/assert.inc [Cached_plan_hits does not grow for parameterized LIMIT ROWS EXAMINED real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for parameterized LIMIT ROWS EXAMINED real-hit candidate]
+DEALLOCATE PREPARE stmt_limit_rows_examined_param;
+PREPARE stmt_limit_one_rows_examined FROM
+'SELECT pad FROM pc_real_hit_pk WHERE id = ? LIMIT 1 ROWS EXAMINED 1000';
+# LIMIT 1 ROWS EXAMINED remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_limit_one_rows_examined USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_limit_one_rows_examined USING @p;
+pad
+b
+include/assert.inc [Cached_plan_hits does not grow for LIMIT 1 ROWS EXAMINED real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for LIMIT 1 ROWS EXAMINED real-hit candidate]
+DEALLOCATE PREPARE stmt_limit_one_rows_examined;
+PREPARE stmt_limit_comma_zero FROM
+'SELECT pad FROM pc_real_hit_pk WHERE id = ? LIMIT 0, 1';
+# Zero comma-offset syntax remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_limit_comma_zero USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_limit_comma_zero USING @p;
+pad
+b
+include/assert.inc [Cached_plan_hits does not grow for LIMIT zero comma-offset real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for LIMIT zero comma-offset real-hit candidate]
+DEALLOCATE PREPARE stmt_limit_comma_zero;
+PREPARE stmt_having FROM
+'SELECT pad FROM pc_real_hit_pk WHERE id = ? HAVING pad IS NOT NULL';
+# HAVING remains fail-closed for real hits
+SET @p=1;
+EXECUTE stmt_having USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_having USING @p;
+pad
+b
+include/assert.inc [Cached_plan_hits does not grow for HAVING real-hit candidate]
+include/assert.inc [Cached_plan_prevalidations does not grow for HAVING real-hit candidate]
+DEALLOCATE PREPARE stmt_having;
+SET @save_character_set_client= @@session.character_set_client;
+SET @save_character_set_connection= @@session.character_set_connection;
+SET @save_character_set_results= @@session.character_set_results;
+SET NAMES latin1;
+PREPARE stmt_charset FROM
+'SELECT pad FROM pc_real_hit_char WHERE c = ?';
+# Charset change invalidates an otherwise eligible string unique lookup
+SET @p='a';
+EXECUTE stmt_charset USING @p;
+pad
+ca
+SET NAMES utf8;
+SET @p='b';
+EXECUTE stmt_charset USING @p;
+pad
+cb
+include/assert.inc [Cached_plan_hits does not grow across charset invalidation]
+include/assert.inc [Cached_plan_prevalidations does not grow across charset invalidation]
+DEALLOCATE PREPARE stmt_charset;
+SET @@session.character_set_client= @save_character_set_client;
+SET @@session.character_set_connection= @save_character_set_connection;
+SET @@session.character_set_results= @save_character_set_results;
+include/assert.inc [Cached_plan_count returns to baseline after real-hit deallocates]
+SET @@session.session_plan_cache_allow_change_ratio = @save_ratio;
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_real_hit_pk;
+DROP TABLE pc_real_hit_nullable;
+DROP TABLE pc_real_hit_nonunique;
+DROP TABLE pc_real_hit_multi;
+DROP TABLE pc_real_hit_char;

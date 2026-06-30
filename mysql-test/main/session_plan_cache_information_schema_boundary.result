@@ -1,0 +1,14 @@
+SET @@session.session_plan_cache = ON;
+# INFORMATION_SCHEMA tables are not plan-cache candidates
+PREPARE stmt FROM
+'SELECT COUNT(*) AS cnt FROM information_schema.tables WHERE table_schema = ?';
+SET @schema_name='INFORMATION_SCHEMA';
+EXECUTE stmt USING @schema_name;
+SET @schema_name='test';
+EXECUTE stmt USING @schema_name;
+include/assert.inc [Cached_plan_count does not grow for INFORMATION_SCHEMA SELECT]
+include/assert.inc [Cached_plan_hits does not grow for INFORMATION_SCHEMA SELECT]
+include/assert.inc [Cached_plan_prevalidations does not grow for INFORMATION_SCHEMA SELECT]
+include/assert.inc [Cached_plan_invalidations does not grow for INFORMATION_SCHEMA SELECT]
+DEALLOCATE PREPARE stmt;
+SET @@session.session_plan_cache = DEFAULT;

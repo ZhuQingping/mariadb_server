@@ -1,0 +1,72 @@
+--source include/have_innodb.inc
+
+CREATE TABLE pc_const_lookup (
+  id INT PRIMARY KEY,
+  pad CHAR(10)
+) ENGINE=InnoDB;
+INSERT INTO pc_const_lookup VALUES (1, 'x');
+
+SET @@session.session_plan_cache = ON;
+SET @save_ratio=@@session.session_plan_cache_allow_change_ratio;
+SET @@session.session_plan_cache_allow_change_ratio = 0;
+
+--disable_query_log
+let $count_before= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $invalidations_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+--enable_query_log
+
+PREPARE stmt FROM 'SELECT id FROM pc_const_lookup WHERE id = ?';
+
+--echo # First execute creates a const lookup state
+SET @p=1;
+EXECUTE stmt USING @p;
+
+--disable_query_log
+let $count_after_first= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $invalidations_after_first= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count grows after first const lookup execute
+--let $assert_cond= $count_after_first = $count_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations remains unchanged after first const lookup execute
+--let $assert_cond= $invalidations_after_first = $invalidations_before
+--source include/assert.inc
+--enable_query_log
+
+--echo # Same const lookup shape can return no rows through a real hit
+SET @p=0;
+EXECUTE stmt USING @p;
+
+--disable_query_log
+let $count_after_second= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_second= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $invalidations_after_second= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count keeps one const lookup state after empty result
+--let $assert_cond= $count_after_second = $count_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations remains unchanged when const lookup shape is stable
+--let $assert_cond= $invalidations_after_second = $invalidations_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits grows for empty const lookup real hit
+--let $assert_cond= $hits_after_second = $hits_before + 1
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt;
+
+--disable_query_log
+let $count_after_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after const lookup deallocate
+--let $assert_cond= $count_after_deallocate = $count_before
+--source include/assert.inc
+--enable_query_log
+
+SET @@session.session_plan_cache_allow_change_ratio = @save_ratio;
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_const_lookup;

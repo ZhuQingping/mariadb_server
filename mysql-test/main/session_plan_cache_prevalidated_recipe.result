@@ -1,0 +1,141 @@
+CREATE TABLE pc_recipe_pk (
+id INT NOT NULL PRIMARY KEY,
+pad CHAR(10)
+) ENGINE=InnoDB;
+INSERT INTO pc_recipe_pk VALUES (1, 'a'), (2, 'b');
+CREATE TABLE pc_recipe_nullable (
+id INT,
+pad CHAR(10),
+UNIQUE KEY id_uq(id)
+) ENGINE=InnoDB;
+INSERT INTO pc_recipe_nullable VALUES (1, 'a'), (NULL, 'n');
+CREATE TABLE pc_recipe_nonunique (
+id INT NOT NULL,
+pad CHAR(10),
+KEY id_key(id)
+) ENGINE=InnoDB;
+INSERT INTO pc_recipe_nonunique VALUES (1, 'a'), (2, 'b');
+CREATE TABLE pc_recipe_multi (
+tenant_id INT NOT NULL,
+id INT NOT NULL,
+pad CHAR(10),
+UNIQUE KEY tenant_id_uq(tenant_id, id)
+) ENGINE=InnoDB;
+INSERT INTO pc_recipe_multi VALUES (10, 1, 'a'), (10, 2, 'b');
+SET @@session.session_plan_cache = ON;
+SET @save_ratio=@@session.session_plan_cache_allow_change_ratio;
+SET @@session.session_plan_cache_allow_change_ratio = 0;
+PREPARE stmt FROM 'SELECT pad FROM pc_recipe_pk WHERE id = ?';
+# First execute creates state and stores the unique equality recipe
+SET @p=1;
+EXECUTE stmt USING @p;
+pad
+a
+# Second execute can prevalidate the same recipe before normal optimization
+SET @p=2;
+EXECUTE stmt USING @p;
+pad
+b
+include/assert.inc [Cached_plan_count keeps one state for prevalidated unique equality recipe]
+include/assert.inc [Cached_plan_prevalidations grows on second unique equality execute]
+include/assert.inc [Cached_plan_hits grows for prevalidated unique equality recipe]
+DEALLOCATE PREPARE stmt;
+include/assert.inc [Cached_plan_count returns to baseline after prevalidated recipe deallocate]
+PREPARE stmt_reverse FROM 'SELECT pad FROM pc_recipe_pk WHERE ? = id';
+# Reversed equality operands are accepted as the same unique equality recipe
+SET @p=1;
+EXECUTE stmt_reverse USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_reverse USING @p;
+pad
+b
+include/assert.inc [Cached_plan_count keeps one state for reversed unique equality recipe]
+include/assert.inc [Cached_plan_prevalidations grows for reversed unique equality recipe]
+DEALLOCATE PREPARE stmt_reverse;
+include/assert.inc [Cached_plan_count returns to baseline after reversed recipe deallocate]
+PREPARE stmt_nullable FROM 'SELECT pad FROM pc_recipe_nullable WHERE id = ?';
+# Nullable unique keys are not accepted as deterministic unique equality recipes
+SET @p=1;
+EXECUTE stmt_nullable USING @p;
+pad
+a
+SET @p=1;
+EXECUTE stmt_nullable USING @p;
+pad
+a
+include/assert.inc [Cached_plan_prevalidations does not grow for nullable unique equality recipe]
+DEALLOCATE PREPARE stmt_nullable;
+include/assert.inc [Cached_plan_count returns to baseline after nullable recipe deallocate]
+PREPARE stmt_null_param FROM 'SELECT pad FROM pc_recipe_pk WHERE id = ?';
+# NULL parameters are not accepted as unique equality recipes
+SET @p=1;
+EXECUTE stmt_null_param USING @p;
+pad
+a
+SET @p=NULL;
+EXECUTE stmt_null_param USING @p;
+pad
+include/assert.inc [Cached_plan_prevalidations does not grow for NULL parameter recipe]
+DEALLOCATE PREPARE stmt_null_param;
+include/assert.inc [Cached_plan_count returns to baseline after NULL parameter recipe deallocate]
+PREPARE stmt_nonunique FROM 'SELECT pad FROM pc_recipe_nonunique WHERE id = ?';
+# Non-unique keys are accepted as ref equality recipes
+SET @p=1;
+EXECUTE stmt_nonunique USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_nonunique USING @p;
+pad
+b
+include/assert.inc [Cached_plan_prevalidations grows for non-unique ref equality recipe]
+DEALLOCATE PREPARE stmt_nonunique;
+include/assert.inc [Cached_plan_count returns to baseline after non-unique recipe deallocate]
+PREPARE stmt_multi FROM 'SELECT pad FROM pc_recipe_multi WHERE id = ?';
+# Multi-part unique keys are not accepted by the phase 11 recipe skeleton
+SET @p=1;
+EXECUTE stmt_multi USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_multi USING @p;
+pad
+b
+include/assert.inc [Cached_plan_prevalidations does not grow for multi-part unique recipe]
+DEALLOCATE PREPARE stmt_multi;
+include/assert.inc [Cached_plan_count returns to baseline after multi-part recipe deallocate]
+PREPARE stmt_range FROM 'SELECT pad FROM pc_recipe_pk WHERE id > ?';
+# Range predicates are not accepted as unique equality recipes
+SET @p=0;
+EXECUTE stmt_range USING @p;
+pad
+a
+b
+SET @p=1;
+EXECUTE stmt_range USING @p;
+pad
+b
+include/assert.inc [Cached_plan_prevalidations does not grow for range recipe]
+DEALLOCATE PREPARE stmt_range;
+include/assert.inc [Cached_plan_count returns to baseline after range recipe deallocate]
+PREPARE stmt_and FROM 'SELECT pad FROM pc_recipe_pk WHERE id = ? AND pad = ?';
+# AND predicate trees are not accepted by the phase 11 recipe skeleton
+SET @p=1;
+SET @q='a';
+EXECUTE stmt_and USING @p, @q;
+pad
+a
+SET @p=2;
+SET @q='b';
+EXECUTE stmt_and USING @p, @q;
+pad
+b
+include/assert.inc [Cached_plan_prevalidations does not grow for AND recipe]
+DEALLOCATE PREPARE stmt_and;
+include/assert.inc [Cached_plan_count returns to baseline after AND recipe deallocate]
+SET @@session.session_plan_cache_allow_change_ratio = @save_ratio;
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_recipe_pk, pc_recipe_nullable, pc_recipe_nonunique,
+pc_recipe_multi;

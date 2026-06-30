@@ -1,0 +1,199 @@
+--source include/have_innodb.inc
+
+CREATE TABLE pc_state (
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+
+INSERT INTO pc_state VALUES (1,10),(2,20);
+
+SET @@session.session_plan_cache = ON;
+
+--disable_query_log
+let $count_before= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $invalidations_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+--enable_query_log
+
+--echo # First eligible execute creates one cached-plan state
+PREPARE stmt FROM 'SELECT id, v FROM pc_state WHERE id = ?';
+SET @p=1;
+EXECUTE stmt USING @p;
+
+--disable_query_log
+let $count_after_first= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_first= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $invalidations_after_first= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count grows after first eligible execute
+--let $assert_cond= $count_after_first = $count_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits remains unchanged before a reusable state exists
+--let $assert_cond= $hits_after_first = $hits_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations remains unchanged before reprepare
+--let $assert_cond= $invalidations_after_first = $invalidations_before
+--source include/assert.inc
+--enable_query_log
+
+--echo # Re-executing same statement keeps one state and uses a real hit
+SET @p=2;
+EXECUTE stmt USING @p;
+
+--disable_query_log
+let $count_after_second= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_second= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+
+--let $assert_text= Cached_plan_count stays at one state for the same prepared statement
+--let $assert_cond= $count_after_second = $count_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits grows after second execute
+--let $assert_cond= $hits_after_second = $hits_before + 1
+--source include/assert.inc
+--enable_query_log
+
+--echo # Deallocate destroys the state
+DEALLOCATE PREPARE stmt;
+
+--disable_query_log
+let $count_after_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $invalidations_after_deallocate= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after deallocate
+--let $assert_cond= $count_after_deallocate = $count_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations remains unchanged after deallocate
+--let $assert_cond= $invalidations_after_deallocate = $invalidations_before
+--source include/assert.inc
+--enable_query_log
+
+--echo # Metadata reprepare invalidates the old state and creates a replacement
+PREPARE stmt FROM 'SELECT id, v FROM pc_state WHERE id = ?';
+SET @p=1;
+EXECUTE stmt USING @p;
+ALTER TABLE pc_state ADD COLUMN extra INT DEFAULT 0;
+SET @p=2;
+EXECUTE stmt USING @p;
+
+--disable_query_log
+let $count_after_reprepare= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_reprepare= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $invalidations_after_reprepare= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count has one replacement state after reprepare
+--let $assert_cond= $count_after_reprepare = $count_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits does not grow while replacing state after reprepare
+--let $assert_cond= $hits_after_reprepare = $hits_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations grows once after metadata reprepare
+--let $assert_cond= $invalidations_after_reprepare = $invalidations_before + 1
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt;
+
+--disable_query_log
+let $count_after_final_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after final deallocate
+--let $assert_cond= $count_after_final_deallocate = $count_before
+--source include/assert.inc
+--enable_query_log
+
+--echo # Same-name PREPARE replacement destroys the old state without invalidation
+PREPARE stmt FROM 'SELECT id, v FROM pc_state WHERE id = ?';
+SET @p=1;
+EXECUTE stmt USING @p;
+
+--disable_query_log
+let $count_before_prepare_replace= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $invalidations_before_prepare_replace= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count has one state before same-name PREPARE replacement
+--let $assert_cond= $count_before_prepare_replace = $count_before + 1
+--source include/assert.inc
+--enable_query_log
+
+PREPARE stmt FROM 'SELECT v FROM pc_state WHERE id = ?';
+
+--disable_query_log
+let $count_after_prepare_replace= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $invalidations_after_prepare_replace= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after same-name PREPARE replacement
+--let $assert_cond= $count_after_prepare_replace = $count_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations does not grow after same-name PREPARE replacement
+--let $assert_cond= $invalidations_after_prepare_replace = $invalidations_before_prepare_replace
+--source include/assert.inc
+--enable_query_log
+
+SET @p=2;
+EXECUTE stmt USING @p;
+
+--disable_query_log
+let $count_after_replacement_execute= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $invalidations_after_replacement_execute= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count grows after replacement statement execute
+--let $assert_cond= $count_after_replacement_execute = $count_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations remains unchanged after replacement statement execute
+--let $assert_cond= $invalidations_after_replacement_execute = $invalidations_before_prepare_replace
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt;
+
+--disable_query_log
+let $count_after_replace_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after replacement deallocate
+--let $assert_cond= $count_after_replace_deallocate = $count_before
+--source include/assert.inc
+--enable_query_log
+
+--echo # Failed same-name PREPARE replacement also removes the old state
+PREPARE stmt FROM 'SELECT id, v FROM pc_state WHERE id = ?';
+SET @p=1;
+EXECUTE stmt USING @p;
+
+--disable_query_log
+let $count_before_failed_replace= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $invalidations_before_failed_replace= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count has one state before failed same-name PREPARE replacement
+--let $assert_cond= $count_before_failed_replace = $count_before + 1
+--source include/assert.inc
+--enable_query_log
+
+--error ER_PARSE_ERROR
+PREPARE stmt FROM 'SELECT FROM';
+
+--disable_query_log
+let $count_after_failed_replace= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $invalidations_after_failed_replace= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after failed same-name PREPARE replacement
+--let $assert_cond= $count_after_failed_replace = $count_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations does not grow after failed same-name PREPARE replacement
+--let $assert_cond= $invalidations_after_failed_replace = $invalidations_before_failed_replace
+--source include/assert.inc
+--enable_query_log
+
+--error ER_UNKNOWN_STMT_HANDLER
+EXECUTE stmt USING @p;
+
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_state;

@@ -1,0 +1,17 @@
+CREATE TABLE pc_change_user_count (
+id INT PRIMARY KEY,
+v INT
+) ENGINE=InnoDB;
+INSERT INTO pc_change_user_count VALUES (1,10),(2,20);
+SET @@session.session_plan_cache = ON;
+PREPARE stmt FROM 'SELECT id FROM pc_change_user_count WHERE id = ?';
+SET @p=1;
+EXECUTE stmt USING @p;
+id
+1
+include/assert.inc [Cached_plan_count grows before change_user]
+change_user root,,test;
+include/assert.inc [Cached_plan_count returns to baseline after change_user destroys prepared statements]
+include/assert.inc [Cached_plan_invalidations does not grow after change_user destroys prepared statements]
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_change_user_count;

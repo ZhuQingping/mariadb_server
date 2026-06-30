@@ -1,0 +1,111 @@
+--source include/have_innodb.inc
+
+CREATE TABLE pc_readiness_t1 (
+  id INT PRIMARY KEY,
+  v INT,
+  KEY(v)
+) ENGINE=InnoDB;
+
+CREATE TABLE pc_readiness_t2 (
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+
+INSERT INTO pc_readiness_t1 VALUES (1,10),(2,20),(3,20);
+INSERT INTO pc_readiness_t2 VALUES (1,100),(2,200);
+
+SET @@session.session_plan_cache = ON;
+
+--disable_query_log
+let $count_before= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+--enable_query_log
+
+--echo # Recipe-less SELECT without a WHERE predicate does not create plan-cache state
+PREPARE stmt FROM 'SELECT id FROM pc_readiness_t1';
+--disable_result_log
+EXECUTE stmt;
+EXECUTE stmt;
+--enable_result_log
+DEALLOCATE PREPARE stmt;
+
+--echo # Literal non-unique key equality does not create plan-cache state
+PREPARE stmt FROM 'SELECT id FROM pc_readiness_t1 WHERE v = 20';
+--disable_result_log
+EXECUTE stmt;
+EXECUTE stmt;
+--enable_result_log
+DEALLOCATE PREPARE stmt;
+
+--echo # Literal unique-key equality does not create plan-cache state
+PREPARE stmt FROM 'SELECT id FROM pc_readiness_t1 WHERE id = 1';
+--disable_result_log
+EXECUTE stmt;
+EXECUTE stmt;
+--enable_result_log
+DEALLOCATE PREPARE stmt;
+
+--echo # Join remains outside the plan-cache boundary
+PREPARE stmt FROM 'SELECT t1.id, t2.v FROM pc_readiness_t1 t1 JOIN pc_readiness_t2 t2 ON t2.id = t1.id WHERE t1.id = ?';
+SET @p=1;
+--disable_result_log
+EXECUTE stmt USING @p;
+EXECUTE stmt USING @p;
+--enable_result_log
+DEALLOCATE PREPARE stmt;
+
+--echo # Derived table remains outside the plan-cache boundary
+PREPARE stmt FROM 'SELECT id FROM (SELECT id, v FROM pc_readiness_t1 WHERE v = ?) AS d WHERE id > 0';
+SET @p=20;
+--disable_result_log
+EXECUTE stmt USING @p;
+EXECUTE stmt USING @p;
+--enable_result_log
+DEALLOCATE PREPARE stmt;
+
+--echo # Correlated subquery remains outside the plan-cache boundary
+PREPARE stmt FROM 'SELECT id FROM pc_readiness_t1 t1 WHERE id = ? AND EXISTS (SELECT 1 FROM pc_readiness_t2 t2 WHERE t2.id = t1.id)';
+SET @p=1;
+--disable_result_log
+EXECUTE stmt USING @p;
+EXECUTE stmt USING @p;
+--enable_result_log
+DEALLOCATE PREPARE stmt;
+
+--echo # mysql system tables remain outside the plan-cache boundary
+PREPARE stmt FROM 'SELECT name FROM mysql.help_topic WHERE help_topic_id = ?';
+SET @p=1;
+--disable_result_log
+EXECUTE stmt USING @p;
+EXECUTE stmt USING @p;
+--enable_result_log
+DEALLOCATE PREPARE stmt;
+
+--disable_query_log
+let $count_after= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_after= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count does not grow for readiness boundary cases
+--let $assert_cond= $count_after = $count_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits does not grow for readiness boundary cases
+--let $assert_cond= $hits_after = $hits_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for readiness boundary cases
+--let $assert_cond= $prevalidations_after = $prevalidations_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations does not grow for readiness boundary cases
+--let $assert_cond= $invalidations_after = $invalidations_before
+--source include/assert.inc
+--enable_query_log
+
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_readiness_t2;
+DROP TABLE pc_readiness_t1;

@@ -1,0 +1,33 @@
+# session_plan_cache defaults to OFF in MariaDB MVP
+SELECT @@session.session_plan_cache;
+@@session.session_plan_cache
+0
+SET @@session.session_plan_cache = ON;
+SELECT @@session.session_plan_cache;
+@@session.session_plan_cache
+1
+SET @@session.session_plan_cache = OFF;
+SELECT @@session.session_plan_cache;
+@@session.session_plan_cache
+0
+SET @@session.session_plan_cache = DEFAULT;
+SELECT @@session.session_plan_cache;
+@@session.session_plan_cache
+0
+SET @@global.session_plan_cache = ON;
+SELECT @@global.session_plan_cache;
+@@global.session_plan_cache
+1
+SELECT @@session.session_plan_cache;
+@@session.session_plan_cache
+0
+SET @@global.session_plan_cache = DEFAULT;
+SELECT @@global.session_plan_cache;
+@@global.session_plan_cache
+0
+SET @@session.session_plan_cache = 2;
+ERROR 42000: Variable 'session_plan_cache' can't be set to the value of '2'
+SET @@session.session_plan_cache = 'invalid';
+ERROR 42000: Variable 'session_plan_cache' can't be set to the value of 'invalid'
+SET @@global.session_plan_cache = 2;
+ERROR 42000: Variable 'session_plan_cache' can't be set to the value of '2'

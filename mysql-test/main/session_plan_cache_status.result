@@ -1,0 +1,34 @@
+# Status variables are present before behavior is implemented
+SHOW SESSION STATUS LIKE 'Cached_plan_hits';
+Variable_name	Value
+Cached_plan_hits	NUMBER
+SHOW SESSION STATUS LIKE 'Cached_plan_count';
+Variable_name	Value
+Cached_plan_count	0
+SHOW GLOBAL STATUS LIKE 'Cached_plan_count';
+Variable_name	Value
+Cached_plan_count	NUMBER
+SHOW SESSION STATUS LIKE 'Cached_plan_invalidations';
+Variable_name	Value
+Cached_plan_invalidations	NUMBER
+SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_unique_alloc_us';
+Variable_name	Value
+Cached_plan_profile_hit_unique_alloc_us	NUMBER
+SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_unique_setup_plan_us';
+Variable_name	Value
+Cached_plan_profile_hit_unique_setup_plan_us	NUMBER
+SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_ref_alloc_us';
+Variable_name	Value
+Cached_plan_profile_hit_ref_alloc_us	NUMBER
+SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_ref_setup_us';
+Variable_name	Value
+Cached_plan_profile_hit_ref_setup_us	NUMBER
+SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_range_setup_ref_array_us';
+Variable_name	Value
+Cached_plan_profile_hit_range_setup_ref_array_us	NUMBER
+SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_range_setup_aggr_us';
+Variable_name	Value
+Cached_plan_profile_hit_range_setup_aggr_us	NUMBER
+SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_range_setup_distinct_fast_us';
+Variable_name	Value
+Cached_plan_profile_hit_range_setup_distinct_fast_us	NUMBER

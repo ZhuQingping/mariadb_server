@@ -1,0 +1,97 @@
+--source include/have_innodb.inc
+
+CREATE TABLE pc_sm_t1 (
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+
+CREATE TABLE pc_sm_t2 (
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+
+INSERT INTO pc_sm_t1 VALUES (1,10),(2,20);
+INSERT INTO pc_sm_t2 VALUES (1,100),(2,200);
+
+--disable_query_log
+let $count_before= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $invalidations_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+--enable_query_log
+
+--echo # DISABLED is transient: the same prepared statement can cache after enabling
+SET @@session.session_plan_cache = OFF;
+PREPARE stmt FROM 'SELECT id, v FROM pc_sm_t1 WHERE id = ?';
+SET @p=1;
+EXECUTE stmt USING @p;
+
+--disable_query_log
+let $count_after_disabled= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count does not grow while session_plan_cache is OFF
+--let $assert_cond= $count_after_disabled = $count_before
+--source include/assert.inc
+--enable_query_log
+
+SET @@session.session_plan_cache = ON;
+SET @p=2;
+EXECUTE stmt USING @p;
+
+--disable_query_log
+let $count_after_enabled= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_enabled= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $invalidations_after_enabled= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count grows after enabling session_plan_cache on the same prepared statement
+--let $assert_cond= $count_after_enabled = $count_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits remains unchanged before reuse is implemented
+--let $assert_cond= $hits_after_enabled = $hits_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations remains unchanged after enabling
+--let $assert_cond= $invalidations_after_enabled = $invalidations_before
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt;
+
+--disable_query_log
+let $count_after_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after deallocate
+--let $assert_cond= $count_after_deallocate = $count_before
+--source include/assert.inc
+--enable_query_log
+
+--echo # Unsupported shapes are permanently uncacheable for this prepared statement
+PREPARE stmt FROM 'SELECT pc_sm_t1.id, pc_sm_t2.v FROM pc_sm_t1 JOIN pc_sm_t2 ON pc_sm_t2.id = pc_sm_t1.id WHERE pc_sm_t1.id = ?';
+SET @p=1;
+EXECUTE stmt USING @p;
+SET @p=2;
+EXECUTE stmt USING @p;
+
+--disable_query_log
+let $count_after_uncacheable= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_uncacheable= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $invalidations_after_uncacheable= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Unsupported prepared statement does not create a cached-plan state
+--let $assert_cond= $count_after_uncacheable = $count_before
+--source include/assert.inc
+
+--let $assert_text= Unsupported prepared statement does not record hits
+--let $assert_cond= $hits_after_uncacheable = $hits_before
+--source include/assert.inc
+
+--let $assert_text= Unsupported prepared statement does not invalidate absent state
+--let $assert_cond= $invalidations_after_uncacheable = $invalidations_before
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt;
+
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_sm_t2;
+DROP TABLE pc_sm_t1;

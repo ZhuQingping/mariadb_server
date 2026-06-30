@@ -1,0 +1,23 @@
+CREATE TABLE pc_lifecycle (
+id INT PRIMARY KEY,
+v INT
+) ENGINE=InnoDB;
+INSERT INTO pc_lifecycle VALUES (1,10),(2,20);
+SET @@session.session_plan_cache = OFF;
+# Prepared SELECT executes before and after metadata reprepare
+PREPARE stmt FROM 'SELECT id, v FROM pc_lifecycle WHERE id = ?';
+SET @p=1;
+EXECUTE stmt USING @p;
+id	v
+1	10
+ALTER TABLE pc_lifecycle ADD COLUMN extra INT DEFAULT 0;
+SET @p=2;
+EXECUTE stmt USING @p;
+id	v
+2	20
+DEALLOCATE PREPARE stmt;
+include/assert.inc [Cached_plan_count does not grow through lifecycle no-op]
+include/assert.inc [Cached_plan_hits does not grow through lifecycle no-op]
+include/assert.inc [Cached_plan_invalidations does not grow through lifecycle no-op]
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_lifecycle;

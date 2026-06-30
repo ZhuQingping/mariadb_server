@@ -1,0 +1,22 @@
+--echo # session_plan_cache_allow_change_ratio defaults to 0 for conservative MVP
+SELECT @@session.session_plan_cache_allow_change_ratio;
+SET @@session.session_plan_cache_allow_change_ratio = 0.2;
+SELECT @@session.session_plan_cache_allow_change_ratio;
+SET @@session.session_plan_cache_allow_change_ratio = 0;
+SELECT @@session.session_plan_cache_allow_change_ratio;
+SET @@session.session_plan_cache_allow_change_ratio = DEFAULT;
+SELECT @@session.session_plan_cache_allow_change_ratio;
+SET @@session.session_plan_cache_allow_change_ratio = 1;
+SELECT @@session.session_plan_cache_allow_change_ratio;
+SET @@session.session_plan_cache_allow_change_ratio = DEFAULT;
+SET @@global.session_plan_cache_allow_change_ratio = 0.1;
+SELECT @@global.session_plan_cache_allow_change_ratio;
+SELECT @@session.session_plan_cache_allow_change_ratio;
+SET @@global.session_plan_cache_allow_change_ratio = DEFAULT;
+SELECT @@global.session_plan_cache_allow_change_ratio;
+--error ER_WRONG_VALUE_FOR_VAR
+SET @@session.session_plan_cache_allow_change_ratio = -0.1;
+--error ER_WRONG_TYPE_FOR_VAR
+SET @@session.session_plan_cache_allow_change_ratio = 'invalid';
+--error ER_WRONG_VALUE_FOR_VAR
+SET @@global.session_plan_cache_allow_change_ratio = -0.1;

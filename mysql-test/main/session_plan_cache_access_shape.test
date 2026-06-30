@@ -1,0 +1,133 @@
+--source include/have_innodb.inc
+
+CREATE TABLE pc_access_shape (
+  id INT PRIMARY KEY,
+  a INT,
+  b INT,
+  pad CHAR(10),
+  KEY a_idx(a),
+  KEY b_idx(b)
+) ENGINE=InnoDB;
+
+CREATE TABLE pc_digits (d INT PRIMARY KEY) ENGINE=InnoDB;
+INSERT INTO pc_digits VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9);
+
+INSERT INTO pc_access_shape
+SELECT ones.d + tens.d * 10 + hundreds.d * 100 + 1 AS seq,
+       IF(ones.d + tens.d * 10 + hundreds.d * 100 + 1 <= 900, 1,
+          ones.d + tens.d * 10 + hundreds.d * 100 + 1),
+       IF(ones.d + tens.d * 10 + hundreds.d * 100 + 1 <= 100, 1,
+          ones.d + tens.d * 10 + hundreds.d * 100 + 1),
+       'x'
+FROM pc_digits ones, pc_digits tens, pc_digits hundreds;
+
+ANALYZE TABLE pc_access_shape;
+
+SET @@session.session_plan_cache = ON;
+SET @save_ratio=@@session.session_plan_cache_allow_change_ratio;
+SET @@session.session_plan_cache_allow_change_ratio = 0;
+
+--disable_query_log
+let $count_before= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+--enable_query_log
+
+PREPARE stmt FROM 'SELECT id FROM pc_access_shape WHERE a BETWEEN ? AND ? AND b BETWEEN ? AND ?';
+
+--echo # Range predicates no longer create recipe-less plan-cache state
+SET @a1=1, @a2=1, @b1=1, @b2=1000;
+--disable_result_log
+EXECUTE stmt USING @a1, @a2, @b1, @b2;
+--enable_result_log
+
+--disable_query_log
+let $count_after_first= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_first= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_first= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_after_first= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count does not grow after range access-shape execute
+--let $assert_cond= $count_after_first = $count_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits remains unchanged after range access-shape execute
+--let $assert_cond= $hits_after_first = $hits_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations remains unchanged after range access-shape execute
+--let $assert_cond= $prevalidations_after_first = $prevalidations_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations remains unchanged after range access-shape execute
+--let $assert_cond= $invalidations_after_first = $invalidations_before
+--source include/assert.inc
+--enable_query_log
+
+--echo # Parameter selectivity changes still execute normally without state
+SET @a1=1, @a2=1000, @b1=1, @b2=1;
+--disable_result_log
+EXECUTE stmt USING @a1, @a2, @b1, @b2;
+--enable_result_log
+
+--disable_query_log
+let $count_after_second= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_second= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_second= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_after_second= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count remains baseline after non-DDL access shape change
+--let $assert_cond= $count_after_second = $count_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations remains unchanged after non-DDL access shape change
+--let $assert_cond= $invalidations_after_second = $invalidations_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits remains unchanged for range access shape
+--let $assert_cond= $hits_after_second = $hits_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations remains unchanged for range access shape
+--let $assert_cond= $prevalidations_after_second = $prevalidations_before
+--source include/assert.inc
+--enable_query_log
+
+--echo # A later parameter set remains safe without state if the access index changes again
+SET @a1=950, @a2=960, @b1=1, @b2=1000;
+--disable_result_log
+EXECUTE stmt USING @a1, @a2, @b1, @b2;
+--enable_result_log
+
+--disable_query_log
+let $count_after_third= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $prevalidations_after_third= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_after_third= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count remains baseline after later access shape change
+--let $assert_cond= $count_after_third = $count_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations remains unchanged after later access shape change
+--let $assert_cond= $invalidations_after_third = $invalidations_after_second
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations remains unchanged after later access shape change
+--let $assert_cond= $prevalidations_after_third = $prevalidations_before
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt;
+
+--disable_query_log
+let $count_after_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after access-shape deallocate
+--let $assert_cond= $count_after_deallocate = $count_before
+--source include/assert.inc
+--enable_query_log
+
+SET @@session.session_plan_cache_allow_change_ratio = @save_ratio;
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_access_shape, pc_digits;

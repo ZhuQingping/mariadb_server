@@ -1,0 +1,113 @@
+--source include/have_innodb.inc
+
+CREATE TABLE pc_param_shape (
+  id INT PRIMARY KEY,
+  v INT NOT NULL,
+  KEY(v)
+) ENGINE=InnoDB;
+
+INSERT INTO pc_param_shape VALUES (1,10),(2,20);
+
+SET @@session.session_plan_cache = ON;
+
+--disable_query_log
+let $count_before= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+--enable_query_log
+
+--echo # Non-unique equality creates a ref plan-cache state
+PREPARE stmt FROM 'SELECT id FROM pc_param_shape WHERE v = ?';
+SET @p=10;
+EXECUTE stmt USING @p;
+
+--disable_query_log
+let $count_after_first= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_first= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_first= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_after_first= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count grows after non-unique ref execute
+--let $assert_cond= $count_after_first = $count_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits remains unchanged after non-unique parameter-shape execute
+--let $assert_cond= $hits_after_first = $hits_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations remains unchanged after non-unique parameter-shape execute
+--let $assert_cond= $prevalidations_after_first = $prevalidations_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations remains unchanged after non-unique parameter-shape execute
+--let $assert_cond= $invalidations_after_first = $invalidations_before
+--source include/assert.inc
+--enable_query_log
+
+--echo # String parameter shape invalidates and recaches the ref state
+SET @p='10';
+EXECUTE stmt USING @p;
+
+--disable_query_log
+let $count_after_string= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_string= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_string= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_after_string= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count keeps one replacement ref state after string parameter shape
+--let $assert_cond= $count_after_string = $count_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations grows after string parameter shape
+--let $assert_cond= $invalidations_after_string = $invalidations_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits remains unchanged after string parameter shape
+--let $assert_cond= $hits_after_string = $hits_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations remains unchanged after string parameter shape
+--let $assert_cond= $prevalidations_after_string = $prevalidations_before
+--source include/assert.inc
+--enable_query_log
+
+--echo # NULL parameter shape invalidates and leaves no ref state
+SET @p=NULL;
+EXECUTE stmt USING @p;
+
+--disable_query_log
+let $count_after_null= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_null= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_null= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_after_null= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after NULL parameter shape
+--let $assert_cond= $count_after_null = $count_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations grows after NULL parameter shape
+--let $assert_cond= $invalidations_after_null = $invalidations_before + 2
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits remains unchanged after NULL parameter shape
+--let $assert_cond= $hits_after_null = $hits_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations remains unchanged after NULL parameter shape
+--let $assert_cond= $prevalidations_after_null = $prevalidations_before
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt;
+
+--disable_query_log
+let $count_after_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after parameter-shape deallocate
+--let $assert_cond= $count_after_deallocate = $count_before
+--source include/assert.inc
+--enable_query_log
+
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_param_shape;

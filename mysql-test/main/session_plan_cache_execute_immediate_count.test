@@ -1,0 +1,63 @@
+--source include/have_innodb.inc
+
+CREATE TABLE pc_exec_immediate (
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+
+INSERT INTO pc_exec_immediate VALUES (1,10),(2,20);
+
+SET @@session.session_plan_cache = ON;
+
+--disable_query_log
+let $count_before= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+--enable_query_log
+
+--echo # EXECUTE IMMEDIATE releases any transient cached state after execution
+SET @p=1;
+EXECUTE IMMEDIATE
+  'SELECT id, v FROM pc_exec_immediate WHERE id = ?'
+  USING @p;
+
+--disable_query_log
+let $count_after_first= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after first EXECUTE IMMEDIATE
+--let $assert_cond= $count_after_first = $count_before
+--source include/assert.inc
+--enable_query_log
+
+--echo # Repeating EXECUTE IMMEDIATE does not reuse a persistent cached state
+SET @p=2;
+EXECUTE IMMEDIATE
+  'SELECT id, v FROM pc_exec_immediate WHERE id = ?'
+  USING @p;
+
+--disable_query_log
+let $count_after_second= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_second= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_second= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_after_second= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count remains at baseline after repeated EXECUTE IMMEDIATE
+--let $assert_cond= $count_after_second = $count_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits does not grow for EXECUTE IMMEDIATE
+--let $assert_cond= $hits_after_second = $hits_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for EXECUTE IMMEDIATE
+--let $assert_cond= $prevalidations_after_second = $prevalidations_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations does not grow for EXECUTE IMMEDIATE cleanup
+--let $assert_cond= $invalidations_after_second = $invalidations_before
+--source include/assert.inc
+--enable_query_log
+
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_exec_immediate;

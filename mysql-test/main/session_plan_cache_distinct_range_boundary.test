@@ -1,0 +1,180 @@
+--source include/have_innodb.inc
+
+CREATE TABLE pc_distinct_range_boundary (
+  id INT NOT NULL PRIMARY KEY,
+  c CHAR(10) NOT NULL,
+  pad CHAR(10) NOT NULL
+) ENGINE=InnoDB;
+
+INSERT INTO pc_distinct_range_boundary VALUES
+  (1, 'c3', 'p1'), (2, 'c1', 'p2'), (3, 'c2', 'p3'),
+  (4, 'c1', 'p4'), (5, 'c4', 'p5'), (6, 'c2', 'p6');
+
+SET @@session.session_plan_cache = ON;
+SET @save_ratio=@@session.session_plan_cache_allow_change_ratio;
+SET @@session.session_plan_cache_allow_change_ratio = 0;
+
+--disable_query_log
+let $count_before= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+--enable_query_log
+
+--echo # DISTINCT range with an extra selected column remains fail-closed
+PREPARE stmt FROM
+  'SELECT DISTINCT c, pad FROM pc_distinct_range_boundary WHERE id BETWEEN ? AND ? ORDER BY c';
+SET @lo=1;
+SET @hi=4;
+--disable_result_log
+EXECUTE stmt USING @lo, @hi;
+SET @lo=2;
+SET @hi=6;
+EXECUTE stmt USING @lo, @hi;
+--enable_result_log
+DEALLOCATE PREPARE stmt;
+
+--disable_query_log
+let $count_after_extra_column= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_extra_column= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_extra_column= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= DISTINCT range extra-column boundary does not create cached state
+--let $assert_cond= $count_after_extra_column = $count_before
+--source include/assert.inc
+
+--let $assert_text= DISTINCT range extra-column boundary does not add hits
+--let $assert_cond= $hits_after_extra_column = $hits_before
+--source include/assert.inc
+
+--let $assert_text= DISTINCT range extra-column boundary does not add prevalidations
+--let $assert_cond= $prevalidations_after_extra_column = $prevalidations_before
+--source include/assert.inc
+--enable_query_log
+
+--echo # DISTINCT range with GROUP BY remains fail-closed
+PREPARE stmt FROM
+  'SELECT DISTINCT c FROM pc_distinct_range_boundary WHERE id BETWEEN ? AND ? GROUP BY c ORDER BY c';
+SET @lo=1;
+SET @hi=4;
+--disable_result_log
+EXECUTE stmt USING @lo, @hi;
+SET @lo=2;
+SET @hi=6;
+EXECUTE stmt USING @lo, @hi;
+--enable_result_log
+DEALLOCATE PREPARE stmt;
+
+--disable_query_log
+let $count_after_group= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_group= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_group= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= DISTINCT range GROUP BY boundary does not create cached state
+--let $assert_cond= $count_after_group = $count_before
+--source include/assert.inc
+
+--let $assert_text= DISTINCT range GROUP BY boundary does not add hits
+--let $assert_cond= $hits_after_group = $hits_before
+--source include/assert.inc
+
+--let $assert_text= DISTINCT range GROUP BY boundary does not add prevalidations
+--let $assert_cond= $prevalidations_after_group = $prevalidations_before
+--source include/assert.inc
+--enable_query_log
+
+--echo # DISTINCT range with HAVING remains fail-closed
+PREPARE stmt FROM
+  'SELECT DISTINCT c FROM pc_distinct_range_boundary WHERE id BETWEEN ? AND ? HAVING c IS NOT NULL ORDER BY c';
+SET @lo=1;
+SET @hi=4;
+--disable_result_log
+EXECUTE stmt USING @lo, @hi;
+SET @lo=2;
+SET @hi=6;
+EXECUTE stmt USING @lo, @hi;
+--enable_result_log
+DEALLOCATE PREPARE stmt;
+
+--disable_query_log
+let $count_after_having= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_having= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_having= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= DISTINCT range HAVING boundary does not create cached state
+--let $assert_cond= $count_after_having = $count_before
+--source include/assert.inc
+
+--let $assert_text= DISTINCT range HAVING boundary does not add hits
+--let $assert_cond= $hits_after_having = $hits_before
+--source include/assert.inc
+
+--let $assert_text= DISTINCT range HAVING boundary does not add prevalidations
+--let $assert_cond= $prevalidations_after_having = $prevalidations_before
+--source include/assert.inc
+--enable_query_log
+
+--echo # DISTINCT range with a window function remains fail-closed
+PREPARE stmt FROM
+  'SELECT DISTINCT c, ROW_NUMBER() OVER (ORDER BY c) AS rn FROM pc_distinct_range_boundary WHERE id BETWEEN ? AND ? ORDER BY c';
+SET @lo=1;
+SET @hi=4;
+--disable_result_log
+EXECUTE stmt USING @lo, @hi;
+SET @lo=2;
+SET @hi=6;
+EXECUTE stmt USING @lo, @hi;
+--enable_result_log
+DEALLOCATE PREPARE stmt;
+
+--disable_query_log
+let $count_after_window= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_window= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_window= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= DISTINCT range window boundary does not create cached state
+--let $assert_cond= $count_after_window = $count_before
+--source include/assert.inc
+
+--let $assert_text= DISTINCT range window boundary does not add hits
+--let $assert_cond= $hits_after_window = $hits_before
+--source include/assert.inc
+
+--let $assert_text= DISTINCT range window boundary does not add prevalidations
+--let $assert_cond= $prevalidations_after_window = $prevalidations_before
+--source include/assert.inc
+--enable_query_log
+
+--echo # Aggregate GROUP BY range remains fail-closed
+PREPARE stmt FROM
+  'SELECT c, COUNT(*) FROM pc_distinct_range_boundary WHERE id BETWEEN ? AND ? GROUP BY c ORDER BY c';
+SET @lo=1;
+SET @hi=4;
+--disable_result_log
+EXECUTE stmt USING @lo, @hi;
+SET @lo=2;
+SET @hi=6;
+EXECUTE stmt USING @lo, @hi;
+--enable_result_log
+DEALLOCATE PREPARE stmt;
+
+--disable_query_log
+let $count_after_aggregate_group= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_aggregate_group= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_aggregate_group= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= aggregate GROUP BY range boundary does not create cached state
+--let $assert_cond= $count_after_aggregate_group = $count_before
+--source include/assert.inc
+
+--let $assert_text= aggregate GROUP BY range boundary does not add hits
+--let $assert_cond= $hits_after_aggregate_group = $hits_before
+--source include/assert.inc
+
+--let $assert_text= aggregate GROUP BY range boundary does not add prevalidations
+--let $assert_cond= $prevalidations_after_aggregate_group = $prevalidations_before
+--source include/assert.inc
+--enable_query_log
+
+SET @@session.session_plan_cache_allow_change_ratio = @save_ratio;
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_distinct_range_boundary;

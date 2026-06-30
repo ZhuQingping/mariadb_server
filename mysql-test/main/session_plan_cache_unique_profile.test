@@ -1,0 +1,78 @@
+--source include/have_innodb.inc
+
+CREATE TABLE pc_unique_profile (
+  id INT NOT NULL PRIMARY KEY,
+  c CHAR(10) NOT NULL
+) ENGINE=InnoDB;
+
+INSERT INTO pc_unique_profile VALUES
+  (1, 'a'), (2, 'b'), (3, 'c');
+
+SET @@session.session_plan_cache = ON;
+SET @save_ratio=@@session.session_plan_cache_allow_change_ratio;
+SET @save_profile=@@session.session_plan_cache_profile;
+SET @@session.session_plan_cache_allow_change_ratio = 0;
+SET @@session.session_plan_cache_profile = ON;
+
+--disable_query_log
+let $hits_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $unique_hits_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_unique_count', Value, 1);
+let $unique_build_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_unique_build_us', Value, 1);
+let $unique_alloc_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_unique_alloc_us', Value, 1);
+let $unique_setup_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_unique_setup_plan_us', Value, 1);
+--enable_query_log
+
+PREPARE stmt FROM 'SELECT c FROM pc_unique_profile WHERE id = ?';
+
+--echo # First execution creates the state; later executions are profiled unique hits
+SET @id=1;
+--disable_result_log
+--disable_query_log
+EXECUTE stmt USING @id;
+
+let $i= 50;
+while ($i)
+{
+  SET @id=2;
+  EXECUTE stmt USING @id;
+  SET @id=3;
+  EXECUTE stmt USING @id;
+  dec $i;
+}
+--enable_query_log
+--enable_result_log
+
+--disable_query_log
+let $hits_after= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $unique_hits_after= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_unique_count', Value, 1);
+let $unique_build_after= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_unique_build_us', Value, 1);
+let $unique_alloc_after= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_unique_alloc_us', Value, 1);
+let $unique_setup_after= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_profile_hit_unique_setup_plan_us', Value, 1);
+
+--let $assert_text= profiled unique lookup records repeated cache hits
+--let $assert_cond= $hits_after >= $hits_before + 50
+--source include/assert.inc
+
+--let $assert_text= profiled unique lookup increments unique hit counter
+--let $assert_cond= $unique_hits_after >= $unique_hits_before + 50
+--source include/assert.inc
+
+--let $assert_text= profiled unique lookup records aggregate build time
+--let $assert_cond= $unique_build_after > $unique_build_before
+--source include/assert.inc
+
+--let $assert_text= profiled unique lookup records allocation time
+--let $assert_cond= $unique_alloc_after > $unique_alloc_before
+--source include/assert.inc
+
+--let $assert_text= profiled unique lookup records setup time
+--let $assert_cond= $unique_setup_after > $unique_setup_before
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt;
+
+SET @@session.session_plan_cache_profile = @save_profile;
+SET @@session.session_plan_cache_allow_change_ratio = @save_ratio;
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_unique_profile;

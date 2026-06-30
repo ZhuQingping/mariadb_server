@@ -1,0 +1,46 @@
+CREATE TABLE pc_binary_smoke (
+id INT NOT NULL PRIMARY KEY,
+pad CHAR(10)
+) ENGINE=InnoDB;
+INSERT INTO pc_binary_smoke VALUES (1, 'a'), (2, 'b');
+PREPARE stmt_disabled FROM 'SELECT pad FROM pc_binary_smoke WHERE id = ?';
+# Default-off execution should not create plan-cache state
+SET @p=1;
+EXECUTE stmt_disabled USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_disabled USING @p;
+pad
+b
+include/assert.inc [Cached_plan_count does not grow while plan cache is disabled]
+include/assert.inc [Cached_plan_hits does not grow while plan cache is disabled]
+include/assert.inc [Cached_plan_prevalidations does not grow while plan cache is disabled]
+DEALLOCATE PREPARE stmt_disabled;
+SET @@session.session_plan_cache = ON;
+SET @save_ratio=@@session.session_plan_cache_allow_change_ratio;
+SET @@session.session_plan_cache_allow_change_ratio = 0;
+PREPARE stmt_hit FROM 'SELECT pad FROM pc_binary_smoke WHERE id = ?';
+# First enabled execute creates state; later executes use the real-hit path
+SET @p=1;
+EXECUTE stmt_hit USING @p;
+pad
+a
+include/assert.inc [Cached_plan_count grows after first binary-protocol smoke execute]
+include/assert.inc [Cached_plan_hits does not grow on first binary-protocol smoke execute]
+include/assert.inc [Cached_plan_prevalidations does not grow on first binary-protocol smoke execute]
+SET @p=2;
+EXECUTE stmt_hit USING @p;
+pad
+b
+SET @p=42;
+EXECUTE stmt_hit USING @p;
+pad
+include/assert.inc [Cached_plan_count keeps one binary-protocol smoke state]
+include/assert.inc [Cached_plan_prevalidations grows for binary-protocol smoke hits]
+include/assert.inc [Cached_plan_hits grows for binary-protocol smoke hits]
+DEALLOCATE PREPARE stmt_hit;
+include/assert.inc [Cached_plan_count returns to baseline after binary-protocol smoke deallocate]
+SET @@session.session_plan_cache_allow_change_ratio = @save_ratio;
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_binary_smoke;

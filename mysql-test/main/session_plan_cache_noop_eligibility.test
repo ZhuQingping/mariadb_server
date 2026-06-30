@@ -1,0 +1,197 @@
+--source include/have_innodb.inc
+
+CREATE TABLE pc_t1 (
+  id INT PRIMARY KEY,
+  v INT,
+  KEY(v)
+) ENGINE=InnoDB;
+
+CREATE TABLE pc_t2 (
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+
+INSERT INTO pc_t1 VALUES (1,10),(2,20),(3,20);
+INSERT INTO pc_t2 VALUES (1,100),(2,200);
+
+--echo # session_plan_cache OFF: prepared SELECTs are no-ops for plan cache
+SET @@session.session_plan_cache = OFF;
+
+--disable_query_log
+let $count_before= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $invalidations_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+--enable_query_log
+
+--echo # supported-shape single-table SELECT
+PREPARE stmt FROM 'SELECT id, v FROM pc_t1 WHERE id = ?';
+SET @p=2;
+EXECUTE stmt USING @p;
+SET @p=3;
+EXECUTE stmt USING @p;
+DEALLOCATE PREPARE stmt;
+
+--echo # unsupported join
+PREPARE stmt FROM 'SELECT pc_t1.id, pc_t2.v FROM pc_t1 JOIN pc_t2 ON pc_t2.id = pc_t1.id WHERE pc_t1.id = ?';
+SET @p=1;
+EXECUTE stmt USING @p;
+DEALLOCATE PREPARE stmt;
+
+--echo # unsupported derived table
+PREPARE stmt FROM 'SELECT id FROM (SELECT id FROM pc_t1 WHERE v = ?) AS d ORDER BY id';
+SET @p=20;
+EXECUTE stmt USING @p;
+DEALLOCATE PREPARE stmt;
+
+--echo # unsupported union
+PREPARE stmt FROM 'SELECT id FROM pc_t1 WHERE id = ? UNION SELECT id FROM pc_t2 WHERE id = ? ORDER BY id';
+SET @p1=1;
+SET @p2=2;
+EXECUTE stmt USING @p1, @p2;
+DEALLOCATE PREPARE stmt;
+
+--echo # unsupported temporary table
+CREATE TEMPORARY TABLE pc_tmp (id INT PRIMARY KEY, v INT) ENGINE=MEMORY;
+INSERT INTO pc_tmp VALUES (1,10),(2,20);
+PREPARE stmt FROM 'SELECT id FROM pc_tmp WHERE v = ?';
+SET @p=20;
+EXECUTE stmt USING @p;
+DEALLOCATE PREPARE stmt;
+DROP TEMPORARY TABLE pc_tmp;
+
+--echo # unsupported order by
+PREPARE stmt FROM 'SELECT id FROM pc_t1 WHERE v >= ? ORDER BY id DESC';
+SET @p=10;
+EXECUTE stmt USING @p;
+DEALLOCATE PREPARE stmt;
+
+--echo # unsupported group by
+PREPARE stmt FROM 'SELECT v, COUNT(*) FROM pc_t1 WHERE v >= ? GROUP BY v ORDER BY v';
+SET @p=10;
+EXECUTE stmt USING @p;
+DEALLOCATE PREPARE stmt;
+
+--echo # unsupported user variable
+PREPARE stmt FROM 'SELECT @uv := v FROM pc_t1 WHERE id = ?';
+SET @uv=0;
+SET @p=1;
+EXECUTE stmt USING @p;
+SELECT @uv;
+DEALLOCATE PREPARE stmt;
+
+--echo # unsupported scalar subquery
+PREPARE stmt FROM 'SELECT id, (SELECT MAX(v) FROM pc_t2) AS m FROM pc_t1 WHERE id = ?';
+SET @p=1;
+EXECUTE stmt USING @p;
+DEALLOCATE PREPARE stmt;
+
+--disable_query_log
+let $count_after= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $invalidations_after= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count does not grow with session_plan_cache OFF
+--let $assert_cond= $count_after = $count_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits does not grow with session_plan_cache OFF
+--let $assert_cond= $hits_after = $hits_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations does not grow with session_plan_cache OFF
+--let $assert_cond= $invalidations_after = $invalidations_before
+--source include/assert.inc
+--enable_query_log
+
+--echo # session_plan_cache ON: supported shape can hit, unsupported shapes stay fail-closed
+SET @@session.session_plan_cache = ON;
+
+--disable_query_log
+let $count_before= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $invalidations_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+--enable_query_log
+
+--echo # supported-shape single-table SELECT
+PREPARE stmt FROM 'SELECT id, v FROM pc_t1 WHERE id = ?';
+SET @p=2;
+EXECUTE stmt USING @p;
+SET @p=3;
+EXECUTE stmt USING @p;
+DEALLOCATE PREPARE stmt;
+
+--echo # unsupported join
+PREPARE stmt FROM 'SELECT pc_t1.id, pc_t2.v FROM pc_t1 JOIN pc_t2 ON pc_t2.id = pc_t1.id WHERE pc_t1.id = ?';
+SET @p=1;
+EXECUTE stmt USING @p;
+DEALLOCATE PREPARE stmt;
+
+--echo # unsupported derived table
+PREPARE stmt FROM 'SELECT id FROM (SELECT id FROM pc_t1 WHERE v = ?) AS d ORDER BY id';
+SET @p=20;
+EXECUTE stmt USING @p;
+DEALLOCATE PREPARE stmt;
+
+--echo # unsupported union
+PREPARE stmt FROM 'SELECT id FROM pc_t1 WHERE id = ? UNION SELECT id FROM pc_t2 WHERE id = ? ORDER BY id';
+SET @p1=1;
+SET @p2=2;
+EXECUTE stmt USING @p1, @p2;
+DEALLOCATE PREPARE stmt;
+
+--echo # unsupported temporary table
+CREATE TEMPORARY TABLE pc_tmp (id INT PRIMARY KEY, v INT) ENGINE=MEMORY;
+INSERT INTO pc_tmp VALUES (1,10),(2,20);
+PREPARE stmt FROM 'SELECT id FROM pc_tmp WHERE v = ?';
+SET @p=20;
+EXECUTE stmt USING @p;
+DEALLOCATE PREPARE stmt;
+DROP TEMPORARY TABLE pc_tmp;
+
+--echo # unsupported order by
+PREPARE stmt FROM 'SELECT id FROM pc_t1 WHERE v >= ? ORDER BY id DESC';
+SET @p=10;
+EXECUTE stmt USING @p;
+DEALLOCATE PREPARE stmt;
+
+--echo # unsupported group by
+PREPARE stmt FROM 'SELECT v, COUNT(*) FROM pc_t1 WHERE v >= ? GROUP BY v ORDER BY v';
+SET @p=10;
+EXECUTE stmt USING @p;
+DEALLOCATE PREPARE stmt;
+
+--echo # unsupported user variable
+PREPARE stmt FROM 'SELECT @uv := v FROM pc_t1 WHERE id = ?';
+SET @uv=0;
+SET @p=1;
+EXECUTE stmt USING @p;
+SELECT @uv;
+DEALLOCATE PREPARE stmt;
+
+--echo # unsupported scalar subquery
+PREPARE stmt FROM 'SELECT id, (SELECT MAX(v) FROM pc_t2) AS m FROM pc_t1 WHERE id = ?';
+SET @p=1;
+EXECUTE stmt USING @p;
+DEALLOCATE PREPARE stmt;
+
+--disable_query_log
+let $count_after= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $invalidations_after= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count does not grow with session_plan_cache ON
+--let $assert_cond= $count_after = $count_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits grows only for supported shape with session_plan_cache ON
+--let $assert_cond= $hits_after = $hits_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations does not grow with session_plan_cache ON
+--let $assert_cond= $invalidations_after = $invalidations_before
+--source include/assert.inc
+--enable_query_log
+
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_t2;
+DROP TABLE pc_t1;

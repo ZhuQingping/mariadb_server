@@ -1,0 +1,90 @@
+--source include/have_innodb.inc
+
+CREATE TABLE pc_explain_analyze (
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+
+INSERT INTO pc_explain_analyze VALUES (1,10),(2,20);
+
+SET @@session.session_plan_cache = ON;
+
+--disable_query_log
+let $count_before= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+--enable_query_log
+
+--echo # Prepared EXPLAIN SELECT is not a plan-cache candidate
+PREPARE stmt FROM
+  'EXPLAIN SELECT id, v FROM pc_explain_analyze WHERE id = ?';
+SET @p=1;
+--disable_result_log
+EXECUTE stmt USING @p;
+SET @p=2;
+EXECUTE stmt USING @p;
+--enable_result_log
+
+--disable_query_log
+let $count_after_explain= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_explain= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_explain= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_after_explain= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count does not grow for prepared EXPLAIN SELECT
+--let $assert_cond= $count_after_explain = $count_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits does not grow for prepared EXPLAIN SELECT
+--let $assert_cond= $hits_after_explain = $hits_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for prepared EXPLAIN SELECT
+--let $assert_cond= $prevalidations_after_explain = $prevalidations_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations does not grow for prepared EXPLAIN SELECT
+--let $assert_cond= $invalidations_after_explain = $invalidations_before
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt;
+
+--echo # Prepared ANALYZE SELECT is not a plan-cache candidate
+PREPARE stmt FROM
+  'ANALYZE SELECT id, v FROM pc_explain_analyze WHERE id = ?';
+SET @p=1;
+--disable_result_log
+EXECUTE stmt USING @p;
+SET @p=2;
+EXECUTE stmt USING @p;
+--enable_result_log
+
+--disable_query_log
+let $count_after_analyze= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_analyze= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_analyze= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_after_analyze= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count does not grow for prepared ANALYZE SELECT
+--let $assert_cond= $count_after_analyze = $count_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits does not grow for prepared ANALYZE SELECT
+--let $assert_cond= $hits_after_analyze = $hits_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow for prepared ANALYZE SELECT
+--let $assert_cond= $prevalidations_after_analyze = $prevalidations_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations does not grow for prepared ANALYZE SELECT
+--let $assert_cond= $invalidations_after_analyze = $invalidations_before
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt;
+
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_explain_analyze;

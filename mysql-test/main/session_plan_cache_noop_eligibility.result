@@ -1,0 +1,184 @@
+CREATE TABLE pc_t1 (
+id INT PRIMARY KEY,
+v INT,
+KEY(v)
+) ENGINE=InnoDB;
+CREATE TABLE pc_t2 (
+id INT PRIMARY KEY,
+v INT
+) ENGINE=InnoDB;
+INSERT INTO pc_t1 VALUES (1,10),(2,20),(3,20);
+INSERT INTO pc_t2 VALUES (1,100),(2,200);
+# session_plan_cache OFF: prepared SELECTs are no-ops for plan cache
+SET @@session.session_plan_cache = OFF;
+# supported-shape single-table SELECT
+PREPARE stmt FROM 'SELECT id, v FROM pc_t1 WHERE id = ?';
+SET @p=2;
+EXECUTE stmt USING @p;
+id	v
+2	20
+SET @p=3;
+EXECUTE stmt USING @p;
+id	v
+3	20
+DEALLOCATE PREPARE stmt;
+# unsupported join
+PREPARE stmt FROM 'SELECT pc_t1.id, pc_t2.v FROM pc_t1 JOIN pc_t2 ON pc_t2.id = pc_t1.id WHERE pc_t1.id = ?';
+SET @p=1;
+EXECUTE stmt USING @p;
+id	v
+1	100
+DEALLOCATE PREPARE stmt;
+# unsupported derived table
+PREPARE stmt FROM 'SELECT id FROM (SELECT id FROM pc_t1 WHERE v = ?) AS d ORDER BY id';
+SET @p=20;
+EXECUTE stmt USING @p;
+id
+2
+3
+DEALLOCATE PREPARE stmt;
+# unsupported union
+PREPARE stmt FROM 'SELECT id FROM pc_t1 WHERE id = ? UNION SELECT id FROM pc_t2 WHERE id = ? ORDER BY id';
+SET @p1=1;
+SET @p2=2;
+EXECUTE stmt USING @p1, @p2;
+id
+1
+2
+DEALLOCATE PREPARE stmt;
+# unsupported temporary table
+CREATE TEMPORARY TABLE pc_tmp (id INT PRIMARY KEY, v INT) ENGINE=MEMORY;
+INSERT INTO pc_tmp VALUES (1,10),(2,20);
+PREPARE stmt FROM 'SELECT id FROM pc_tmp WHERE v = ?';
+SET @p=20;
+EXECUTE stmt USING @p;
+id
+2
+DEALLOCATE PREPARE stmt;
+DROP TEMPORARY TABLE pc_tmp;
+# unsupported order by
+PREPARE stmt FROM 'SELECT id FROM pc_t1 WHERE v >= ? ORDER BY id DESC';
+SET @p=10;
+EXECUTE stmt USING @p;
+id
+3
+2
+1
+DEALLOCATE PREPARE stmt;
+# unsupported group by
+PREPARE stmt FROM 'SELECT v, COUNT(*) FROM pc_t1 WHERE v >= ? GROUP BY v ORDER BY v';
+SET @p=10;
+EXECUTE stmt USING @p;
+v	COUNT(*)
+10	1
+20	2
+DEALLOCATE PREPARE stmt;
+# unsupported user variable
+PREPARE stmt FROM 'SELECT @uv := v FROM pc_t1 WHERE id = ?';
+SET @uv=0;
+SET @p=1;
+EXECUTE stmt USING @p;
+@uv := v
+10
+SELECT @uv;
+@uv
+10
+DEALLOCATE PREPARE stmt;
+# unsupported scalar subquery
+PREPARE stmt FROM 'SELECT id, (SELECT MAX(v) FROM pc_t2) AS m FROM pc_t1 WHERE id = ?';
+SET @p=1;
+EXECUTE stmt USING @p;
+id	m
+1	200
+DEALLOCATE PREPARE stmt;
+include/assert.inc [Cached_plan_count does not grow with session_plan_cache OFF]
+include/assert.inc [Cached_plan_hits does not grow with session_plan_cache OFF]
+include/assert.inc [Cached_plan_invalidations does not grow with session_plan_cache OFF]
+# session_plan_cache ON: supported shape can hit, unsupported shapes stay fail-closed
+SET @@session.session_plan_cache = ON;
+# supported-shape single-table SELECT
+PREPARE stmt FROM 'SELECT id, v FROM pc_t1 WHERE id = ?';
+SET @p=2;
+EXECUTE stmt USING @p;
+id	v
+2	20
+SET @p=3;
+EXECUTE stmt USING @p;
+id	v
+3	20
+DEALLOCATE PREPARE stmt;
+# unsupported join
+PREPARE stmt FROM 'SELECT pc_t1.id, pc_t2.v FROM pc_t1 JOIN pc_t2 ON pc_t2.id = pc_t1.id WHERE pc_t1.id = ?';
+SET @p=1;
+EXECUTE stmt USING @p;
+id	v
+1	100
+DEALLOCATE PREPARE stmt;
+# unsupported derived table
+PREPARE stmt FROM 'SELECT id FROM (SELECT id FROM pc_t1 WHERE v = ?) AS d ORDER BY id';
+SET @p=20;
+EXECUTE stmt USING @p;
+id
+2
+3
+DEALLOCATE PREPARE stmt;
+# unsupported union
+PREPARE stmt FROM 'SELECT id FROM pc_t1 WHERE id = ? UNION SELECT id FROM pc_t2 WHERE id = ? ORDER BY id';
+SET @p1=1;
+SET @p2=2;
+EXECUTE stmt USING @p1, @p2;
+id
+1
+2
+DEALLOCATE PREPARE stmt;
+# unsupported temporary table
+CREATE TEMPORARY TABLE pc_tmp (id INT PRIMARY KEY, v INT) ENGINE=MEMORY;
+INSERT INTO pc_tmp VALUES (1,10),(2,20);
+PREPARE stmt FROM 'SELECT id FROM pc_tmp WHERE v = ?';
+SET @p=20;
+EXECUTE stmt USING @p;
+id
+2
+DEALLOCATE PREPARE stmt;
+DROP TEMPORARY TABLE pc_tmp;
+# unsupported order by
+PREPARE stmt FROM 'SELECT id FROM pc_t1 WHERE v >= ? ORDER BY id DESC';
+SET @p=10;
+EXECUTE stmt USING @p;
+id
+3
+2
+1
+DEALLOCATE PREPARE stmt;
+# unsupported group by
+PREPARE stmt FROM 'SELECT v, COUNT(*) FROM pc_t1 WHERE v >= ? GROUP BY v ORDER BY v';
+SET @p=10;
+EXECUTE stmt USING @p;
+v	COUNT(*)
+10	1
+20	2
+DEALLOCATE PREPARE stmt;
+# unsupported user variable
+PREPARE stmt FROM 'SELECT @uv := v FROM pc_t1 WHERE id = ?';
+SET @uv=0;
+SET @p=1;
+EXECUTE stmt USING @p;
+@uv := v
+10
+SELECT @uv;
+@uv
+10
+DEALLOCATE PREPARE stmt;
+# unsupported scalar subquery
+PREPARE stmt FROM 'SELECT id, (SELECT MAX(v) FROM pc_t2) AS m FROM pc_t1 WHERE id = ?';
+SET @p=1;
+EXECUTE stmt USING @p;
+id	m
+1	200
+DEALLOCATE PREPARE stmt;
+include/assert.inc [Cached_plan_count does not grow with session_plan_cache ON]
+include/assert.inc [Cached_plan_hits grows only for supported shape with session_plan_cache ON]
+include/assert.inc [Cached_plan_invalidations does not grow with session_plan_cache ON]
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_t2;
+DROP TABLE pc_t1;

@@ -1,0 +1,394 @@
+--source include/have_innodb.inc
+
+CREATE TABLE pc_rh_boundary (
+  id INT NOT NULL PRIMARY KEY,
+  u INT NOT NULL,
+  pad CHAR(10),
+  UNIQUE KEY u_key(u)
+) ENGINE=InnoDB;
+
+CREATE TABLE pc_rh_nullable_ddl (
+  id INT NOT NULL PRIMARY KEY,
+  u INT NOT NULL,
+  pad CHAR(10),
+  UNIQUE KEY u_key(u)
+) ENGINE=InnoDB;
+
+CREATE TABLE pc_rh_charset_ddl (
+  c VARCHAR(20) NOT NULL,
+  pad CHAR(10),
+  UNIQUE KEY c_key(c)
+) ENGINE=InnoDB DEFAULT CHARSET latin1 COLLATE latin1_swedish_ci;
+
+CREATE TABLE pc_rh_type_boundary (
+  id INT NOT NULL PRIMARY KEY,
+  pad CHAR(10)
+) ENGINE=InnoDB;
+
+CREATE TABLE pc_rh_secondary_mutation (
+  id INT NOT NULL PRIMARY KEY,
+  u INT NOT NULL,
+  pad CHAR(10),
+  UNIQUE KEY u_key(u)
+) ENGINE=InnoDB;
+
+CREATE TABLE pc_rh_promote_ddl (
+  id INT NOT NULL PRIMARY KEY,
+  u INT NOT NULL,
+  pad CHAR(10),
+  KEY u_key(u)
+) ENGINE=InnoDB;
+
+INSERT INTO pc_rh_boundary VALUES (1, 10, 'a'), (2, 20, 'b');
+INSERT INTO pc_rh_nullable_ddl VALUES (1, 100, 'n1'), (2, 200, 'n2');
+INSERT INTO pc_rh_charset_ddl VALUES ('m', 'cm'), ('n', 'cn');
+INSERT INTO pc_rh_type_boundary VALUES (7, 'seven'), (8, 'eight');
+INSERT INTO pc_rh_secondary_mutation VALUES
+  (1, 1000, 's1'), (2, 2000, 's2');
+INSERT INTO pc_rh_promote_ddl VALUES (1, 111, 'p1'), (2, 222, 'p2');
+
+SET @@session.session_plan_cache = ON;
+SET @save_ratio= @@session.session_plan_cache_allow_change_ratio;
+SET @@session.session_plan_cache_allow_change_ratio = 0;
+
+--disable_query_log
+let $count_before= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+--enable_query_log
+
+PREPARE stmt_empty FROM 'SELECT pad FROM pc_rh_boundary WHERE id = ?';
+
+--echo # First execute creates a zero-result state
+SET @p=42;
+EXECUTE stmt_empty USING @p;
+
+--echo # Inserting the missing row should not reuse the zero-result shape as a hit
+INSERT INTO pc_rh_boundary VALUES (42, 420, 'z');
+EXECUTE stmt_empty USING @p;
+
+--echo # The replacement non-empty state can hit on the next execute
+EXECUTE stmt_empty USING @p;
+
+--disable_query_log
+let $count_after_empty= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_empty= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_empty= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_after_empty= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count keeps one replacement state after zero-result boundary
+--let $assert_cond= $count_after_empty = $count_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits grows only after zero-result state replacement
+--let $assert_cond= $hits_after_empty = $hits_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations grows only after zero-result replacement
+--let $assert_cond= $prevalidations_after_empty = $prevalidations_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations does not grow for zero-result no-state boundary
+--let $assert_cond= $invalidations_after_empty = $invalidations_before
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_empty;
+
+--disable_query_log
+let $count_after_empty_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after zero-result boundary deallocate
+--let $assert_cond= $count_after_empty_deallocate = $count_before
+--source include/assert.inc
+--enable_query_log
+
+PREPARE stmt_mutation FROM 'SELECT pad FROM pc_rh_boundary WHERE id = ?';
+
+--echo # Real hits must read current row contents, not stale cached record data
+SET @p=1;
+EXECUTE stmt_mutation USING @p;
+UPDATE pc_rh_boundary SET pad='aa' WHERE id=1;
+EXECUTE stmt_mutation USING @p;
+DELETE FROM pc_rh_boundary WHERE id=1;
+EXECUTE stmt_mutation USING @p;
+INSERT INTO pc_rh_boundary VALUES (1, 10, 'aaa');
+EXECUTE stmt_mutation USING @p;
+UPDATE pc_rh_boundary SET id=3 WHERE id=1;
+EXECUTE stmt_mutation USING @p;
+SET @p=3;
+EXECUTE stmt_mutation USING @p;
+
+--disable_query_log
+let $count_after_mutation= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_mutation= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_mutation= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count keeps one state across row mutations when ratio is zero
+--let $assert_cond= $count_after_mutation = $count_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits grows across update delete insert and key-change row-boundary hits
+--let $assert_cond= $hits_after_mutation = $hits_after_empty + 5
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations grows across row-boundary hits
+--let $assert_cond= $prevalidations_after_mutation = $prevalidations_after_empty + 5
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_mutation;
+
+--disable_query_log
+let $count_after_mutation_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after row mutation deallocate
+--let $assert_cond= $count_after_mutation_deallocate = $count_before
+--source include/assert.inc
+--enable_query_log
+
+PREPARE stmt_ddl FROM 'SELECT pad FROM pc_rh_boundary WHERE u = ?';
+
+--echo # Replacing a unique key with a non-unique key should invalidate and rebuild a ref state
+SET @p=20;
+EXECUTE stmt_ddl USING @p;
+ALTER TABLE pc_rh_boundary DROP INDEX u_key, ADD INDEX u_key(u);
+EXECUTE stmt_ddl USING @p;
+EXECUTE stmt_ddl USING @p;
+
+--disable_query_log
+let $count_after_ddl= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_ddl= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_ddl= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_after_ddl= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count keeps a ref state after unique key is replaced by non-unique key
+--let $assert_cond= $count_after_ddl = $count_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits grows after unique key is replaced by non-unique key
+--let $assert_cond= $hits_after_ddl = $hits_after_mutation + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations grows after unique key is replaced by non-unique key
+--let $assert_cond= $prevalidations_after_ddl = $prevalidations_after_mutation + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations grows after DDL reprepare
+--let $assert_cond= $invalidations_after_ddl = $invalidations_after_empty + 1
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_ddl;
+
+--disable_query_log
+let $count_after_ddl_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after unique-to-ref DDL deallocate
+--let $assert_cond= $count_after_ddl_deallocate = $count_before
+--source include/assert.inc
+--enable_query_log
+
+PREPARE stmt_nullable_ddl FROM
+  'SELECT pad FROM pc_rh_nullable_ddl WHERE u = ?';
+
+--echo # Making a unique key nullable should invalidate and avoid recipe-less replacement state
+SET @p=200;
+EXECUTE stmt_nullable_ddl USING @p;
+EXECUTE stmt_nullable_ddl USING @p;
+ALTER TABLE pc_rh_nullable_ddl MODIFY u INT NULL;
+EXECUTE stmt_nullable_ddl USING @p;
+EXECUTE stmt_nullable_ddl USING @p;
+
+--disable_query_log
+let $count_after_nullable_ddl= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_nullable_ddl= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_nullable_ddl= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_after_nullable_ddl= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after nullable-key DDL
+--let $assert_cond= $count_after_nullable_ddl = $count_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits grows only before nullable-key DDL
+--let $assert_cond= $hits_after_nullable_ddl = $hits_after_ddl + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations grows only before nullable-key DDL
+--let $assert_cond= $prevalidations_after_nullable_ddl = $prevalidations_after_ddl + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations grows after nullable-key DDL reprepare
+--let $assert_cond= $invalidations_after_nullable_ddl = $invalidations_after_ddl + 1
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_nullable_ddl;
+
+PREPARE stmt_charset_ddl FROM
+  'SELECT pad FROM pc_rh_charset_ddl WHERE c = ?';
+
+--echo # Character metadata DDL should invalidate old string-key state before a new hit is possible
+SET @p='m';
+EXECUTE stmt_charset_ddl USING @p;
+EXECUTE stmt_charset_ddl USING @p;
+ALTER TABLE pc_rh_charset_ddl
+  MODIFY c VARCHAR(30) CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci
+  NOT NULL;
+EXECUTE stmt_charset_ddl USING @p;
+EXECUTE stmt_charset_ddl USING @p;
+
+--disable_query_log
+let $count_after_charset_ddl= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_charset_ddl= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_charset_ddl= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_after_charset_ddl= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after character metadata DDL
+--let $assert_cond= $count_after_charset_ddl = $count_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits grows only before character metadata DDL
+--let $assert_cond= $hits_after_charset_ddl = $hits_after_nullable_ddl + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations grows only before character metadata DDL
+--let $assert_cond= $prevalidations_after_charset_ddl = $prevalidations_after_nullable_ddl + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations grows after character metadata DDL reprepare
+--let $assert_cond= $invalidations_after_charset_ddl = $invalidations_after_nullable_ddl + 1
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_charset_ddl;
+
+PREPARE stmt_type FROM 'SELECT pad FROM pc_rh_type_boundary WHERE id = ?';
+
+--echo # Numeric string parameters invalidate the integer shape before a new stable hit
+SET @p=7;
+EXECUTE stmt_type USING @p;
+EXECUTE stmt_type USING @p;
+SET @p='7';
+EXECUTE stmt_type USING @p;
+EXECUTE stmt_type USING @p;
+
+--disable_query_log
+let $count_after_type= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_type= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_type= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_after_type= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count keeps replacement state after numeric string parameter shape
+--let $assert_cond= $count_after_type = $count_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits grows only before numeric string parameter shape
+--let $assert_cond= $hits_after_type = $hits_after_charset_ddl + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations grows only before numeric string parameter shape
+--let $assert_cond= $prevalidations_after_type = $prevalidations_after_charset_ddl + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations grows after numeric string parameter shape change
+--let $assert_cond= $invalidations_after_type = $invalidations_after_charset_ddl + 1
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_type;
+
+PREPARE stmt_secondary_mutation FROM
+  'SELECT pad FROM pc_rh_secondary_mutation WHERE u = ?';
+
+--echo # Secondary unique-key mutation must rebuild the lookup key on every hit
+SET @p=1000;
+EXECUTE stmt_secondary_mutation USING @p;
+UPDATE pc_rh_secondary_mutation SET u=3000, pad='s3' WHERE u=1000;
+EXECUTE stmt_secondary_mutation USING @p;
+SET @p=3000;
+EXECUTE stmt_secondary_mutation USING @p;
+EXECUTE stmt_secondary_mutation USING @p;
+
+--disable_query_log
+let $count_after_secondary_mutation= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_secondary_mutation= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_secondary_mutation= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_after_secondary_mutation= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count keeps one state across secondary unique-key mutation
+--let $assert_cond= $count_after_secondary_mutation = $count_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits grows across secondary unique old-key and new-key lookups
+--let $assert_cond= $hits_after_secondary_mutation = $hits_after_type + 3
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations grows across secondary unique-key mutation hits
+--let $assert_cond= $prevalidations_after_secondary_mutation = $prevalidations_after_type + 3
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations does not grow for secondary unique-key row mutation
+--let $assert_cond= $invalidations_after_secondary_mutation = $invalidations_after_type
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_secondary_mutation;
+
+PREPARE stmt_promote_ddl FROM
+  'SELECT pad FROM pc_rh_promote_ddl WHERE u = ?';
+
+--echo # Promoting a non-unique key to UNIQUE should invalidate ref state and rebuild unique state
+SET @p=111;
+EXECUTE stmt_promote_ddl USING @p;
+EXECUTE stmt_promote_ddl USING @p;
+ALTER TABLE pc_rh_promote_ddl DROP INDEX u_key, ADD UNIQUE KEY u_key(u);
+EXECUTE stmt_promote_ddl USING @p;
+SET @p=222;
+EXECUTE stmt_promote_ddl USING @p;
+SET @p=111;
+EXECUTE stmt_promote_ddl USING @p;
+
+--disable_query_log
+let $count_after_promote_ddl= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_promote_ddl= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_promote_ddl= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_after_promote_ddl= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count keeps replacement state after non-unique key is promoted to unique
+--let $assert_cond= $count_after_promote_ddl = $count_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits grows across ref and unique states after promotion DDL
+--let $assert_cond= $hits_after_promote_ddl = $hits_after_secondary_mutation + 3
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations grows across ref and unique states after promotion DDL
+--let $assert_cond= $prevalidations_after_promote_ddl = $prevalidations_after_secondary_mutation + 3
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations grows after non-unique key is promoted to unique
+--let $assert_cond= $invalidations_after_promote_ddl = $invalidations_after_secondary_mutation + 1
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_promote_ddl;
+
+--disable_query_log
+let $count_after_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after boundary tests
+--let $assert_cond= $count_after_deallocate = $count_before
+--source include/assert.inc
+--enable_query_log
+
+SET @@session.session_plan_cache_allow_change_ratio = @save_ratio;
+SET @@session.session_plan_cache = DEFAULT;
+
+DROP TABLE pc_rh_boundary;
+DROP TABLE pc_rh_nullable_ddl;
+DROP TABLE pc_rh_charset_ddl;
+DROP TABLE pc_rh_type_boundary;
+DROP TABLE pc_rh_secondary_mutation;
+DROP TABLE pc_rh_promote_ddl;

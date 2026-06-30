@@ -1,0 +1,271 @@
+--source include/have_innodb.inc
+
+CREATE TABLE pc_recipe_pk (
+  id INT NOT NULL PRIMARY KEY,
+  pad CHAR(10)
+) ENGINE=InnoDB;
+INSERT INTO pc_recipe_pk VALUES (1, 'a'), (2, 'b');
+
+CREATE TABLE pc_recipe_nullable (
+  id INT,
+  pad CHAR(10),
+  UNIQUE KEY id_uq(id)
+) ENGINE=InnoDB;
+INSERT INTO pc_recipe_nullable VALUES (1, 'a'), (NULL, 'n');
+
+CREATE TABLE pc_recipe_nonunique (
+  id INT NOT NULL,
+  pad CHAR(10),
+  KEY id_key(id)
+) ENGINE=InnoDB;
+INSERT INTO pc_recipe_nonunique VALUES (1, 'a'), (2, 'b');
+
+CREATE TABLE pc_recipe_multi (
+  tenant_id INT NOT NULL,
+  id INT NOT NULL,
+  pad CHAR(10),
+  UNIQUE KEY tenant_id_uq(tenant_id, id)
+) ENGINE=InnoDB;
+INSERT INTO pc_recipe_multi VALUES (10, 1, 'a'), (10, 2, 'b');
+
+SET @@session.session_plan_cache = ON;
+SET @save_ratio=@@session.session_plan_cache_allow_change_ratio;
+SET @@session.session_plan_cache_allow_change_ratio = 0;
+
+--disable_query_log
+let $count_before= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+--enable_query_log
+
+PREPARE stmt FROM 'SELECT pad FROM pc_recipe_pk WHERE id = ?';
+
+--echo # First execute creates state and stores the unique equality recipe
+SET @p=1;
+EXECUTE stmt USING @p;
+
+--echo # Second execute can prevalidate the same recipe before normal optimization
+SET @p=2;
+EXECUTE stmt USING @p;
+
+--disable_query_log
+let $count_after_pk= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_pk= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_pk= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count keeps one state for prevalidated unique equality recipe
+--let $assert_cond= $count_after_pk = $count_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations grows on second unique equality execute
+--let $assert_cond= $prevalidations_after_pk = $prevalidations_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits grows for prevalidated unique equality recipe
+--let $assert_cond= $hits_after_pk = $hits_before + 1
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt;
+
+--disable_query_log
+let $count_after_pk_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after prevalidated recipe deallocate
+--let $assert_cond= $count_after_pk_deallocate = $count_before
+--source include/assert.inc
+--enable_query_log
+
+PREPARE stmt_reverse FROM 'SELECT pad FROM pc_recipe_pk WHERE ? = id';
+
+--echo # Reversed equality operands are accepted as the same unique equality recipe
+SET @p=1;
+EXECUTE stmt_reverse USING @p;
+SET @p=2;
+EXECUTE stmt_reverse USING @p;
+
+--disable_query_log
+let $count_after_reverse= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $prevalidations_after_reverse= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count keeps one state for reversed unique equality recipe
+--let $assert_cond= $count_after_reverse = $count_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations grows for reversed unique equality recipe
+--let $assert_cond= $prevalidations_after_reverse = $prevalidations_after_pk + 1
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_reverse;
+
+--disable_query_log
+let $count_after_reverse_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after reversed recipe deallocate
+--let $assert_cond= $count_after_reverse_deallocate = $count_before
+--source include/assert.inc
+--enable_query_log
+
+PREPARE stmt_nullable FROM 'SELECT pad FROM pc_recipe_nullable WHERE id = ?';
+
+--echo # Nullable unique keys are not accepted as deterministic unique equality recipes
+SET @p=1;
+EXECUTE stmt_nullable USING @p;
+SET @p=1;
+EXECUTE stmt_nullable USING @p;
+
+--disable_query_log
+let $prevalidations_after_nullable= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_prevalidations does not grow for nullable unique equality recipe
+--let $assert_cond= $prevalidations_after_nullable = $prevalidations_after_reverse
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_nullable;
+
+--disable_query_log
+let $count_after_nullable_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after nullable recipe deallocate
+--let $assert_cond= $count_after_nullable_deallocate = $count_before
+--source include/assert.inc
+--enable_query_log
+
+PREPARE stmt_null_param FROM 'SELECT pad FROM pc_recipe_pk WHERE id = ?';
+
+--echo # NULL parameters are not accepted as unique equality recipes
+SET @p=1;
+EXECUTE stmt_null_param USING @p;
+SET @p=NULL;
+EXECUTE stmt_null_param USING @p;
+
+--disable_query_log
+let $prevalidations_after_null_param= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_prevalidations does not grow for NULL parameter recipe
+--let $assert_cond= $prevalidations_after_null_param = $prevalidations_after_nullable
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_null_param;
+
+--disable_query_log
+let $count_after_null_param_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after NULL parameter recipe deallocate
+--let $assert_cond= $count_after_null_param_deallocate = $count_before
+--source include/assert.inc
+--enable_query_log
+
+PREPARE stmt_nonunique FROM 'SELECT pad FROM pc_recipe_nonunique WHERE id = ?';
+
+--echo # Non-unique keys are accepted as ref equality recipes
+SET @p=1;
+EXECUTE stmt_nonunique USING @p;
+SET @p=2;
+EXECUTE stmt_nonunique USING @p;
+
+--disable_query_log
+let $prevalidations_after_nonunique= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_prevalidations grows for non-unique ref equality recipe
+--let $assert_cond= $prevalidations_after_nonunique = $prevalidations_after_null_param + 1
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_nonunique;
+
+--disable_query_log
+let $count_after_nonunique_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after non-unique recipe deallocate
+--let $assert_cond= $count_after_nonunique_deallocate = $count_before
+--source include/assert.inc
+--enable_query_log
+
+PREPARE stmt_multi FROM 'SELECT pad FROM pc_recipe_multi WHERE id = ?';
+
+--echo # Multi-part unique keys are not accepted by the phase 11 recipe skeleton
+SET @p=1;
+EXECUTE stmt_multi USING @p;
+SET @p=2;
+EXECUTE stmt_multi USING @p;
+
+--disable_query_log
+let $prevalidations_after_multi= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_prevalidations does not grow for multi-part unique recipe
+--let $assert_cond= $prevalidations_after_multi = $prevalidations_after_nonunique
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_multi;
+
+--disable_query_log
+let $count_after_multi_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after multi-part recipe deallocate
+--let $assert_cond= $count_after_multi_deallocate = $count_before
+--source include/assert.inc
+--enable_query_log
+
+PREPARE stmt_range FROM 'SELECT pad FROM pc_recipe_pk WHERE id > ?';
+
+--echo # Range predicates are not accepted as unique equality recipes
+SET @p=0;
+EXECUTE stmt_range USING @p;
+SET @p=1;
+EXECUTE stmt_range USING @p;
+
+--disable_query_log
+let $prevalidations_after_range= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_prevalidations does not grow for range recipe
+--let $assert_cond= $prevalidations_after_range = $prevalidations_after_multi
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_range;
+
+--disable_query_log
+let $count_after_range_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after range recipe deallocate
+--let $assert_cond= $count_after_range_deallocate = $count_before
+--source include/assert.inc
+--enable_query_log
+
+PREPARE stmt_and FROM 'SELECT pad FROM pc_recipe_pk WHERE id = ? AND pad = ?';
+
+--echo # AND predicate trees are not accepted by the phase 11 recipe skeleton
+SET @p=1;
+SET @q='a';
+EXECUTE stmt_and USING @p, @q;
+SET @p=2;
+SET @q='b';
+EXECUTE stmt_and USING @p, @q;
+
+--disable_query_log
+let $prevalidations_after_and= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_prevalidations does not grow for AND recipe
+--let $assert_cond= $prevalidations_after_and = $prevalidations_after_range
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_and;
+
+--disable_query_log
+let $count_after_and_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after AND recipe deallocate
+--let $assert_cond= $count_after_and_deallocate = $count_before
+--source include/assert.inc
+--enable_query_log
+
+SET @@session.session_plan_cache_allow_change_ratio = @save_ratio;
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_recipe_pk, pc_recipe_nullable, pc_recipe_nonunique,
+           pc_recipe_multi;

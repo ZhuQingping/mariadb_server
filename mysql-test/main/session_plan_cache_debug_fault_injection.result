@@ -1,0 +1,222 @@
+CREATE TABLE pc_debug_fault (
+id INT NOT NULL PRIMARY KEY,
+pad CHAR(10)
+) ENGINE=InnoDB;
+INSERT INTO pc_debug_fault VALUES (1, 'a'), (2, 'b'), (3, 'c');
+CREATE TABLE pc_debug_distinct (
+id INT NOT NULL PRIMARY KEY,
+c CHAR(10)
+) ENGINE=InnoDB;
+INSERT INTO pc_debug_distinct VALUES
+(1, 'c3'), (2, 'c1'), (3, 'c2'), (4, 'c1');
+SET @@session.session_plan_cache = ON;
+SET @save_ratio=@@session.session_plan_cache_allow_change_ratio;
+SET @@session.session_plan_cache_allow_change_ratio = 0;
+SET @save_debug=@@session.debug_dbug;
+# Injected state allocation failure should execute normally without caching
+PREPARE stmt_state_fail FROM 'SELECT pad FROM pc_debug_fault WHERE id = ?';
+SET @p=1;
+SET @@session.debug_dbug='+d,session_plan_cache_state_alloc_fail';
+EXECUTE stmt_state_fail USING @p;
+pad
+a
+SET @@session.debug_dbug=@save_debug;
+include/assert.inc [Cached_plan_count does not grow after injected state allocation failure]
+include/assert.inc [Cached_plan_hits does not grow after injected state allocation failure]
+include/assert.inc [Cached_plan_prevalidations does not grow before state exists]
+# Clearing the hook should allow the same shape to cache and hit normally
+SET @p=2;
+EXECUTE stmt_state_fail USING @p;
+pad
+b
+SET @p=3;
+EXECUTE stmt_state_fail USING @p;
+pad
+c
+include/assert.inc [Cached_plan_count grows after state allocation hook is cleared]
+include/assert.inc [Cached_plan_hits grows after state allocation hook is cleared]
+include/assert.inc [Cached_plan_prevalidations grows after state allocation hook is cleared]
+DEALLOCATE PREPARE stmt_state_fail;
+include/assert.inc [Cached_plan_count returns to baseline after state allocation fault test]
+# Injected hit-path failure should fall back without counting a hit
+PREPARE stmt_hit_fail FROM 'SELECT pad FROM pc_debug_fault WHERE id = ?';
+SET @p=1;
+EXECUTE stmt_hit_fail USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_hit_fail USING @p;
+pad
+b
+include/assert.inc [Cached_plan_count has one state before hit-path fault injection]
+SET @p=3;
+SET @@session.debug_dbug='+d,session_plan_cache_hit_path_fail';
+EXECUTE stmt_hit_fail USING @p;
+pad
+c
+SET @@session.debug_dbug=@save_debug;
+include/assert.inc [Cached_plan_count remains stable after injected hit-path failure]
+include/assert.inc [Cached_plan_hits does not grow for injected hit-path failure]
+include/assert.inc [Cached_plan_prevalidations records the attempted hit-path fallback]
+# Clearing the hit-path hook should restore normal hits
+SET @p=1;
+EXECUTE stmt_hit_fail USING @p;
+pad
+a
+include/assert.inc [Cached_plan_count remains stable after hit-path hook is cleared]
+include/assert.inc [Cached_plan_hits grows after hit-path hook is cleared]
+include/assert.inc [Cached_plan_prevalidations grows after hit-path hook is cleared]
+DEALLOCATE PREPARE stmt_hit_fail;
+include/assert.inc [Cached_plan_count returns to baseline after hit-path fault test]
+# Injected const lookup failure should roll back compact JOIN state
+PREPARE stmt_const_lookup_fail FROM 'SELECT pad FROM pc_debug_fault WHERE id = ?';
+SET @p=1;
+EXECUTE stmt_const_lookup_fail USING @p;
+pad
+a
+SET @p=2;
+EXECUTE stmt_const_lookup_fail USING @p;
+pad
+b
+include/assert.inc [Cached_plan_count has one state before const lookup fault injection]
+SET @p=3;
+SET @@session.debug_dbug='+d,session_plan_cache_const_lookup_fail';
+EXECUTE stmt_const_lookup_fail USING @p;
+pad
+c
+SET @@session.debug_dbug=@save_debug;
+include/assert.inc [Cached_plan_count remains stable after injected const lookup failure]
+include/assert.inc [Cached_plan_hits does not grow for injected const lookup failure]
+include/assert.inc [Cached_plan_prevalidations records the attempted const lookup fallback]
+# Clearing the const lookup hook should restore normal hits
+SET @p=1;
+EXECUTE stmt_const_lookup_fail USING @p;
+pad
+a
+include/assert.inc [Cached_plan_count remains stable after const lookup hook is cleared]
+include/assert.inc [Cached_plan_hits grows after const lookup hook is cleared]
+include/assert.inc [Cached_plan_prevalidations grows after const lookup hook is cleared]
+DEALLOCATE PREPARE stmt_const_lookup_fail;
+include/assert.inc [Cached_plan_count returns to baseline after const lookup fault test]
+# Injected distinct range setup failure should roll back upper JOIN state
+PREPARE stmt_distinct_setup_fail FROM 'SELECT DISTINCT c FROM pc_debug_distinct WHERE id BETWEEN ? AND ? ORDER BY c';
+SET @lo=1;
+SET @hi=4;
+EXECUTE stmt_distinct_setup_fail USING @lo, @hi;
+c
+c1
+c2
+c3
+include/assert.inc [Cached_plan_count has one state before distinct range setup fault injection]
+SET @lo=2;
+SET @hi=4;
+SET @@session.debug_dbug='+d,session_plan_cache_distinct_range_setup_fail';
+EXECUTE stmt_distinct_setup_fail USING @lo, @hi;
+c
+c1
+c2
+SET @@session.debug_dbug=@save_debug;
+include/assert.inc [Cached_plan_count remains stable after injected distinct range setup failure]
+include/assert.inc [Cached_plan_hits does not grow for injected distinct range setup failure]
+include/assert.inc [Cached_plan_prevalidations records the attempted distinct range setup fallback]
+# Clearing the distinct range setup hook should restore normal hits
+SET @lo=1;
+SET @hi=3;
+EXECUTE stmt_distinct_setup_fail USING @lo, @hi;
+c
+c1
+c2
+c3
+include/assert.inc [Cached_plan_count remains stable after distinct range setup hook is cleared]
+include/assert.inc [Cached_plan_hits grows after distinct range setup hook is cleared]
+include/assert.inc [Cached_plan_prevalidations grows after distinct range setup hook is cleared]
+DEALLOCATE PREPARE stmt_distinct_setup_fail;
+include/assert.inc [Cached_plan_count returns to baseline after distinct range setup fault test]
+# Injected distinct group failure should fall back before mutating JOIN lists
+PREPARE stmt_distinct_group_fail FROM 'SELECT DISTINCT c FROM pc_debug_distinct WHERE id BETWEEN ? AND ? ORDER BY c';
+SET @lo=1;
+SET @hi=4;
+EXECUTE stmt_distinct_group_fail USING @lo, @hi;
+c
+c1
+c2
+c3
+include/assert.inc [Cached_plan_count has one state before distinct group fault injection]
+SET @lo=2;
+SET @hi=4;
+SET @@session.debug_dbug='+d,session_plan_cache_distinct_range_group_fail';
+EXECUTE stmt_distinct_group_fail USING @lo, @hi;
+c
+c1
+c2
+SET @@session.debug_dbug=@save_debug;
+include/assert.inc [Cached_plan_count remains stable after injected distinct group failure]
+include/assert.inc [Cached_plan_hits does not grow for injected distinct group failure]
+include/assert.inc [Cached_plan_prevalidations records the attempted distinct group fallback]
+# Clearing the distinct group hook should restore normal hits
+SET @lo=1;
+SET @hi=3;
+EXECUTE stmt_distinct_group_fail USING @lo, @hi;
+c
+c1
+c2
+c3
+include/assert.inc [Cached_plan_count remains stable after distinct group hook is cleared]
+include/assert.inc [Cached_plan_hits grows after distinct group hook is cleared]
+include/assert.inc [Cached_plan_prevalidations grows after distinct group hook is cleared]
+DEALLOCATE PREPARE stmt_distinct_group_fail;
+include/assert.inc [Cached_plan_count returns to baseline after distinct group fault test]
+# Injected distinct aggregate setup failure should return an error after JOIN commit
+PREPARE stmt_distinct_aggr_fail FROM 'SELECT DISTINCT c FROM pc_debug_distinct WHERE id BETWEEN ? AND ? ORDER BY c';
+SET @lo=1;
+SET @hi=4;
+EXECUTE stmt_distinct_aggr_fail USING @lo, @hi;
+c
+c1
+c2
+c3
+include/assert.inc [Cached_plan_count has one state before distinct aggregate setup fault injection]
+SET @lo=2;
+SET @hi=4;
+SET @@session.debug_dbug='+d,session_plan_cache_distinct_range_aggr_setup_fail';
+EXECUTE stmt_distinct_aggr_fail USING @lo, @hi;
+ERROR HY000: Out of memory.
+SET @@session.debug_dbug=@save_debug;
+include/assert.inc [Cached_plan_count remains stable after injected distinct aggregate setup failure]
+include/assert.inc [Cached_plan_hits does not grow for injected distinct aggregate setup failure]
+include/assert.inc [Cached_plan_prevalidations records the attempted distinct aggregate setup hit]
+DEALLOCATE PREPARE stmt_distinct_aggr_fail;
+include/assert.inc [Cached_plan_count returns to baseline after distinct aggregate setup fault test]
+# Injected table info failure should invalidate instead of trusting stale row counts
+SET @@session.session_plan_cache_allow_change_ratio = 0.2;
+PREPARE stmt_table_info_fail FROM 'SELECT pad FROM pc_debug_fault WHERE id = ?';
+SET @p=1;
+EXECUTE stmt_table_info_fail USING @p;
+pad
+a
+include/assert.inc [Cached_plan_count has one state before table info fault injection]
+SET @p=2;
+SET @@session.debug_dbug='+d,session_plan_cache_table_info_fail';
+EXECUTE stmt_table_info_fail USING @p;
+pad
+b
+SET @@session.debug_dbug=@save_debug;
+include/assert.inc [Cached_plan_count keeps one replacement state after table info refresh failure]
+include/assert.inc [Cached_plan_hits does not grow after table info refresh failure]
+include/assert.inc [Cached_plan_prevalidations does not grow before failed table info validation]
+include/assert.inc [Cached_plan_invalidations grows after table info refresh failure]
+# Clearing the table info hook should restore normal hits
+SET @p=3;
+EXECUTE stmt_table_info_fail USING @p;
+pad
+c
+include/assert.inc [Cached_plan_hits grows after table info hook is cleared]
+include/assert.inc [Cached_plan_prevalidations grows after table info hook is cleared]
+include/assert.inc [Cached_plan_invalidations does not grow after table info hook is cleared]
+DEALLOCATE PREPARE stmt_table_info_fail;
+include/assert.inc [Cached_plan_count returns to baseline after table info fault test]
+SET @@session.debug_dbug=@save_debug;
+SET @@session.session_plan_cache_allow_change_ratio = @save_ratio;
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_debug_distinct;
+DROP TABLE pc_debug_fault;

@@ -1,0 +1,509 @@
+--source include/have_debug.inc
+--source include/have_innodb.inc
+
+CREATE TABLE pc_debug_fault (
+  id INT NOT NULL PRIMARY KEY,
+  pad CHAR(10)
+) ENGINE=InnoDB;
+INSERT INTO pc_debug_fault VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+CREATE TABLE pc_debug_distinct (
+  id INT NOT NULL PRIMARY KEY,
+  c CHAR(10)
+) ENGINE=InnoDB;
+INSERT INTO pc_debug_distinct VALUES
+  (1, 'c3'), (2, 'c1'), (3, 'c2'), (4, 'c1');
+
+SET @@session.session_plan_cache = ON;
+SET @save_ratio=@@session.session_plan_cache_allow_change_ratio;
+SET @@session.session_plan_cache_allow_change_ratio = 0;
+SET @save_debug=@@session.debug_dbug;
+
+--disable_query_log
+let $count_before= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_before= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+--enable_query_log
+
+--echo # Injected state allocation failure should execute normally without caching
+PREPARE stmt_state_fail FROM 'SELECT pad FROM pc_debug_fault WHERE id = ?';
+SET @p=1;
+SET @@session.debug_dbug='+d,session_plan_cache_state_alloc_fail';
+EXECUTE stmt_state_fail USING @p;
+SET @@session.debug_dbug=@save_debug;
+
+--disable_query_log
+let $count_after_state_fail= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_state_fail= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_state_fail= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count does not grow after injected state allocation failure
+--let $assert_cond= $count_after_state_fail = $count_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits does not grow after injected state allocation failure
+--let $assert_cond= $hits_after_state_fail = $hits_before
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow before state exists
+--let $assert_cond= $prevalidations_after_state_fail = $prevalidations_before
+--source include/assert.inc
+--enable_query_log
+
+--echo # Clearing the hook should allow the same shape to cache and hit normally
+SET @p=2;
+EXECUTE stmt_state_fail USING @p;
+SET @p=3;
+EXECUTE stmt_state_fail USING @p;
+
+--disable_query_log
+let $count_after_state_recovery= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_state_recovery= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_state_recovery= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count grows after state allocation hook is cleared
+--let $assert_cond= $count_after_state_recovery = $count_before + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits grows after state allocation hook is cleared
+--let $assert_cond= $hits_after_state_recovery = $hits_after_state_fail + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations grows after state allocation hook is cleared
+--let $assert_cond= $prevalidations_after_state_recovery = $prevalidations_after_state_fail + 1
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_state_fail;
+
+--disable_query_log
+let $count_after_first_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after state allocation fault test
+--let $assert_cond= $count_after_first_deallocate = $count_before
+--source include/assert.inc
+--enable_query_log
+
+--echo # Injected hit-path failure should fall back without counting a hit
+PREPARE stmt_hit_fail FROM 'SELECT pad FROM pc_debug_fault WHERE id = ?';
+SET @p=1;
+EXECUTE stmt_hit_fail USING @p;
+SET @p=2;
+EXECUTE stmt_hit_fail USING @p;
+
+--disable_query_log
+let $count_before_hit_fail= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_before_hit_fail= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_before_hit_fail= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count has one state before hit-path fault injection
+--let $assert_cond= $count_before_hit_fail = $count_before + 1
+--source include/assert.inc
+--enable_query_log
+
+SET @p=3;
+SET @@session.debug_dbug='+d,session_plan_cache_hit_path_fail';
+EXECUTE stmt_hit_fail USING @p;
+SET @@session.debug_dbug=@save_debug;
+
+--disable_query_log
+let $count_after_hit_fail= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_hit_fail= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_hit_fail= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count remains stable after injected hit-path failure
+--let $assert_cond= $count_after_hit_fail = $count_before_hit_fail
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits does not grow for injected hit-path failure
+--let $assert_cond= $hits_after_hit_fail = $hits_before_hit_fail
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations records the attempted hit-path fallback
+--let $assert_cond= $prevalidations_after_hit_fail = $prevalidations_before_hit_fail + 1
+--source include/assert.inc
+--enable_query_log
+
+--echo # Clearing the hit-path hook should restore normal hits
+SET @p=1;
+EXECUTE stmt_hit_fail USING @p;
+
+--disable_query_log
+let $count_after_hit_recovery= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_hit_recovery= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_hit_recovery= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count remains stable after hit-path hook is cleared
+--let $assert_cond= $count_after_hit_recovery = $count_before_hit_fail
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits grows after hit-path hook is cleared
+--let $assert_cond= $hits_after_hit_recovery = $hits_after_hit_fail + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations grows after hit-path hook is cleared
+--let $assert_cond= $prevalidations_after_hit_recovery = $prevalidations_after_hit_fail + 1
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_hit_fail;
+
+--disable_query_log
+let $count_after_final_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after hit-path fault test
+--let $assert_cond= $count_after_final_deallocate = $count_before
+--source include/assert.inc
+--enable_query_log
+
+--echo # Injected const lookup failure should roll back compact JOIN state
+PREPARE stmt_const_lookup_fail FROM 'SELECT pad FROM pc_debug_fault WHERE id = ?';
+SET @p=1;
+EXECUTE stmt_const_lookup_fail USING @p;
+SET @p=2;
+EXECUTE stmt_const_lookup_fail USING @p;
+
+--disable_query_log
+let $count_before_const_lookup_fail= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_before_const_lookup_fail= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_before_const_lookup_fail= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count has one state before const lookup fault injection
+--let $assert_cond= $count_before_const_lookup_fail = $count_before + 1
+--source include/assert.inc
+--enable_query_log
+
+SET @p=3;
+SET @@session.debug_dbug='+d,session_plan_cache_const_lookup_fail';
+EXECUTE stmt_const_lookup_fail USING @p;
+SET @@session.debug_dbug=@save_debug;
+
+--disable_query_log
+let $count_after_const_lookup_fail= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_const_lookup_fail= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_const_lookup_fail= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count remains stable after injected const lookup failure
+--let $assert_cond= $count_after_const_lookup_fail = $count_before_const_lookup_fail
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits does not grow for injected const lookup failure
+--let $assert_cond= $hits_after_const_lookup_fail = $hits_before_const_lookup_fail
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations records the attempted const lookup fallback
+--let $assert_cond= $prevalidations_after_const_lookup_fail = $prevalidations_before_const_lookup_fail + 1
+--source include/assert.inc
+--enable_query_log
+
+--echo # Clearing the const lookup hook should restore normal hits
+SET @p=1;
+EXECUTE stmt_const_lookup_fail USING @p;
+
+--disable_query_log
+let $count_after_const_lookup_recovery= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_const_lookup_recovery= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_const_lookup_recovery= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count remains stable after const lookup hook is cleared
+--let $assert_cond= $count_after_const_lookup_recovery = $count_before_const_lookup_fail
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits grows after const lookup hook is cleared
+--let $assert_cond= $hits_after_const_lookup_recovery = $hits_after_const_lookup_fail + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations grows after const lookup hook is cleared
+--let $assert_cond= $prevalidations_after_const_lookup_recovery = $prevalidations_after_const_lookup_fail + 1
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_const_lookup_fail;
+
+--disable_query_log
+let $count_after_const_lookup_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after const lookup fault test
+--let $assert_cond= $count_after_const_lookup_deallocate = $count_before
+--source include/assert.inc
+--enable_query_log
+
+--echo # Injected distinct range setup failure should roll back upper JOIN state
+PREPARE stmt_distinct_setup_fail FROM 'SELECT DISTINCT c FROM pc_debug_distinct WHERE id BETWEEN ? AND ? ORDER BY c';
+SET @lo=1;
+SET @hi=4;
+EXECUTE stmt_distinct_setup_fail USING @lo, @hi;
+
+--disable_query_log
+let $count_before_distinct_setup_fail= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_before_distinct_setup_fail= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_before_distinct_setup_fail= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count has one state before distinct range setup fault injection
+--let $assert_cond= $count_before_distinct_setup_fail = $count_before + 1
+--source include/assert.inc
+--enable_query_log
+
+SET @lo=2;
+SET @hi=4;
+SET @@session.debug_dbug='+d,session_plan_cache_distinct_range_setup_fail';
+EXECUTE stmt_distinct_setup_fail USING @lo, @hi;
+SET @@session.debug_dbug=@save_debug;
+
+--disable_query_log
+let $count_after_distinct_setup_fail= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_distinct_setup_fail= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_distinct_setup_fail= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count remains stable after injected distinct range setup failure
+--let $assert_cond= $count_after_distinct_setup_fail = $count_before_distinct_setup_fail
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits does not grow for injected distinct range setup failure
+--let $assert_cond= $hits_after_distinct_setup_fail = $hits_before_distinct_setup_fail
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations records the attempted distinct range setup fallback
+--let $assert_cond= $prevalidations_after_distinct_setup_fail = $prevalidations_before_distinct_setup_fail + 1
+--source include/assert.inc
+--enable_query_log
+
+--echo # Clearing the distinct range setup hook should restore normal hits
+SET @lo=1;
+SET @hi=3;
+EXECUTE stmt_distinct_setup_fail USING @lo, @hi;
+
+--disable_query_log
+let $count_after_distinct_setup_recovery= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_distinct_setup_recovery= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_distinct_setup_recovery= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count remains stable after distinct range setup hook is cleared
+--let $assert_cond= $count_after_distinct_setup_recovery = $count_before_distinct_setup_fail
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits grows after distinct range setup hook is cleared
+--let $assert_cond= $hits_after_distinct_setup_recovery = $hits_after_distinct_setup_fail + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations grows after distinct range setup hook is cleared
+--let $assert_cond= $prevalidations_after_distinct_setup_recovery = $prevalidations_after_distinct_setup_fail + 1
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_distinct_setup_fail;
+
+--disable_query_log
+let $count_after_distinct_setup_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after distinct range setup fault test
+--let $assert_cond= $count_after_distinct_setup_deallocate = $count_before
+--source include/assert.inc
+--enable_query_log
+
+--echo # Injected distinct group failure should fall back before mutating JOIN lists
+PREPARE stmt_distinct_group_fail FROM 'SELECT DISTINCT c FROM pc_debug_distinct WHERE id BETWEEN ? AND ? ORDER BY c';
+SET @lo=1;
+SET @hi=4;
+EXECUTE stmt_distinct_group_fail USING @lo, @hi;
+
+--disable_query_log
+let $count_before_distinct_group_fail= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_before_distinct_group_fail= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_before_distinct_group_fail= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count has one state before distinct group fault injection
+--let $assert_cond= $count_before_distinct_group_fail = $count_before + 1
+--source include/assert.inc
+--enable_query_log
+
+SET @lo=2;
+SET @hi=4;
+SET @@session.debug_dbug='+d,session_plan_cache_distinct_range_group_fail';
+EXECUTE stmt_distinct_group_fail USING @lo, @hi;
+SET @@session.debug_dbug=@save_debug;
+
+--disable_query_log
+let $count_after_distinct_group_fail= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_distinct_group_fail= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_distinct_group_fail= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count remains stable after injected distinct group failure
+--let $assert_cond= $count_after_distinct_group_fail = $count_before_distinct_group_fail
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits does not grow for injected distinct group failure
+--let $assert_cond= $hits_after_distinct_group_fail = $hits_before_distinct_group_fail
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations records the attempted distinct group fallback
+--let $assert_cond= $prevalidations_after_distinct_group_fail = $prevalidations_before_distinct_group_fail + 1
+--source include/assert.inc
+--enable_query_log
+
+--echo # Clearing the distinct group hook should restore normal hits
+SET @lo=1;
+SET @hi=3;
+EXECUTE stmt_distinct_group_fail USING @lo, @hi;
+
+--disable_query_log
+let $count_after_distinct_group_recovery= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_distinct_group_recovery= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_distinct_group_recovery= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count remains stable after distinct group hook is cleared
+--let $assert_cond= $count_after_distinct_group_recovery = $count_before_distinct_group_fail
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits grows after distinct group hook is cleared
+--let $assert_cond= $hits_after_distinct_group_recovery = $hits_after_distinct_group_fail + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations grows after distinct group hook is cleared
+--let $assert_cond= $prevalidations_after_distinct_group_recovery = $prevalidations_after_distinct_group_fail + 1
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_distinct_group_fail;
+
+--disable_query_log
+let $count_after_distinct_group_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after distinct group fault test
+--let $assert_cond= $count_after_distinct_group_deallocate = $count_before
+--source include/assert.inc
+--enable_query_log
+
+--echo # Injected distinct aggregate setup failure should return an error after JOIN commit
+PREPARE stmt_distinct_aggr_fail FROM 'SELECT DISTINCT c FROM pc_debug_distinct WHERE id BETWEEN ? AND ? ORDER BY c';
+SET @lo=1;
+SET @hi=4;
+EXECUTE stmt_distinct_aggr_fail USING @lo, @hi;
+
+--disable_query_log
+let $count_before_distinct_aggr_fail= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_before_distinct_aggr_fail= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_before_distinct_aggr_fail= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count has one state before distinct aggregate setup fault injection
+--let $assert_cond= $count_before_distinct_aggr_fail = $count_before + 1
+--source include/assert.inc
+--enable_query_log
+
+SET @lo=2;
+SET @hi=4;
+SET @@session.debug_dbug='+d,session_plan_cache_distinct_range_aggr_setup_fail';
+--error ER_OUT_OF_RESOURCES
+EXECUTE stmt_distinct_aggr_fail USING @lo, @hi;
+SET @@session.debug_dbug=@save_debug;
+
+--disable_query_log
+let $count_after_distinct_aggr_fail= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_distinct_aggr_fail= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_distinct_aggr_fail= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count remains stable after injected distinct aggregate setup failure
+--let $assert_cond= $count_after_distinct_aggr_fail = $count_before_distinct_aggr_fail
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits does not grow for injected distinct aggregate setup failure
+--let $assert_cond= $hits_after_distinct_aggr_fail = $hits_before_distinct_aggr_fail
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations records the attempted distinct aggregate setup hit
+--let $assert_cond= $prevalidations_after_distinct_aggr_fail = $prevalidations_before_distinct_aggr_fail + 1
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_distinct_aggr_fail;
+
+--disable_query_log
+let $count_after_distinct_aggr_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after distinct aggregate setup fault test
+--let $assert_cond= $count_after_distinct_aggr_deallocate = $count_before
+--source include/assert.inc
+--enable_query_log
+
+--echo # Injected table info failure should invalidate instead of trusting stale row counts
+SET @@session.session_plan_cache_allow_change_ratio = 0.2;
+PREPARE stmt_table_info_fail FROM 'SELECT pad FROM pc_debug_fault WHERE id = ?';
+SET @p=1;
+EXECUTE stmt_table_info_fail USING @p;
+
+--disable_query_log
+let $count_before_table_info_fail= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_before_table_info_fail= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_before_table_info_fail= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_before_table_info_fail= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count has one state before table info fault injection
+--let $assert_cond= $count_before_table_info_fail = $count_before + 1
+--source include/assert.inc
+--enable_query_log
+
+SET @p=2;
+SET @@session.debug_dbug='+d,session_plan_cache_table_info_fail';
+EXECUTE stmt_table_info_fail USING @p;
+SET @@session.debug_dbug=@save_debug;
+
+--disable_query_log
+let $count_after_table_info_fail= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+let $hits_after_table_info_fail= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_table_info_fail= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_after_table_info_fail= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_count keeps one replacement state after table info refresh failure
+--let $assert_cond= $count_after_table_info_fail = $count_before_table_info_fail
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_hits does not grow after table info refresh failure
+--let $assert_cond= $hits_after_table_info_fail = $hits_before_table_info_fail
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations does not grow before failed table info validation
+--let $assert_cond= $prevalidations_after_table_info_fail = $prevalidations_before_table_info_fail
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations grows after table info refresh failure
+--let $assert_cond= $invalidations_after_table_info_fail = $invalidations_before_table_info_fail + 1
+--source include/assert.inc
+--enable_query_log
+
+--echo # Clearing the table info hook should restore normal hits
+SET @p=3;
+EXECUTE stmt_table_info_fail USING @p;
+
+--disable_query_log
+let $hits_after_table_info_recovery= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_hits', Value, 1);
+let $prevalidations_after_table_info_recovery= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_prevalidations', Value, 1);
+let $invalidations_after_table_info_recovery= query_get_value(SHOW SESSION STATUS LIKE 'Cached_plan_invalidations', Value, 1);
+
+--let $assert_text= Cached_plan_hits grows after table info hook is cleared
+--let $assert_cond= $hits_after_table_info_recovery = $hits_after_table_info_fail + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_prevalidations grows after table info hook is cleared
+--let $assert_cond= $prevalidations_after_table_info_recovery = $prevalidations_after_table_info_fail + 1
+--source include/assert.inc
+
+--let $assert_text= Cached_plan_invalidations does not grow after table info hook is cleared
+--let $assert_cond= $invalidations_after_table_info_recovery = $invalidations_after_table_info_fail
+--source include/assert.inc
+--enable_query_log
+
+DEALLOCATE PREPARE stmt_table_info_fail;
+
+--disable_query_log
+let $count_after_table_info_deallocate= query_get_value(SHOW GLOBAL STATUS LIKE 'Cached_plan_count', Value, 1);
+
+--let $assert_text= Cached_plan_count returns to baseline after table info fault test
+--let $assert_cond= $count_after_table_info_deallocate = $count_before
+--source include/assert.inc
+--enable_query_log
+
+SET @@session.debug_dbug=@save_debug;
+SET @@session.session_plan_cache_allow_change_ratio = @save_ratio;
+SET @@session.session_plan_cache = DEFAULT;
+DROP TABLE pc_debug_distinct;
+DROP TABLE pc_debug_fault;
